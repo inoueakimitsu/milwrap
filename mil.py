@@ -15,7 +15,8 @@ class MilCountBasedMultiClassLearner:
         n_list = [len(bag) for bag in bags]
         
         # initialize y_i = Y_I for i \in I
-        y = [np.repeat(positive_count_of_group, n) for positive_count_of_group, n in zip(positive_count_of_groups, n_list)]
+        for i_class in range(n_classes):
+            y = [np.repeat(positive_count_of_group, n) for positive_count_of_group, n in zip(positive_count_of_groups, n_list)]
 
         # fit
         flatten_bags = np.vstack(bags)
