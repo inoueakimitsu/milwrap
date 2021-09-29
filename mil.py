@@ -28,6 +28,7 @@ class MilCountBasedMultiClassLearner:
             # compute outputs
             fs = [self.classifier.predict_proba(bag) for bag in bags]
             y = [self.classifier.predict(bag) for bag in bags]
+            flatten_original_y = np.hstack([s for s in y])
 
             # for every bag
             has_changed = False
@@ -42,8 +43,24 @@ class MilCountBasedMultiClassLearner:
                         has_changed = True
                     elif upper_threshold[i_bag, i_class] < class_count:
                         indice_should_be_negative = np.argsort(fs[i_bag][:, i_class])[:int(upper_threshold[i_bag, i_class])]
-                        y[i_bag][indice_should_be_negative] = default_class  # TODO
+                        indice_should_change_to_be_negative = list(
+                            set(indice_should_be_negative.tolist()).intersection(
+                                set(np.argwhere(y[i_bag] == i_class).ravel().tolist())))
+                        y[i_bag][indice_should_change_to_be_negative] = np.random.choice(n_classes, size=1)  # TODO
                         has_changed = True
+            
+            
+            predicted_count = np.nan_to_num(pd.DataFrame([pd.Series(b).value_counts().to_dict() for b in y])[list(range(n_classes))].values)
+            print("false negative")
+            count_false_negative = np.minimum(predicted_count - lower_threshold, 0)
+            print(np.sum(count_false_negative))
+            print("false positive")
+            count_false_positive = np.maximum(predicted_count - upper_threshold, 0)
+            print(np.sum(count_false_positive))
+            print("num changes instance")
+            num_changes_instance = np.sum(np.hstack(y) != flatten_original_y)
+            print(num_changes_instance)
+            print("-----")
             
             if not has_changed:
                 break
@@ -78,7 +95,7 @@ if __name__ == '__main__':
     # upper_threshold = n_bags * n_classes    
     np.random.seed(123)
 
-    n_classes = 15
+    n_classes = 5
     n_bags = 100
     n_max_instance_in_one_bag = 1000
     n_instances_of_each_bags = [np.random.randint(low=0, high=n_max_instance_in_one_bag) for _ in range(n_bags)]
@@ -100,7 +117,7 @@ if __name__ == '__main__':
                     lower_threshold[i_bag, i_class] = divisions[i_division]
                     upper_threshold[i_bag, i_class] = divisions[i_division+1]
     
-    n_fatures = 2
+    n_fatures = 6
     x_min = 0
     x_max = 100
     cov_diag = 40**2
@@ -121,8 +138,12 @@ if __name__ == '__main__':
     # clf = DecisionTreeClassifier()
     # clf = RandomForestClassifier()
 
-    from sklearn.linear_model import LogisticRegression
-    clf = LogisticRegression()
+    # from sklearn.linear_model import LogisticRegression
+    # clf = LogisticRegression()
+
+    from sklearn.neural_network import MLPClassifier
+    clf = MLPClassifier(alpha=1, max_iter=100)
+
     learner = MilCountBasedMultiClassLearner(clf, n_classes)
     learner.fit(bags, lower_threshold, upper_threshold, n_classes)
 
