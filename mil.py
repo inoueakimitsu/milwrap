@@ -6,7 +6,7 @@ class MilCountBasedMultiClassLearner:
         self.classifier = classifier
         self.n_classes = n_classes
     
-    def fit(self, bags, lower_threshold, upper_threshold, n_classes, default_class=0, debug_true_y=None):
+    def fit(self, bags, lower_threshold, upper_threshold, n_classes, default_class=0, max_iter=100, debug_true_y=None):
         """
 
         lower_threshold = n_bags * n_classes
@@ -19,7 +19,7 @@ class MilCountBasedMultiClassLearner:
         # initialize y_i = Y_I for i \in I
         y = [np.repeat(class_index, n_instance_in_bag) for class_index, n_instance_in_bag in zip(np.argmax(lower_threshold, axis=1), n_list)]
 
-        while True:
+        for i_iter in range(max_iter):
             # fit
             flatten_bags = np.vstack(bags)
             flatten_y = np.hstack(y)
@@ -50,23 +50,29 @@ class MilCountBasedMultiClassLearner:
                         has_changed = True
             
             
+            print("iter:", i_iter)
             predicted_count = np.nan_to_num(pd.DataFrame([pd.Series(b).value_counts().to_dict() for b in y])[list(range(n_classes))].values)
-            print("false negative")
+            print("false negative instances")
             count_false_negative = np.minimum(predicted_count - lower_threshold, 0)
             print(np.sum(count_false_negative))
-            print("false positive")
+            print("false positive instances")
             count_false_positive = np.maximum(predicted_count - upper_threshold, 0)
             print(np.sum(count_false_positive))
-            print("num changes instance")
+            print("num changes instances")
             num_changes_instance = np.sum(np.hstack(y) != flatten_original_y)
             print(num_changes_instance)
             if debug_true_y is not None:
                 print("instance unit accuracy")
+                print(np.mean(np.hstack([self.classifier.predict(bag) for bag in bags]) == np.hstack(debug_true_y)))
+                print("instance unit accuracy (label adjusted)")
                 print(np.mean(np.hstack(y) == np.hstack(debug_true_y)))
+
             print("-----")
             
             if not has_changed:
                 break
+        
+        return self.classifier, y
 
 def generate_class_ratios(n_classes):
     
@@ -98,9 +104,9 @@ if __name__ == '__main__':
     # upper_threshold = n_bags * n_classes    
     np.random.seed(123)
 
-    n_classes = 5
+    n_classes = 15
     n_bags = 100
-    n_max_instance_in_one_bag = 10000
+    n_max_instance_in_one_bag = 100000
     n_instances_of_each_bags = [np.random.randint(low=0, high=n_max_instance_in_one_bag) for _ in range(n_bags)]
     class_labels_of_instance_in_bags = generate_instance(n_classes, n_instances_of_each_bags)
     count_each_class_of_instance_in_bags = [
@@ -123,7 +129,7 @@ if __name__ == '__main__':
     n_fatures = 7
     x_min = 0
     x_max = 100
-    cov_diag = 40**2
+    cov_diag = 0.1*40**2
     
     means_of_classes = [np.random.uniform(low=x_min, high=x_max, size=n_fatures) for _ in range(n_classes)]
     covs_of_classes = [np.eye(n_fatures)*cov_diag for _ in range(n_classes)]
@@ -139,22 +145,36 @@ if __name__ == '__main__':
     # from sklearn.ensemble import RandomForestClassifier
     # clf = RandomForestClassifier()
 
-    # from sklearn.tree import DecisionTreeClassifier
-    # clf = DecisionTreeClassifier()
+    from sklearn.tree import DecisionTreeClassifier
+    clf = DecisionTreeClassifier(min_samples_leaf=10)
 
     # from sklearn.linear_model import LogisticRegression
     # clf = LogisticRegression()
 
-    from sklearn.neural_network import MLPClassifier
-    clf = MLPClassifier(alpha=1, max_iter=10)
+    # from sklearn.neural_network import MLPClassifier
+    # clf = MLPClassifier(alpha=1, max_iter=10)
 
-    print("instance unit accuracy(single instance learning)")
+    learner = MilCountBasedMultiClassLearner(clf, n_classes)
+    clf_mil, y_mil = learner.fit(
+        bags,
+        lower_threshold,
+        upper_threshold,
+        n_classes,
+        debug_true_y=class_labels_of_instance_in_bags,
+        max_iter=50)
+
+    print("MIL instance unit accuracy")
+    print(np.mean(clf_mil.predict(np.vstack(bags)) == np.hstack(class_labels_of_instance_in_bags)))
+    print("----")
+
+    print("MIL instance unit accuracy (label adjusted)")
+    print(np.mean(np.hstack(y_mil) == np.hstack(class_labels_of_instance_in_bags)))
+    print("----")
+
+    print("SIL instance unit accuracy")
     clf.fit(np.vstack(bags), np.hstack(class_labels_of_instance_in_bags))
     print(np.mean(clf.predict(np.vstack(bags)) == np.hstack(class_labels_of_instance_in_bags)))
     print("----")
-
-    learner = MilCountBasedMultiClassLearner(clf, n_classes)
-    learner.fit(bags, lower_threshold, upper_threshold, n_classes, debug_true_y=class_labels_of_instance_in_bags)
 
 
 
