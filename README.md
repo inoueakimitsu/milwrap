@@ -1,2 +1,5 @@
 # milwrap
-Multiple Instance Learning Wrapper
+
+Multiple instance learning meta-learner that can wrap any supervised-learning algorithms.
+
+

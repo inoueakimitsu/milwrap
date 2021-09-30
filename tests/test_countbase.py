@@ -29,7 +29,7 @@ def generate_instance(n_classes, n_instances_of_each_bags):
 class TestCountBase:
 
     def test_fit(self):
-        
+
         np.random.seed(123)
 
         n_classes = 15
@@ -82,14 +82,14 @@ class TestCountBase:
         # from sklearn.neural_network import MLPClassifier
         # clf = MLPClassifier(alpha=1, max_iter=10)
 
-        learner = MilCountBasedMultiClassLearner(clf, n_classes)
+        learner = MilCountBasedMultiClassLearner(clf)
         clf_mil, y_mil = learner.fit(
             bags,
             lower_threshold,
             upper_threshold,
             n_classes,
             debug_true_y=class_labels_of_instance_in_bags,
-            max_iter=50)
+            max_iter=10)
 
         print("MIL instance unit accuracy")
         print(np.mean(clf_mil.predict(np.vstack(bags)) == np.hstack(class_labels_of_instance_in_bags)))
