@@ -49,7 +49,7 @@ clf_mil, y_mil = learner.fit(
 
 # after multiple instance learning,
 # you can predict instance class
-clf.mil.predict([instance_feature])
+clf_mil.predict([instance_feature])
 ```
 
 See `tests/test_countbased.py` for an example of a fully working test data generation process.
