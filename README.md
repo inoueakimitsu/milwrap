@@ -5,7 +5,7 @@
 
 Multiple instance learning meta-learner that can wrap any single-instance (ordinary) supervised-learning algorithms.
 
-## Features
+## 💡 Features
 
 - support count-based multiple instance assumptions (see [wikipedia](https://en.wikipedia.org/wiki/Multiple_instance_learning#:~:text=Presence-%2C%20threshold-%2C%20and%20count-based%20assumptions%5Bedit%5D))
 - support multi-class setting
