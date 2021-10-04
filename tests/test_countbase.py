@@ -33,7 +33,7 @@ class TestCountBase:
         np.random.seed(123)
 
         n_classes = 15
-        n_bags = 100
+        n_bags = 1000
         n_max_instance_in_one_bag = 1000
         n_instances_of_each_bags = [np.random.randint(low=0, high=n_max_instance_in_one_bag) for _ in range(n_bags)]
         class_labels_of_instance_in_bags = generate_instance(n_classes, n_instances_of_each_bags)
@@ -83,12 +83,14 @@ class TestCountBase:
         # clf = MLPClassifier(alpha=1, max_iter=10)
 
         learner = MilCountBasedMultiClassLearner(clf)
+        breakpoint()
+        # subsampling bags
         clf_mil, y_mil = learner.fit(
-            bags,
-            lower_threshold,
-            upper_threshold,
+            bags[::10],
+            lower_threshold[::10, :],
+            upper_threshold[::10, :],
             n_classes,
-            debug_true_y=class_labels_of_instance_in_bags,
+            debug_true_y=class_labels_of_instance_in_bags[::10],
             max_iter=10)
 
         print("MIL instance unit accuracy")
@@ -104,5 +106,29 @@ class TestCountBase:
         print(np.mean(clf.predict(np.vstack(bags)) == np.hstack(class_labels_of_instance_in_bags)))
         print("----")
 
+        second_learner = MilCountBasedMultiClassLearner(clf_mil)
+        clf_mil, y_mil = second_learner.fit(
+            bags,
+            lower_threshold,
+            upper_threshold,
+            n_classes,
+            initialize_classifier=False,
+            debug_true_y=class_labels_of_instance_in_bags,
+            max_iter=10)     
 
+        print("MIL instance unit accuracy")
+        print(np.mean(clf_mil.predict(np.vstack(bags)) == np.hstack(class_labels_of_instance_in_bags)))
+        print("----")
+
+        print("MIL instance unit accuracy (label adjusted)")
+        print(np.mean(np.hstack(y_mil) == np.hstack(class_labels_of_instance_in_bags)))
+        print("----")
+
+        print("SIL instance unit accuracy")
+        clf.fit(np.vstack(bags), np.hstack(class_labels_of_instance_in_bags))
+        print(np.mean(clf.predict(np.vstack(bags)) == np.hstack(class_labels_of_instance_in_bags)))
+        print("----")
+
+if __name__ == '__main__':
+    TestCountBase().test_fit()
 

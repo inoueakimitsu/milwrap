@@ -13,6 +13,7 @@ class MilCountBasedMultiClassLearner:
             upper_threshold,
             n_classes,
             max_iter=10,
+            initialize_classifier=True,
             debug_true_y=None,
             debug=True):
         
@@ -27,7 +28,8 @@ class MilCountBasedMultiClassLearner:
             # fit
             flatten_bags = np.vstack(bags)
             flatten_y = np.hstack(y)
-            self.classifier.fit(flatten_bags, flatten_y)
+            if initialize_classifier:
+                self.classifier.fit(flatten_bags, flatten_y)
 
             # compute outputs
             fs = [self.classifier.predict_proba(bag) for bag in bags]
