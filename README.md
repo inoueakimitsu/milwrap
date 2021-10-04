@@ -3,7 +3,8 @@
 [![Build Status](https://app.travis-ci.com/inoueakimitsu/milwrap.svg?branch=main)](https://app.travis-ci.com/inoueakimitsu/milwrap)
 <a href="https://github.com/inoueakimitsu/milwrap/issues"><img alt="GitHub issues" src="https://img.shields.io/github/issues/inoueakimitsu/milwrap"></a>
 
-Multiple instance learning meta-learner that can wrap any single-instance (ordinary) supervised-learning algorithms.
+Python package for multiple instance learning (MIL).
+This wraps single instance learning algorithms so that they can be fitted to data for MIL.
 
 ## 💡 Features
 
