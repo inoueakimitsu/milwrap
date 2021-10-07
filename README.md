@@ -15,7 +15,7 @@ This wraps single instance learning algorithms so that they can be fitted to dat
 ## 📦 Installation
 
 ```bash
-pip install git+https://github.com/inoueakimitsu/milwrap
+pip install milwrap
 ```
 
 ## 🚀 Usage
