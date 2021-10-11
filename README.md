@@ -6,19 +6,19 @@
 Python package for multiple instance learning (MIL).
 This wraps single instance learning algorithms so that they can be fitted to data for MIL.
 
-## 💡 Features
+## Features
 
 - support count-based multiple instance assumptions (see [wikipedia](https://en.wikipedia.org/wiki/Multiple_instance_learning#:~:text=Presence-%2C%20threshold-%2C%20and%20count-based%20assumptions%5Bedit%5D))
 - support multi-class setting
 - support scikit-learn algorithms (such as `RandomForestClassifier`, `SVC`, `LogisticRegression`)
 
-## 📦 Installation
+## Installation
 
 ```bash
 pip install milwrap
 ```
 
-## 🚀 Usage
+## Usage
 
 ```python
 # Prepare single-instance supervised-learning algorithm
@@ -55,6 +55,6 @@ clf_mil.predict([instance_feature])
 
 See `tests/test_countbased.py` for an example of a fully working test data generation process.
 
-## 📄 License
+## License
 
 milwrap is available under the MIT License.
