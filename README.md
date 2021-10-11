@@ -1,7 +1,10 @@
 # milwrap
 
 [![Build Status](https://app.travis-ci.com/inoueakimitsu/milwrap.svg?branch=main)](https://app.travis-ci.com/inoueakimitsu/milwrap)
-<a href="https://github.com/inoueakimitsu/milwrap/issues"><img alt="GitHub issues" src="https://img.shields.io/github/issues/inoueakimitsu/milwrap"></a>
+<a href="https://github.com/inoueakimitsu/milwrap/issues"><img alt="GitHub issues" src="https://img.shields.io/github/issues/inoueakimitsu/milwrap"></a> 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/inoueakimitsu/milwrap/introduction.ipynb)
+
+
 
 Python package for multiple instance learning (MIL).
 This wraps single instance learning algorithms so that they can be fitted to data for MIL.
