@@ -14,14 +14,17 @@ class MilCountBasedMultiClassLearner:
             n_classes,
             max_iter=10,
             initialize_classifier=True,
+            initial_y=None,
             debug_true_y=None,
             debug=True):
         
-        # number of instances of each bags
-        n_list = [len(bag) for bag in bags]
-        
         # initialize y
-        y = [np.repeat(class_index, n_instance_in_bag) for class_index, n_instance_in_bag in zip(np.argmax(lower_threshold, axis=1), n_list)]
+        n_list = [len(bag) for bag in bags]
+        if not initial_y:
+            # number of instances of each bags
+            y = [np.repeat(class_index, n_instance_in_bag) for class_index, n_instance_in_bag in zip(np.argmax(lower_threshold, axis=1), n_list)]
+        else:
+            y = initial_y
 
         for i_iter in range(max_iter):
 

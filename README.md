@@ -1,23 +1,25 @@
 # milwrap
 
 [![Build Status](https://app.travis-ci.com/inoueakimitsu/milwrap.svg?branch=main)](https://app.travis-ci.com/inoueakimitsu/milwrap)
-<a href="https://github.com/inoueakimitsu/milwrap/issues"><img alt="GitHub issues" src="https://img.shields.io/github/issues/inoueakimitsu/milwrap"></a>
+<a href="https://github.com/inoueakimitsu/milwrap/issues"><img alt="GitHub issues" src="https://img.shields.io/github/issues/inoueakimitsu/milwrap"></a> 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/inoueakimitsu/milwrap/blob/master/introduction.ipynb)
 
-Multiple instance learning meta-learner that can wrap any single-instance (ordinary) supervised-learning algorithms.
+Python package for multiple instance learning (MIL).
+This wraps single instance learning algorithms so that they can be fitted to data for MIL.
 
-## 💡 Features
+## Features
 
 - support count-based multiple instance assumptions (see [wikipedia](https://en.wikipedia.org/wiki/Multiple_instance_learning#:~:text=Presence-%2C%20threshold-%2C%20and%20count-based%20assumptions%5Bedit%5D))
 - support multi-class setting
 - support scikit-learn algorithms (such as `RandomForestClassifier`, `SVC`, `LogisticRegression`)
 
-## 📦 Installation
+## Installation
 
 ```bash
-pip install git+https://github.com/inoueakimitsu/milwrap
+pip install milwrap
 ```
 
-## 🚀 Usage
+## Usage
 
 ```python
 # Prepare single-instance supervised-learning algorithm
@@ -54,6 +56,6 @@ clf_mil.predict([instance_feature])
 
 See `tests/test_countbased.py` for an example of a fully working test data generation process.
 
-## 📄 License
+## License
 
 milwrap is available under the MIT License.
