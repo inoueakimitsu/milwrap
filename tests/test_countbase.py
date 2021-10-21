@@ -1,7 +1,48 @@
 import pandas as pd
 import numpy as np
 
-from milwrap.countbase import MilCountBasedMultiClassLearner
+from milwrap.countbase import MilCountBasedMultiClassLearner, \
+    get_order_based_initial_bag_labels, \
+    get_order_based_initial_y
+
+def test_get_order_based_initial_bag_labels():
+    
+    n_instances_for_each_bag = np.array([
+        [100, 20, 3],
+        [200, 30, 1],
+        [300, 10, 2],
+    ], dtype="float32")
+
+    new_bag_labels = get_order_based_initial_bag_labels(n_instances_for_each_bag)
+    assert np.all(new_bag_labels == [2, 1, 0])
+
+def test_get_order_based_initial_y():
+
+    lower_bound = np.array([
+        [100, 20, 3],
+        [200, 30, 1],
+        [300, 10, 2],
+    ], dtype="float32")
+
+    upper_bound = np.array([
+        [200, 30, 4],
+        [300, 40, 2],
+        [400, 20, 3],
+    ], dtype="float32")
+
+    n_instances_of_each_bags = [1000, 2000, 500]
+
+    order_based_initial_y = get_order_based_initial_y(
+        lower_bound, upper_bound,
+        n_instances_of_each_bags)
+    
+    assert np.all([len(elem) for elem in order_based_initial_y] == n_instances_of_each_bags)
+    assert order_based_initial_y[0][0] == 2
+    assert order_based_initial_y[1][0] == 1
+    assert order_based_initial_y[2][0] == 0
+
+
+
 
 def generate_class_ratios(n_classes):
     
