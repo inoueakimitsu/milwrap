@@ -1,5 +1,40 @@
+from typing import List
+
 import numpy as np
 import pandas as pd
+import scipy.stats
+
+
+def get_order_based_initial_bag_labels(
+        n_instances_for_each_bag_and_class: np.ndarray) -> List[int]:
+    
+    assert len(n_instances_for_each_bag_and_class.shape) == 2
+
+    n_bags = n_instances_for_each_bag_and_class.shape[0]
+    n_classes = n_instances_for_each_bag_and_class.shape[1]
+
+    bag_order = np.zeros_like(n_instances_for_each_bag_and_class, dtype=int)
+    
+    for i_class in range(n_classes):
+        bag_order[:, i_class] = scipy.stats.rankdata(n_instances_for_each_bag_and_class[:, i_class])
+
+    initial_bag_labels = [0 for _ in range(n_bags)]
+
+    for i_bag in range(n_bags):
+        initial_bag_labels[i_bag] = np.argmax(bag_order[i_bag, :])
+    
+    return initial_bag_labels
+
+
+def get_order_based_initial_y(
+        lower_threshold: np.ndarray,
+        upper_threshold: np.ndarray,
+        n_instances_of_each_bags: List[int],
+        ) -> List[np.ndarray]:
+    return [np.repeat(label, n) for n, label in zip(
+        n_instances_of_each_bags,
+        get_order_based_initial_bag_labels(
+            (lower_threshold + upper_threshold) / 2))]
 
 class MilCountBasedMultiClassLearner:
 
