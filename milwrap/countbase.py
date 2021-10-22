@@ -1,4 +1,5 @@
 from typing import List
+import random
 
 import numpy as np
 import pandas as pd
@@ -50,7 +51,11 @@ class MilCountBasedMultiClassLearner:
             max_iter=10,
             initial_y=None,
             debug_true_y=None,
+            seed=None,
             debug=True):
+
+        if seed is not None:
+            random.seed(seed)
         
         # initialize y
         n_list = [len(bag) for bag in bags]
@@ -75,20 +80,37 @@ class MilCountBasedMultiClassLearner:
             # for every bag
             has_changed = False
             for i_bag in range(len(bags)):
-                for i_class in range(n_classes):
+                target_classes = list(range(n_classes))
+                # Ensure that there is no biased preference for a particular class.
+                random.shuffle(target_classes)                
+                # Prevents multiple classes from conflictingly changing the label of a single instance in a single iteration
+                changed_indice_list = []
+                for i_class in target_classes:
                     class_count_dict = pd.Series(y[i_bag]).value_counts().to_dict()
                     class_count = class_count_dict.get(i_class, 0)
                     if class_count < lower_threshold[i_bag, i_class]:
                         # fs is minus
-                        indice_should_be_positive = np.argsort(-fs[i_bag][:, i_class])[:int(lower_threshold[i_bag, i_class])]
+                        argsorted_with_score = np.argsort(-fs[i_bag][:, i_class])
+                        # In this iteration, this instance will only be changed to this class and not to any other class
+                        argsorted_with_score = np.array([x for x in argsorted_with_score if x not in changed_indice_list])
+                        indice_should_be_positive = argsorted_with_score[:int(lower_threshold[i_bag, i_class])]
+                        # Register the instance whose label has been changed.
+                        changed_indice_list.extend(indice_should_be_positive.tolist())
                         y[i_bag][indice_should_be_positive] = i_class
                         has_changed = True
                     elif upper_threshold[i_bag, i_class] <= class_count:
-                        indice_should_be_negative = np.argsort(fs[i_bag][:, i_class])[:(n_list[i_bag] - int(upper_threshold[i_bag, i_class]))]
+                        argsorted_with_score = np.argsort(fs[i_bag][:, i_class])
+                        # In this iteration, this instance will only be changed to this class and not to any other class
+                        argsorted_with_score = np.array([x for x in argsorted_with_score if x not in changed_indice_list])
+                        indice_should_be_negative = argsorted_with_score[:(n_list[i_bag] - int(upper_threshold[i_bag, i_class]))]
                         indice_should_change_to_be_negative = list(
                             set(indice_should_be_negative.tolist()).intersection(
                                 set(np.argwhere(y[i_bag] == i_class).ravel().tolist())))
-                        y[i_bag][indice_should_change_to_be_negative] = np.random.choice(n_classes, size=1)  # TODO
+                        # Register the instance whose label has been changed.
+                        changed_indice_list.extend(indice_should_change_to_be_negative)
+                        # Instances above the upper limit will be randomly assigned to other classes.
+                        y[i_bag][indice_should_change_to_be_negative] = np.random.choice(
+                            n_classes, size=len(indice_should_change_to_be_negative))  # TODO
                         has_changed = True
             
             if debug:
