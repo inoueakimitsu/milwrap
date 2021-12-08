@@ -92,7 +92,7 @@ class MilCountBasedMultiClassLearner:
                         # fs is minus
                         argsorted_with_score = np.argsort(-fs[i_bag][:, i_class])
                         # In this iteration, this instance will only be changed to this class and not to any other class
-                        argsorted_with_score = np.array([x for x in argsorted_with_score if x not in changed_indice_list])
+                        argsorted_with_score = argsorted_with_score[np.isin(argsorted_with_score, changed_indice_list, assume_unique=True, invert=True)]
                         indice_should_be_positive = argsorted_with_score[:int(lower_threshold[i_bag, i_class])]
                         # Register the instance whose label has been changed.
                         changed_indice_list.extend(indice_should_be_positive.tolist())
@@ -101,7 +101,7 @@ class MilCountBasedMultiClassLearner:
                     elif upper_threshold[i_bag, i_class] <= class_count:
                         argsorted_with_score = np.argsort(fs[i_bag][:, i_class])
                         # In this iteration, this instance will only be changed to this class and not to any other class
-                        argsorted_with_score = np.array([x for x in argsorted_with_score if x not in changed_indice_list])
+                        argsorted_with_score = argsorted_with_score[np.isin(argsorted_with_score, changed_indice_list, assume_unique=True, invert=True)]
                         indice_should_be_negative = argsorted_with_score[:(n_list[i_bag] - int(upper_threshold[i_bag, i_class]))]
                         indice_should_change_to_be_negative = list(
                             set(indice_should_be_negative.tolist()).intersection(
