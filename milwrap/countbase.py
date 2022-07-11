@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import scipy.stats
 import sklearn
+import sklearn.multiclass
 
 def get_order_based_initial_bag_labels(
         n_instances_for_each_bag_and_class: np.ndarray) -> List[int]:
