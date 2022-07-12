@@ -264,8 +264,7 @@ class OneVsRestMilCountBasedMultiClassLearner:
 def convert_binary_classifiers_to_ovr_multiclassifier(
         n_classes, n_features, classifiers):
     
-    clf = sklearn.multiclass.OneVsRestClassifier(
-        sklearn.tree.DecisionTreeClassifier(min_samples_leaf=10))
+    clf = sklearn.multiclass.OneVsRestClassifier(classifiers[0])
     
     dummy_n_classes = n_classes
     dummy_n_sample_per_classes = 10
