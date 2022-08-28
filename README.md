@@ -21,6 +21,8 @@ pip install milwrap
 
 ## Usage
 
+For more information, see [Use scikit-learn models in multiple instance learning based on the count-based assumption](https://github.com/inoueakimitsu/milwrap/blob/main/intro-en.md).
+
 ```python
 # Prepare single-instance supervised-learning algorithm
 # Note: only supports models with predict_proba() method.
