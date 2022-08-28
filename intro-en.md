@@ -1,6 +1,6 @@
 # Use scikit-learn models in multiple instance learning based on the count-based assumption 
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/inoueakimitsu/milwrap/blob/master/milwrap-experiment.ipynb.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/inoueakimitsu/milwrap/blob/master/milwrap-experiment.ipynb)
 
 - [Use scikit-learn models in multiple instance learning based on the count-based assumption](#use-scikit-learn-models-in-multiple-instance-learning-based-on-the-count-based-assumption)
   - [Overview](#overview)

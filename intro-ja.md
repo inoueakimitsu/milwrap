@@ -1,6 +1,6 @@
 # カウント ベース仮定下での Multiple Instance Learning で scikit-learn のモデルを使用する方法
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/inoueakimitsu/milwrap/blob/master/milwrap-experiment.ipynb.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/inoueakimitsu/milwrap/blob/master/milwrap-experiment.ipynb)
 
 - [カウント ベース仮定下での Multiple Instance Learning で scikit-learn のモデルを使用する方法](#カウント-ベース仮定下での-multiple-instance-learning-で-scikit-learn-のモデルを使用する方法)
   - [概要](#概要)
