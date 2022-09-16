@@ -43,18 +43,21 @@
 
 ## 概要
 
-本記事では、Multiple Instance Learning（MIL）の概要と、MIL のための Python ライブラリ milwrap を紹介します。
+本記事では、Multiple Instance Learning（MIL）のタスクに取り組んでいる方のために、
+MIL の概要と、MIL を行うための Python ライブラリ milwrap を紹介します。
 
-milwrap を利用するメリットは 3 つあります。
+以下のようなご要望がある方は、milwrap の利用をご検討ください。
 
-- マルチクラス分類をサポートしています。
-- カウント ベースの仮定をサポートをしています。
-- scikit-learn スタイルの API を持つ任意の教師あり学習モデルを MIL のフレームワークに適応させることができます。
+    MIL でマルチクラス分類タスクを扱うケース
+    バッグに対して、陽性インスタンスが含まれるかではなく、陽性インスタンス数の最小値や最大値が得られるケース
+    scikit-learn や、PyTorch などの教師あり学習モデルを MIL の枠組みで学習させたいケース
 
-本レポートの実験では、以下のことを示しました。
+なお、milwrap を利用するかのご判断を助けるために、
+本レポートの最後に milwrap の性能評価実験の結果を記載しています。
+お忙しい方のために実験結果の概要を以下に示します。
 
-- milwrap を用いた場合、条件によっては Multiple Instance Learning でも Single Instance Learning と同程度の精度を得ることが可能です。
-- データの粒度をできるだけ落とさず、Count-based Assumption に従うデータの情報を利用することで、より高い精度が得られる。
+    milwrap を用いると、条件によっては Multiple Instance Learning でも Single Instance Learning と同程度の精度を得ることが可能なケースがあります。
+    データの粒度をできるだけ落とさないことが必要です。カウントベース仮定に従う正解データの情報を使うことで、より高い精度が得られます。
 
 本論文の構成は以下の通りです。
 
