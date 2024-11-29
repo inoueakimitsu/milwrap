@@ -7,17 +7,17 @@ import scipy.stats
 
 
 def get_order_based_initial_bag_labels(
-        n_instances_for_each_bag_and_class: np.ndarray) -> List[int]:
+        class_ratio_for_each_bag_and_class: np.ndarray) -> List[int]:
     
-    assert len(n_instances_for_each_bag_and_class.shape) == 2
+    assert len(class_ratio_for_each_bag_and_class.shape) == 2
 
-    n_bags = n_instances_for_each_bag_and_class.shape[0]
-    n_classes = n_instances_for_each_bag_and_class.shape[1]
+    n_bags = class_ratio_for_each_bag_and_class.shape[0]
+    n_classes = class_ratio_for_each_bag_and_class.shape[1]
 
-    bag_order = np.zeros_like(n_instances_for_each_bag_and_class, dtype=int)
+    bag_order = np.zeros_like(class_ratio_for_each_bag_and_class, dtype=int)
     
     for i_class in range(n_classes):
-        bag_order[:, i_class] = scipy.stats.rankdata(n_instances_for_each_bag_and_class[:, i_class])
+        bag_order[:, i_class] = scipy.stats.rankdata(class_ratio_for_each_bag_and_class[:, i_class])
 
     initial_bag_labels = [0 for _ in range(n_bags)]
 
@@ -32,10 +32,16 @@ def get_order_based_initial_y(
         upper_threshold: np.ndarray,
         n_instances_of_each_bags: List[int],
         ) -> List[np.ndarray]:
+    
+    n_instances_of_each_bag_and_class = ((lower_threshold + upper_threshold) / 2)
+    n_classes = lower_threshold.shape[1]
+    class_ratio_for_each_bag_and_class = \
+        n_instances_of_each_bag_and_class / np.repeat(
+            np.array([n_instances_of_each_bags]).T, n_classes, axis=1)
+
     return [np.repeat(label, n) for n, label in zip(
         n_instances_of_each_bags,
-        get_order_based_initial_bag_labels(
-            (lower_threshold + upper_threshold) / 2))]
+        get_order_based_initial_bag_labels(class_ratio_for_each_bag_and_class))]
 
 class MilCountBasedMultiClassLearner:
 

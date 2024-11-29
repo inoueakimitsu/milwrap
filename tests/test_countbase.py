@@ -30,7 +30,7 @@ def test_get_order_based_initial_y():
         [400, 20, 3],
     ], dtype="float32")
 
-    n_instances_of_each_bags = [1000, 2000, 500]
+    n_instances_of_each_bags = [1000, 1001, 1002]
 
     order_based_initial_y = get_order_based_initial_y(
         lower_bound, upper_bound,
