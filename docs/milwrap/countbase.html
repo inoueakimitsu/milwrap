@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1">
 <meta name="generator" content="pdoc3 0.11.5">
 <title>milwrap.countbase API documentation</title>
-<meta name="description" content="">
+<meta name="description" content="Multiple instance learning implementation based on count-based constraints …">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/10up-sanitize.css/13.0.0/sanitize.min.css" integrity="sha512-y1dtMcuvtTMJc1yPgEqF0ZjQbhnc/bFhyvIyVNb9Zk5mIGtqVaAB1Ttl28su8AvFMOY0EwRbAe+HCLqj6W7/KA==" crossorigin>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/10up-sanitize.css/13.0.0/typography.min.css" integrity="sha512-Y1DYSb995BAfxobCkKepB1BqJJTPrOp3zPL74AWFugHHmmdcvO+C48WLrUOlhGMc0QG7AE3f7gmvvcrmX2fDoA==" crossorigin>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/default.min.css" crossorigin>
@@ -38,6 +38,9 @@ el.replaceWith(d);
 <h1 class="title">Module <code>milwrap.countbase</code></h1>
 </header>
 <section id="section-intro">
+<p>Multiple instance learning implementation based on count-based constraints.</p>
+<p>This module provides implementations for multiple instance learning algorithms
+that use count-based constraints to learn from bags of instances.</p>
 </section>
 <section>
 </section>
@@ -47,16 +50,30 @@ el.replaceWith(d);
 <h2 class="section-title" id="header-functions">Functions</h2>
 <dl>
 <dt id="milwrap.countbase.get_order_based_initial_bag_labels"><code class="name flex">
-<span>def <span class="ident">get_order_based_initial_bag_labels</span></span>(<span>n_instances_for_each_bag_and_class: numpy.ndarray) ‑> List[int]</span>
+<span>def <span class="ident">get_order_based_initial_bag_labels</span></span>(<span>n_instances_for_each_bag_and_class: numpy.ndarray[tuple[int, ...], numpy.dtype[numpy.int64]]) ‑> List[int]</span>
 </code></dt>
 <dd>
-<div class="desc"></div>
+<div class="desc"><p>Generate initial bag labels based on instance order.</p>
+<h2 id="args">Args:</h2>
+<pre><code>n_instances_for_each_bag_and_class: Array of instance counts for each bag and class.
+</code></pre>
+<h2 id="returns">Returns:</h2>
+<pre><code>List of initial bag labels.
+</code></pre></div>
 </dd>
 <dt id="milwrap.countbase.get_order_based_initial_y"><code class="name flex">
-<span>def <span class="ident">get_order_based_initial_y</span></span>(<span>lower_threshold: numpy.ndarray,<br>upper_threshold: numpy.ndarray,<br>n_instances_of_each_bags: List[int]) ‑> List[numpy.ndarray]</span>
+<span>def <span class="ident">get_order_based_initial_y</span></span>(<span>lower_threshold: numpy.ndarray[tuple[int, ...], numpy.dtype[numpy.float64]],<br>upper_threshold: numpy.ndarray[tuple[int, ...], numpy.dtype[numpy.float64]],<br>n_instances_of_each_bags: List[int]) ‑> List[numpy.ndarray[tuple[int, ...], numpy.dtype[numpy.int64]]]</span>
 </code></dt>
 <dd>
-<div class="desc"></div>
+<div class="desc"><p>Generate initial instance labels based on thresholds and bag sizes.</p>
+<h2 id="args">Args:</h2>
+<pre><code>lower_threshold: Lower threshold array for each bag and class.
+upper_threshold: Upper threshold array for each bag and class.
+n_instances_of_each_bags: List of instance counts for each bag.
+</code></pre>
+<h2 id="returns">Returns:</h2>
+<pre><code>List of arrays containing initial instance labels.
+</code></pre></div>
 </dd>
 </dl>
 </section>
@@ -65,17 +82,35 @@ el.replaceWith(d);
 <dl>
 <dt id="milwrap.countbase.MilCountBasedMultiClassLearner"><code class="flex name class">
 <span>class <span class="ident">MilCountBasedMultiClassLearner</span></span>
-<span>(</span><span>classifier)</span>
+<span>(</span><span>classifier: object)</span>
 </code></dt>
 <dd>
-<div class="desc"></div>
+<div class="desc"><p>Multiple instance learning classifier using count-based constraints.</p>
+<p>Initialize the learner.</p>
+<h2 id="args">Args:</h2>
+<pre><code>classifier: Base classifier that implements fit/predict/predict_proba.
+</code></pre></div>
 <h3>Methods</h3>
 <dl>
 <dt id="milwrap.countbase.MilCountBasedMultiClassLearner.fit"><code class="name flex">
-<span>def <span class="ident">fit</span></span>(<span>self,<br>bags,<br>lower_threshold,<br>upper_threshold,<br>n_classes,<br>max_iter=10,<br>initial_y=None,<br>debug_true_y=None,<br>seed=None,<br>debug=True)</span>
+<span>def <span class="ident">fit</span></span>(<span>self,<br>bags: Sequence[numpy.ndarray[tuple[int, ...], numpy.dtype[numpy.float64]]],<br>lower_threshold: numpy.ndarray[tuple[int, ...], numpy.dtype[numpy.float64]],<br>upper_threshold: numpy.ndarray[tuple[int, ...], numpy.dtype[numpy.float64]],<br>n_classes: int,<br>max_iter: int = 10,<br>initial_y: List[numpy.ndarray[tuple[int, ...], numpy.dtype[numpy.int64]]] | None = None,<br>debug_true_y: List[numpy.ndarray[tuple[int, ...], numpy.dtype[numpy.int64]]] | None = None,<br>seed: int | None = None,<br>*,<br>debug: bool = True) ‑> tuple[object, typing.List[numpy.ndarray[tuple[int, ...], numpy.dtype[numpy.int64]]]]</span>
 </code></dt>
 <dd>
-<div class="desc"></div>
+<div class="desc"><p>Fit the classifier using count-based multiple instance learning.</p>
+<h2 id="args">Args:</h2>
+<pre><code>bags: Sequence of bags, where each bag is an array of instances.
+lower_threshold: Lower threshold array for each bag and class.
+upper_threshold: Upper threshold array for each bag and class.
+n_classes: Number of classes.
+max_iter: Maximum number of iterations.
+initial_y: Initial instance labels (optional).
+debug_true_y: True instance labels for debugging (optional).
+seed: Random seed for reproducibility.
+debug: Whether to print debug information.
+</code></pre>
+<h2 id="returns">Returns:</h2>
+<pre><code>Tuple of (fitted classifier, final instance labels).
+</code></pre></div>
 </dd>
 </dl>
 </dd>

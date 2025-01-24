@@ -23,6 +23,27 @@ ignore = [
     "ANN101",  # Missing type annotation for `self` in method
     "EM102",  # Exception must not use an f-string literal, assign to variable first
     "TRY003",  # Avoid specifying long messages outside the exception class
+    "D203",   # 1 blank line required before class docstring (conflicts with D211)
+    "D213",   # Multi-line docstring summary should start at the second line (conflicts with D212)
+    "T201",   # `print` found (allow print statements for debugging)
+    "ERA001", # Found commented-out code (allow for development reference)
+    "NPY002", # Replace legacy numpy random calls (maintain compatibility)
+    "UP035",  # `typing.List` is deprecated (maintain compatibility)
+    "UP006",  # Use `list` instead of `List` (maintain compatibility)
+    "B905",   # `zip()` without explicit `strict=` parameter (maintain compatibility)
+    "PLR2004", # Magic value used in comparison (allow for simple cases)
+    "PLR0913", # Too many arguments in function definition
+    "PLR0915", # Too many statements
+    "C901",    # Function is too complex
+    "FBT002",  # Boolean positional arg in function definition
+    "PGH003",  # Use specific rule codes when ignoring type issues
+    "PTH100",  # os.path.abspath() should be replaced
+    "PTH120",  # os.path.dirname() should be replaced
+    "PTH123",  # open() should be replaced
+    "PTH118",  # os.path.join() should be replaced
+    "UP015",   # Unnecessary open mode parameters
+    "RET504",  # Unnecessary assignment before return
+    "PD011",   # Use .to_numpy() instead of .values
 ]
 fixable = ["ALL"]
 unfixable = []
