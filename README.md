@@ -1,6 +1,6 @@
 # milwrap
 
-[![Build Status](https://app.travis-ci.com/inoueakimitsu/milwrap.svg?branch=main)](https://app.travis-ci.com/inoueakimitsu/milwrap)
+[![Python Tests](https://github.com/inoueakimitsu/milwrap/actions/workflows/python-tests.yml/badge.svg)](https://github.com/inoueakimitsu/milwrap/actions/workflows/python-tests.yml)
 <a href="https://github.com/inoueakimitsu/milwrap/issues"><img alt="GitHub issues" src="https://img.shields.io/github/issues/inoueakimitsu/milwrap"></a> 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/inoueakimitsu/milwrap/blob/master/introduction.ipynb)
 
