@@ -29,6 +29,19 @@ pytest = "*"
 mypy = "*"
 sphinx = "*"
 sphinx-rtd-theme = "*"
+pre-commit = "^3.3.3"
+pytest-cov = "^4.1.0"
+commitizen = "^3.6.0"
+pdoc3 = "^0.11.1"
+ruff = "^0.4.5"
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+tag_format = "$version"
+version_scheme = "pep440"
+version_provider = "poetry"
+update_changelog_on_bump = true
+major_version_zero = true
 
 [build-system]
 requires = ["poetry-core"]

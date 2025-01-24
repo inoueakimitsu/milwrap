@@ -1,0 +1,98 @@
+# 一般的な pre-commit フックのリポジトリ
+repos:
+  # コードの基本的な品質を保つフック群
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.4.0
+    hooks:
+      - id: trailing-whitespace
+      - id: name-tests-test
+      - id: mixed-line-ending
+      - id: forbid-submodules
+      - id: forbid-new-submodules
+      - id: fix-encoding-pragma
+        args: ["--remove"]
+      - id: fix-byte-order-marker
+      - id: file-contents-sorter
+      - id: end-of-file-fixer
+        exclude: '^docs/.*|requirements\.txt'
+      - id: detect-private-key
+      - id: destroyed-symlinks
+      - id: debug-statements
+      - id: check-yaml
+      - id: check-xml
+      - id: check-vcs-permalinks
+      - id: check-toml
+      - id: check-symlinks
+      - id: check-shebang-scripts-are-executable
+      - id: check-merge-conflict
+      - id: check-executables-have-shebangs
+      - id: check-case-conflict
+      - id: check-case-conflict
+      - id: check-builtin-literals
+      - id: check-ast
+      - id: check-added-large-files
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.4.5
+    hooks:
+      - id: ruff
+        args: [ --fix ]
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+    - id: pdoc3
+      name: pdoc3
+      language: system
+      types: [python]
+      entry: "poetry run pdoc --html --force -o docs --config show_source_code=False --config latex_math=True milwrap"
+      always_run: true
+      pass_filenames: false
+
+  - repo: local
+    hooks:
+    - id: pytest
+      name: pytest
+      stages: [commit]
+      language: system
+      entry: poetry run pytest -s -v .
+      types: [python]
+      pass_filenames: false
+      always_run: true
+    - id: pytest-cov
+      name: pytest-cov
+      stages: [commit]
+      language: system
+      entry: poetry run pytest -v --cov=milwrap --cov-fail-under=50
+      types: [python]
+      pass_filenames: false
+      always_run: true
+
+  - repo: https://github.com/python-poetry/poetry
+    rev: 1.6.1
+    hooks:
+    - id: poetry-check
+    - id: poetry-lock
+    - id: poetry-export
+      args: ["-f", "requirements.txt", "-o", "requirements.txt", "--without-hashes"]
+
+  - repo: https://github.com/commitizen-tools/commitizen
+    rev: v3.13.0
+    hooks:
+      - id: commitizen
+      - id: commitizen-branch
+        stages: [push]
+
+  - repo: https://gitlab.com/smop/pre-commit-hooks
+    rev: v1.0.0
+    hooks:
+      - id: check-poetry
+
+  - repo: https://github.com/roy-ht/pre-commit-jupyter
+    rev: v1.2.1
+    hooks:
+      - id: jupyter-notebook-cleanup
+        args:
+          - --remove-kernel-metadata
+          - --pin-patterns
+          - "[pin];[donotremove]"
