@@ -1,7 +1,7 @@
 # milwrap
 
 [![Python Tests](https://github.com/inoueakimitsu/milwrap/actions/workflows/python-tests.yml/badge.svg)](https://github.com/inoueakimitsu/milwrap/actions/workflows/python-tests.yml)
-<a href="https://github.com/inoueakimitsu/milwrap/issues"><img alt="GitHub issues" src="https://img.shields.io/github/issues/inoueakimitsu/milwrap"></a> 
+<a href="https://github.com/inoueakimitsu/milwrap/issues"><img alt="GitHub issues" src="https://img.shields.io/github/issues/inoueakimitsu/milwrap"></a>
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/inoueakimitsu/milwrap/blob/master/introduction.ipynb)
 
 Python package for multiple instance learning (MIL).
@@ -30,7 +30,7 @@ from sklearn.linear_model import LogisticRegression
 clf = LogisticRegression()
 
 # Wrap it with MilCountBasedMultiClassLearner
-from milwrap import MilCountBasedMultiClassLearner 
+from milwrap import MilCountBasedMultiClassLearner
 mil_learner = MilCountBasedMultiClassLearner(clf)
 
 # Prepare follwing dataset
