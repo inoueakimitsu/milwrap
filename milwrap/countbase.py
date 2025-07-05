@@ -105,9 +105,62 @@ def compute_soft_topk_count_loss(
     # Add entropy regularization to prevent trivial solutions
     # Encourage diverse but confident predictions
     entropy = -np.sum(probs * np.log(probs + 1e-8) + (1 - probs) * np.log(1 - probs + 1e-8))
-    entropy_reg = 0.005 * entropy / n_instances  # Further reduced for sharper decisions
+    entropy_reg = 0.008 * entropy / n_instances  # Slightly increased for better regularization
     
     return count_loss + entropy_reg
+
+
+def sparsemax(z: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Compute sparsemax activation (Martins & Astudillo, 2016).
+    
+    Simplified 1D implementation for efficiency.
+    
+    Args:
+    ----
+        z: 1D input array
+        
+    Returns:
+    -------
+        Sparse probability distribution
+        
+    """
+    # Sort z in descending order
+    z_sorted = np.sort(z)[::-1]
+    z_cumsum = np.cumsum(z_sorted)
+    
+    # Find the support
+    k_array = np.arange(1, len(z) + 1)
+    support = z_sorted * k_array > (z_cumsum - 1)
+    k_max = np.sum(support)
+    
+    # Compute threshold
+    tau_z = (z_cumsum[k_max - 1] - 1) / k_max
+    
+    # Compute sparsemax
+    return np.maximum(0, z - tau_z)
+
+
+def compute_attention_entropy(attention_weights: NDArray[np.float64]) -> float:
+    """Compute entropy of attention weights for AEM regularization.
+    
+    Args:
+    ----
+        attention_weights: Attention weight array
+        
+    Returns:
+    -------
+        Entropy value
+        
+    """
+    # Add small epsilon for numerical stability
+    eps = 1e-8
+    # Normalize if not already normalized
+    if not np.allclose(np.sum(attention_weights), 1.0):
+        attention_weights = attention_weights / (np.sum(attention_weights) + eps)
+    
+    # Compute entropy
+    entropy = -np.sum(attention_weights * np.log(attention_weights + eps))
+    return entropy
 
 
 def get_order_based_initial_bag_labels(
@@ -244,7 +297,7 @@ class MilCountBasedMultiClassLearner:
         temperature_end = 0.01  # Very low end for highly decisive assignments
         
         # MIL-Dropout parameters for better generalization
-        mil_dropout_rate = 0.03  # Drop 3% of high-scoring instances
+        mil_dropout_rate = 0.02  # Drop 2% of high-scoring instances for better stability
         mil_dropout_start_iter = 3  # Start after third iteration
         
         # Count loss weight schedule
@@ -252,7 +305,7 @@ class MilCountBasedMultiClassLearner:
         count_loss_weight_final = 0.9
         
         # Stochastic Weight Averaging (SWA) parameters
-        swa_start_iter = 4  # Start SWA from iteration 4
+        swa_start_iter = 3  # Start SWA earlier for better averaging
         swa_classifier = None
         swa_update_freq = 1
         
@@ -360,6 +413,7 @@ class MilCountBasedMultiClassLearner:
             # For every bag - use soft assignments with augmented Lagrangian
             has_changed = False
             total_count_loss = 0.0
+            total_attention_entropy = 0.0  # For AEM regularization
             
             for i_bag in range(len(bags)):
                 # Hybrid approach: combine constraint-based selection with soft assignments
@@ -394,10 +448,20 @@ class MilCountBasedMultiClassLearner:
                     n_features = instance_features.shape[1]
                     similarities = similarities / (np.sqrt(n_features) + 1e-8)
                     
-                    # Apply temperature-scaled softmax for sharper attention
-                    attention_temp = temperature * 2  # Use higher temp for attention
-                    exp_sim = np.exp((similarities - np.max(similarities, axis=1, keepdims=True)) / attention_temp)
-                    attention_weights = exp_sim / (np.sum(exp_sim, axis=1, keepdims=True) + 1e-8)
+                    # Apply sparsemax for sharper, more selective attention
+                    attention_temp = temperature * 1.5  # Slightly lower temp for sparsemax
+                    # Compute attention scores
+                    attention_scores = (similarities - np.max(similarities, axis=1, keepdims=True)) / attention_temp
+                    
+                    # Use sparsemax instead of softmax for more decisive attention
+                    if i_iter >= 2 and temperature < 0.5:  # Start using sparsemax after initial iterations and low temp
+                        attention_weights = np.zeros_like(attention_scores)
+                        for i in range(n_instances):
+                            attention_weights[i, :] = sparsemax(attention_scores[i, :])
+                    else:
+                        # Use softmax for initial iterations or high temperature
+                        exp_sim = np.exp(attention_scores)
+                        attention_weights = exp_sim / (np.sum(exp_sim, axis=1, keepdims=True) + 1e-8)
                     
                     # Enhanced instance importance with multiple factors
                     # 1. Entropy-based uniqueness
@@ -418,8 +482,15 @@ class MilCountBasedMultiClassLearner:
                     instance_importance = (0.4 * entropy_score + 
                                          0.4 * dissimilarity_score + 
                                          0.2 * confidence_score)
+                    
+                    # AEM: Add attention entropy to encourage diverse attention
+                    # Average attention entropy across all instances in the bag
+                    bag_attention_entropy = np.mean([compute_attention_entropy(attention_weights[i, :]) 
+                                                   for i in range(n_instances)])
+                    total_attention_entropy += bag_attention_entropy
                 else:
                     instance_importance = np.ones(n_instances)
+                    total_attention_entropy += 0.0  # No attention entropy for single instance bags
                 
                 # Get current class counts
                 class_count_dict = pd.Series(y[i_bag]).value_counts().to_dict()
@@ -579,7 +650,11 @@ class MilCountBasedMultiClassLearner:
                 num_changes_instance = np.sum(np.hstack(y) != flatten_original_y)
                 print(num_changes_instance)
                 print("differentiable count loss")
-                print(f"{total_count_loss:.4f}")
+                # Add AEM entropy regularization to total loss
+                aem_lambda = 0.2  # AEM regularization weight
+                aem_loss = -aem_lambda * total_attention_entropy / len(bags)  # Negative because we want to maximize entropy
+                total_loss_with_aem = total_count_loss + aem_loss
+                print(f"{total_loss_with_aem:.4f} (count: {total_count_loss:.4f}, AEM: {aem_loss:.4f})")
                 if debug_true_y is not None:
                     print("instance unit accuracy")
                     print(
@@ -595,16 +670,24 @@ class MilCountBasedMultiClassLearner:
 
             # Continue to iteration 9 for evaluation, even if converged
             min_iterations = 9
-            if not has_changed and i_iter >= min_iterations:
+            if not has_changed and i_iter >= 4:
+                # Labels have converged, but continue training classifier intensively
                 if debug:
-                    print(f"Converged at iteration {i_iter}, continuing to refine classifier...")
-                # Even if labels don't change, continue training to refine decision boundaries
-            elif not has_changed and i_iter < min_iterations:
+                    print(f"Labels converged at iteration {i_iter}, refining classifier with additional training...")
+                # Train with additional inner iterations when labels are stable
+                inner_epochs = max(3, 9 - i_iter)  # More epochs if converged early
+                for inner_iter in range(inner_epochs):
+                    # Apply slight weight decay for regularization
+                    self.classifier.fit(flatten_bags, flatten_y)
+                    if hasattr(self.classifier, 'coef_') and inner_iter % 2 == 0:
+                        # Apply L2 regularization through weight decay
+                        self.classifier.coef_ *= 0.9995
+            elif not has_changed and i_iter < 4:
                 if debug:
-                    print(f"Labels converged at iteration {i_iter}, continuing to minimum {min_iterations} iterations...")
+                    print(f"Early convergence at iteration {i_iter}, continuing exploration...")
             
             # Only break after minimum iterations
-            if not has_changed and i_iter >= min_iterations:
+            if i_iter >= min_iterations - 1:
                 break
 
         # Use SWA classifier if available for better generalization
