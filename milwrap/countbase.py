@@ -74,8 +74,6 @@ def get_order_based_initial_y(
     ]
 
 
-
-
 class MilCountBasedMultiClassLearner:
     """Multiple instance learning classifier using count-based constraints."""
 
@@ -131,8 +129,8 @@ class MilCountBasedMultiClassLearner:
             # Improved initialization: consider both lower and upper thresholds
             # Use weighted average to find better initial class assignment
             threshold_center = (lower_threshold + upper_threshold) / 2.0
-            # Add small noise to break ties
-            threshold_center += np.random.randn(*threshold_center.shape) * 0.01
+            # Add small noise to break ties, slightly larger for external init robustness
+            threshold_center += np.random.randn(*threshold_center.shape) * 0.02
             
             y = [
                 np.repeat(class_index, n_instance_in_bag)
@@ -148,41 +146,27 @@ class MilCountBasedMultiClassLearner:
         n_bags = len(bags)
         lambda_lower = np.zeros((n_bags, n_classes))
         lambda_upper = np.zeros((n_bags, n_classes))
-        
-        # Multi-penalty ADMM: each constraint gets its own penalty parameter
-        rho_lower = np.ones((n_bags, n_classes)) * 1.0
-        rho_upper = np.ones((n_bags, n_classes)) * 1.0
+        rho = 1.0  # Penalty parameter for augmented Lagrangian
         
         # Temperature for soft assignments (starts high, anneals down)
-        # Optimal temperature scales with sqrt(d) where d is feature dimension
-        feature_dim = bags[0].shape[1] if len(bags) > 0 and len(bags[0]) > 0 else 7
-        # Higher initial temperature for better exploration
-        temperature_start = np.sqrt(feature_dim) * 1.5  # Increased from 0.5 to 1.5
-        temperature_end = 0.1
+        # Use slightly different schedule for external init (when initial_y is provided)
+        if initial_y is not None:
+            # More conservative temperature for external init
+            temperature_start = 1.5
+            temperature_end = 0.1
+        else:
+            # Original temperature for auto init
+            temperature_start = 2.0
+            temperature_end = 0.1
         temperature_decay = (temperature_end / temperature_start) ** (1.0 / max_iter)
-        
-        # Instance-aware temperature scaling factors
-        instance_temp_scale = [np.ones(len(bag)) for bag in bags]
-        
-        # Entropy regularization parameters
-        entropy_weight_start = 0.3  # Moderate entropy regularization at start (reduced from 0.5)
-        entropy_weight_end = 0.0    # No entropy regularization at end
-        entropy_decay = (entropy_weight_end + 1e-8) / (entropy_weight_start + 1e-8)
-        
-        # Constraint continuation parameters (gradual constraint tightening)
-        constraint_slack_start = 0.2  # 20% slack on constraints initially (reduced from 0.3)
-        constraint_slack_end = 0.0    # No slack at the end
-        constraint_slack_decay = constraint_slack_end / (constraint_slack_start + 1e-8)
 
         for i_iter in range(max_iter):
             # Temperature annealing
             temperature = temperature_start * (temperature_decay ** i_iter)
             
-            # Entropy weight annealing
-            entropy_weight = entropy_weight_start * (entropy_decay ** i_iter)
-            
-            # Constraint slack annealing (for continuation method)
-            constraint_slack = constraint_slack_start * (1.0 - i_iter / max_iter)
+            # Self-paced learning: confidence threshold for instance selection
+            # Start conservative, gradually include more instances
+            confidence_threshold = 0.7 - 0.2 * (i_iter / max_iter)  # 0.7 -> 0.5
             
             # Fit
             flatten_bags = np.vstack(bags)
@@ -193,13 +177,6 @@ class MilCountBasedMultiClassLearner:
             fs = [self.classifier.predict_proba(bag) for bag in bags]
             y_pred = [self.classifier.predict(bag) for bag in bags]
             flatten_original_y = np.hstack(list(y))
-            
-            # Update instance-aware temperature scaling based on prediction confidence
-            for i_bag in range(len(bags)):
-                max_probs = np.max(fs[i_bag], axis=1)
-                # Higher confidence -> lower temperature (more decisive)
-                # Lower confidence -> higher temperature (more exploration)
-                instance_temp_scale[i_bag] = 2.0 - max_probs  # Range: [1.0, 2.0]
 
             # For every bag - use soft assignments with augmented Lagrangian
             has_changed = False
@@ -207,18 +184,6 @@ class MilCountBasedMultiClassLearner:
                 # Hybrid approach: combine constraint-based selection with soft assignments
                 n_instances = len(bags[i_bag])
                 probs = fs[i_bag]  # Shape: (n_instances, n_classes)
-                
-                # Self-paced learning: identify high-confidence instances to freeze
-                max_probs = np.max(probs, axis=1)
-                predicted_classes = np.argmax(probs, axis=1)
-                
-                # Freeze instances with high confidence (adaptive threshold)
-                confidence_threshold = 0.9 - 0.3 * (i_iter / max_iter)  # Start strict, relax over time
-                frozen_indices = set()
-                if i_iter >= 2:  # Start freezing after initial exploration
-                    for idx in range(n_instances):
-                        if max_probs[idx] > confidence_threshold and y[i_bag][idx] == predicted_classes[idx]:
-                            frozen_indices.add(idx)
                 
                 # Get current class counts
                 class_count_dict = pd.Series(y[i_bag]).value_counts().to_dict()
@@ -238,22 +203,25 @@ class MilCountBasedMultiClassLearner:
                         # Need more instances of this class
                         deficit = int(lower_threshold[i_bag, i_class] - class_count)
                         
-                        # Find best candidates: high probability for this class, not already changed, not frozen
+                        # Find best candidates: high probability for this class, not already changed
                         candidates = []
                         for idx in range(n_instances):
-                            if idx not in changed_indices and idx not in frozen_indices and new_y[idx] != i_class:
+                            if idx not in changed_indices and new_y[idx] != i_class:
                                 # Score based on probability and current class constraint status
                                 score = probs[idx, i_class]
+                                
+                                # Self-paced learning: only consider high-confidence changes
+                                max_prob = np.max(probs[idx])
+                                if max_prob < confidence_threshold and i_iter < 3:
+                                    continue  # Skip low-confidence instances in early iterations
                                 
                                 # Boost score if moving from over-represented class
                                 current_class = new_y[idx]
                                 current_class_count = class_count_dict.get(current_class, 0)
                                 if current_class_count > upper_threshold[i_bag, current_class]:
-                                    # Use adaptive penalty parameter for stronger boost
-                                    score *= 1.0 + rho_upper[i_bag, current_class]
+                                    score *= 2.0  # Stronger boost for constraint satisfaction
                                 elif current_class_count <= lower_threshold[i_bag, current_class]:
-                                    # Use adaptive penalty parameter for penalty
-                                    score *= 1.0 / (1.0 + rho_lower[i_bag, current_class])
+                                    score *= 0.5  # Penalty for taking from under-represented class
                                 
                                 candidates.append((idx, score))
                         
@@ -281,10 +249,10 @@ class MilCountBasedMultiClassLearner:
                         # Too many instances of this class
                         excess = int(class_count - upper_threshold[i_bag, i_class])
                         
-                        # Find instances to reassign: low probability for this class, not frozen
+                        # Find instances to reassign: low probability for this class
                         candidates = []
                         for idx in range(n_instances):
-                            if idx not in changed_indices and idx not in frozen_indices and new_y[idx] == i_class:
+                            if idx not in changed_indices and new_y[idx] == i_class:
                                 candidates.append((idx, probs[idx, i_class]))
                         
                         # Sort by probability (ascending) and reassign
@@ -305,36 +273,20 @@ class MilCountBasedMultiClassLearner:
                                 # Base score from probability
                                 scores[c] = np.log(probs[idx, c] + 1e-8)
                                 
-                                # Constraint bonus with adaptive penalties and continuation
+                                # Constraint bonus
                                 c_count = class_count_dict.get(c, 0)
-                                # Apply constraint slack for continuation method
-                                lower_bound = lower_threshold[i_bag, c] * (1.0 - constraint_slack)
-                                upper_bound = upper_threshold[i_bag, c] * (1.0 + constraint_slack)
-                                
-                                if c_count < lower_bound:
-                                    # Use adaptive penalty for under-represented classes
-                                    scores[c] += rho_lower[i_bag, c] * 2.0
-                                elif c_count < upper_bound:
+                                if c_count < lower_threshold[i_bag, c]:
+                                    scores[c] += 2.0
+                                elif c_count < upper_threshold[i_bag, c]:
                                     scores[c] += 0.5
                                 else:
-                                    # Use adaptive penalty for over-represented classes
-                                    scores[c] -= rho_upper[i_bag, c]
+                                    scores[c] -= 1.0
                             
-                            # Apply temperature-controlled softmax with instance-aware scaling
+                            # Apply temperature-controlled softmax
                             # Gumbel noise disabled for now (ablation analysis)
-                            instance_temperature = temperature * instance_temp_scale[i_bag][idx]
                             
-                            exp_scores = np.exp(scores / instance_temperature)
+                            exp_scores = np.exp(scores / temperature)
                             probabilities = exp_scores / np.sum(exp_scores)
-                            
-                            # Apply entropy regularization to encourage diversity
-                            if entropy_weight > 0:
-                                entropy = -np.sum(probabilities * np.log(probabilities + 1e-8))
-                                # Adjust probabilities to increase entropy
-                                uniform_probs = np.ones(n_classes) / n_classes
-                                probabilities = (1.0 - entropy_weight) * probabilities + entropy_weight * uniform_probs
-                                # Renormalize
-                                probabilities = probabilities / np.sum(probabilities)
                             
                             # Choose new class
                             new_class = np.random.choice(n_classes, p=probabilities)
@@ -385,59 +337,11 @@ class MilCountBasedMultiClassLearner:
                 if debug:
                     print(f"Labels converged at iteration {i_iter}, continuing to refine classifier...")
                 # Train with additional inner iterations when labels are stable
-                # Use early stopping based on validation performance
-                best_score = -np.inf
-                patience = 3
-                no_improvement_count = 0
-                
-                for inner_iter in range(10):  # More inner epochs with early stopping
+                for inner_iter in range(5):  # 5 inner epochs after convergence
                     self.classifier.fit(flatten_bags, flatten_y)
-                    
-                    # Compute validation score
-                    val_predictions = np.hstack([self.classifier.predict(bag) for bag in bags])
-                    val_score = np.mean(val_predictions == flatten_y)
-                    
-                    if val_score > best_score:
-                        best_score = val_score
-                        no_improvement_count = 0
-                    else:
-                        no_improvement_count += 1
-                        
-                    if no_improvement_count >= patience:
-                        break
-                        
             elif not has_changed and i_iter < 4:
                 if debug:
                     print(f"Early convergence at iteration {i_iter}, continuing exploration...")
-            
-            # Update multi-penalty ADMM parameters based on constraint violations
-            if i_iter < max_iter - 1:
-                predicted_count = np.nan_to_num(
-                    pd.DataFrame([pd.Series(b).value_counts().to_dict() for b in y])[list(range(n_classes))].values,
-                )
-                
-                # Adaptive penalty update for lower constraints
-                lower_violations = np.maximum(lower_threshold - predicted_count, 0)
-                for i_bag in range(n_bags):
-                    for i_class in range(n_classes):
-                        if lower_violations[i_bag, i_class] > 0:
-                            # Increase penalty for violated constraints
-                            rho_lower[i_bag, i_class] *= 1.2
-                        else:
-                            # Decrease penalty for satisfied constraints
-                            rho_lower[i_bag, i_class] *= 0.9
-                        # Clamp to reasonable range
-                        rho_lower[i_bag, i_class] = np.clip(rho_lower[i_bag, i_class], 0.1, 10.0)
-                
-                # Adaptive penalty update for upper constraints
-                upper_violations = np.maximum(predicted_count - upper_threshold, 0)
-                for i_bag in range(n_bags):
-                    for i_class in range(n_classes):
-                        if upper_violations[i_bag, i_class] > 0:
-                            rho_upper[i_bag, i_class] *= 1.2
-                        else:
-                            rho_upper[i_bag, i_class] *= 0.9
-                        rho_upper[i_bag, i_class] = np.clip(rho_upper[i_bag, i_class], 0.1, 10.0)
             
             # Only break after minimum iterations
             if i_iter >= min_iterations - 1:
