@@ -113,6 +113,54 @@ def compute_soft_count_loss(predicted_counts: NDArray[np.float64], lower_thresho
     return (lower_loss + upper_loss) * temperature
 
 
+def compute_differentiable_exact_count_loss(probs: NDArray[np.float64], k_min: int, k_max: int, 
+                                           temperature: float = 1.0) -> float:
+    """Compute differentiable exact-k-of-n loss using Fenchel-Young approach.
+    
+    Based on 'A Unified Approach to Count-Based Weakly-Supervised Learning'.
+    
+    Args:
+        probs: Instance probabilities of shape (n_instances,).
+        k_min: Minimum number of positive instances.
+        k_max: Maximum number of positive instances.
+        temperature: Temperature parameter for differentiability.
+        
+    Returns:
+        Differentiable count loss value.
+    """
+    n = len(probs)
+    if k_min > n or k_max < 0:
+        return float('inf')  # Infeasible constraint
+    
+    # Log-space computation for numerical stability
+    log_probs = np.log(probs + 1e-10)
+    log_neg_probs = np.log(1 - probs + 1e-10)
+    
+    # Sort probabilities in descending order
+    sorted_indices = np.argsort(probs)[::-1]
+    sorted_log_probs = log_probs[sorted_indices]
+    sorted_log_neg_probs = log_neg_probs[sorted_indices]
+    
+    # Compute log probability for exactly k positives
+    log_probs_k = []
+    for k in range(max(0, k_min), min(n + 1, k_max + 1)):
+        if k == 0:
+            log_prob_k = np.sum(sorted_log_neg_probs)
+        elif k == n:
+            log_prob_k = np.sum(sorted_log_probs)
+        else:
+            log_prob_k = np.sum(sorted_log_probs[:k]) + np.sum(sorted_log_neg_probs[k:])
+        log_probs_k.append(log_prob_k / temperature)
+    
+    # Stable log-sum-exp for differentiability
+    if log_probs_k:
+        max_log_prob = max(log_probs_k)
+        stable_log_sum_exp = max_log_prob + np.log(sum(np.exp(lp - max_log_prob) for lp in log_probs_k))
+        return -stable_log_sum_exp * temperature
+    else:
+        return float('inf')
+
+
 def compute_diversity_score(selected_instances: NDArray[np.float64], embeddings: NDArray[np.float64]) -> float:
     """Compute diversity score for selected instances using cosine distance.
     
@@ -175,7 +223,7 @@ def compute_margin_aware_confidence(probs: NDArray[np.float64], target_class: in
     return confidence
 
 
-def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margin_scores=None, aem_scores=None, uncertainty_scores=None, embeddings=None, diversity_weight=0.1, use_diversity_optimization=False):
+def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margin_scores=None, aem_scores=None, uncertainty_scores=None):
     """Solve exact k-of-n assignment problem with optional margin weighting.
     
     Find optimal assignment of instances to positive class such that
@@ -189,9 +237,6 @@ def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margi
         margin_scores: margin-based scores for weighting (optional)
         aem_scores: AEM scores for weighting (optional)
         uncertainty_scores: uncertainty scores for weighting (optional)
-        embeddings: instance embeddings for diversity computation (optional)
-        diversity_weight: weight for diversity bonus (optional)
-        use_diversity_optimization: enable diversity-aware selection (optional)
         
     Returns:
         optimal_assignments: binary array of assignments
@@ -250,54 +295,8 @@ def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margi
     # Create assignment vector
     assignments = np.zeros(n, dtype=int)
     if best_k > 0:
-        if use_diversity_optimization and embeddings is not None and best_k > 1:
-            # Use greedy diverse selection
-            selected_indices = []
-            remaining_indices = sorted_indices.tolist()
-            
-            # Select first instance (highest score)
-            selected_indices.append(remaining_indices.pop(0))
-            
-            # Select remaining instances to maximize diversity
-            while len(selected_indices) < best_k and remaining_indices:
-                best_idx = None
-                best_combined_score = -np.inf
-                
-                for idx in remaining_indices[:min(10, len(remaining_indices))]:  # Consider top 10 candidates
-                    # Base score from log-odds
-                    base_score = log_odds[idx]
-                    
-                    # Compute minimum distance to already selected instances
-                    min_distance = np.inf
-                    for sel_idx in selected_indices:
-                        if embeddings is not None:
-                            # Use cosine distance
-                            sim = np.dot(embeddings[idx], embeddings[sel_idx]) / (
-                                np.linalg.norm(embeddings[idx]) * np.linalg.norm(embeddings[sel_idx]) + 1e-10
-                            )
-                            distance = 1.0 - sim
-                        else:
-                            # Use probability difference as distance
-                            distance = abs(probs[idx] - probs[sel_idx])
-                        min_distance = min(min_distance, distance)
-                    
-                    # Combined score: base score + diversity bonus
-                    combined_score = base_score + diversity_weight * min_distance
-                    
-                    if combined_score > best_combined_score:
-                        best_combined_score = combined_score
-                        best_idx = idx
-                
-                if best_idx is not None:
-                    selected_indices.append(best_idx)
-                    remaining_indices.remove(best_idx)
-            
-            # Apply assignments
-            for idx in selected_indices:
-                assignments[idx] = 1
-        else:
-            # Standard selection: top k by score
-            assignments[sorted_indices[:best_k]] = 1
+        # Standard selection: top k by score
+        assignments[sorted_indices[:best_k]] = 1
     
     return assignments
 
@@ -453,14 +452,14 @@ class MilCountBasedMultiClassLearner:
         # Initialize simple parameters
         n_bags = len(bags)
         
-        # Temperature decay settings (based on crossover optimization)
+        # Temperature decay settings (optimized primal-dual approach)
         temperature_start = 5.0  # Higher starting temperature for better exploration
-        temperature_min = 0.65   # Slightly lower minimum for better convergence
+        temperature_min = 0.7    # Higher minimum to avoid over-cooling (from uncertainty-crossover)
         temperature_current = temperature_start
         
-        # Decay rates
-        gamma_base = 0.87  # Slightly faster decay
-        gamma_fast = 0.68  # Accelerated rate when stalled
+        # Decay rates (from successful branches)
+        gamma_base = 0.88  # Main decay rate (from uncertainty-crossover)
+        gamma_fast = 0.70  # Accelerated rate when stalled (from uncertainty-crossover)
         patience = 2       # Iterations with minimal improvement to trigger fast decay
         
         # Self-paced learning: track bag difficulty scores
@@ -471,7 +470,12 @@ class MilCountBasedMultiClassLearner:
         
         # Simple confidence-based freezing (fixed threshold)
         confidence_threshold = 0.97  # Higher threshold for more selective freezing
-        margin_lambda = 0.20  # Fine-tuned from 0.25 for better balance
+        margin_lambda = 0.20  # Fine-tuned from uncertainty-crossover
+        
+        # Primal-dual optimization: dual variables for constraint violations
+        dual_lower = np.zeros((n_bags, n_classes))  # Dual variables for lower bound violations
+        dual_upper = np.zeros((n_bags, n_classes))  # Dual variables for upper bound violations
+        dual_step_size = 0.1  # Step size for dual updates
         
         for i_iter in range(max_iter):
             # Initialize total changes counter for this iteration
@@ -603,7 +607,11 @@ class MilCountBasedMultiClassLearner:
                         aem_scores_active = None
                         if i_iter >= 2:  # Start using AEM after warm-up
                             # Simple AEM with cosine annealing (o3 recommendation)
-                            base_lambda = 0.08  # Fine-tuned from 0.10
+                            # Use different lambda based on initialization type
+                            if initial_y is None:
+                                base_lambda = 0.06  # Lower for auto-init (from high-scoring branch)
+                            else:
+                                base_lambda = 0.03  # Even lower for external-init
                             
                             # Cosine annealing to 0 after second-to-last iteration
                             if i_iter >= max_iter - 2:
@@ -623,27 +631,21 @@ class MilCountBasedMultiClassLearner:
                             # Calculate base uncertainty scores
                             uncertainty_scores = compute_instance_uncertainty(probs)
                             
-                            # Apply iteration-based weighting
+                            # Apply iteration-based weighting (from uncertainty-crossover)
                             if i_iter == 2:
-                                uncertainty_weight = 0.10 * (temperature / temperature_start)  # ~0.08 typically
+                                uncertainty_weight = 0.12 * (temperature / temperature_start)  # ~0.10 typically
                             else:  # i_iter >= 3
-                                uncertainty_weight = min(0.22, 0.10 * (temperature / temperature_start))
+                                uncertainty_weight = min(0.25, 0.12 * (temperature / temperature_start))
                             
                             # Weight the scores for active instances
                             uncertainty_scores_active = uncertainty_scores[active_indices] * uncertainty_weight
                         
                         # Solve exact assignment for active instances with all scores
-                        # Enable diversity optimization after initial iterations
-                        use_diversity = i_iter >= 4 and n_active > 10 and k_max_active > 3  # More conservative conditions
-                        
                         optimal_assignment_active = exact_k_of_n_assignment(
                             active_probs, k_min_active, k_max_active, 
                             margin_scores=margin_scores, 
                             aem_scores=aem_scores_active,
-                            uncertainty_scores=uncertainty_scores_active,
-                            embeddings=probs[active_indices] if use_diversity else None,
-                            diversity_weight=0.08,  # Reduced diversity weight
-                            use_diversity_optimization=use_diversity
+                            uncertainty_scores=uncertainty_scores_active
                         )
                         
                         # Map back to full assignment
@@ -710,19 +712,13 @@ class MilCountBasedMultiClassLearner:
                                     # Add margin-aware confidence
                                     margin_conf = compute_margin_aware_confidence(probs[idx], i_class, margin_lambda=margin_lambda)
                                     # Incorporate uncertainty (prefer certain predictions)
-                                    uncertainty_penalty = uncertainty_scores[idx] * 0.18
+                                    uncertainty_penalty = uncertainty_scores[idx] * 0.2
                                     
-                                    # Add diversity bonus if this instance is different from already selected ones
-                                    diversity_bonus = 0.0
-                                    if len(changed_indices) > 0 and i_iter >= 3:
-                                        # Simple diversity: average distance to changed instances
-                                        changed_probs = [probs[changed_idx] for changed_idx in changed_indices if changed_idx < n_instances]
-                                        if changed_probs:
-                                            avg_similarity = np.mean([np.dot(probs[idx], cp) / (np.linalg.norm(probs[idx]) * np.linalg.norm(cp) + 1e-10) 
-                                                                    for cp in changed_probs])
-                                            diversity_bonus = 0.1 * (1.0 - avg_similarity)
+                                    score = base_score + 0.1 * (margin_conf - base_score) - uncertainty_penalty
                                     
-                                    score = base_score + 0.1 * (margin_conf - base_score) - uncertainty_penalty + diversity_bonus
+                                    # Add primal-dual penalty from dual variables
+                                    dual_penalty = dual_lower[i_bag, i_class] * 0.005  # Very small weight for dual influence
+                                    score += dual_penalty
                                     
                                     # Strong boost/penalty based on constraint satisfaction
                                     current_class = new_y[idx]
@@ -806,6 +802,9 @@ class MilCountBasedMultiClassLearner:
                                         scores[c] += 1.0
                                     else:
                                         scores[c] -= 2.0  # Strong penalty for over-represented classes
+                                    
+                                    # Add primal-dual penalties
+                                    scores[c] += dual_lower[i_bag, c] * 0.005 - dual_upper[i_bag, c] * 0.005
                                 
                                 # Apply temperature
                                 exp_scores = np.exp(scores / temperature)
@@ -869,6 +868,24 @@ class MilCountBasedMultiClassLearner:
                     print("instance unit accuracy (label adjusted)")
                     print(np.mean(np.hstack(y) == np.hstack(debug_true_y)))
                 print("-----")
+            
+            # Primal-dual update: Update dual variables based on constraint violations
+            if i_iter > 0:
+                # Compute current class counts
+                predicted_count = np.nan_to_num(
+                    pd.DataFrame([pd.Series(b).value_counts().to_dict() for b in y])[list(range(n_classes))].values,
+                )
+                
+                # Update dual variables (gradient ascent on dual)
+                lower_violations = np.maximum(0, lower_threshold - predicted_count)
+                upper_violations = np.maximum(0, predicted_count - upper_threshold)
+                
+                # ADMM-style dual updates with momentum
+                dual_lower += dual_step_size * lower_violations
+                dual_upper += dual_step_size * upper_violations
+                
+                # Decay dual step size over iterations
+                dual_step_size *= 0.95
 
             
             # Continue to iteration 9 for evaluation, even if converged
