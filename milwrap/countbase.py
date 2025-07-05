@@ -149,7 +149,7 @@ class MilCountBasedMultiClassLearner:
         rho = 1.0  # Penalty parameter for augmented Lagrangian
         
         # Temperature for soft assignments (starts high, anneals down)
-        temperature_start = 2.0
+        temperature_start = 2.0  # Keep original value that worked well
         temperature_end = 0.1
         temperature_decay = (temperature_end / temperature_start) ** (1.0 / max_iter)
 
@@ -188,9 +188,14 @@ class MilCountBasedMultiClassLearner:
                 for i_class in target_classes:
                     class_count = class_count_dict.get(i_class, 0)
                     
-                    if class_count < lower_threshold[i_bag, i_class]:
+                    # Apply minimal slack only in first iteration for robustness
+                    effective_lower = lower_threshold[i_bag, i_class]
+                    if i_iter == 0:  # Only first iteration
+                        effective_lower = effective_lower * 0.95  # 5% slack
+                    
+                    if class_count < effective_lower:
                         # Need more instances of this class
-                        deficit = int(lower_threshold[i_bag, i_class] - class_count)
+                        deficit = int(effective_lower - class_count)
                         
                         # Find best candidates: high probability for this class, not already changed
                         candidates = []
@@ -229,9 +234,14 @@ class MilCountBasedMultiClassLearner:
                 for i_class in target_classes:
                     class_count = class_count_dict.get(i_class, 0)
                     
-                    if class_count > upper_threshold[i_bag, i_class]:
+                    # Apply minimal slack only in first iteration for robustness
+                    effective_upper = upper_threshold[i_bag, i_class]
+                    if i_iter == 0:  # Only first iteration
+                        effective_upper = effective_upper * 1.05  # 5% slack
+                    
+                    if class_count > effective_upper:
                         # Too many instances of this class
-                        excess = int(class_count - upper_threshold[i_bag, i_class])
+                        excess = int(class_count - effective_upper)
                         
                         # Find instances to reassign: low probability for this class
                         candidates = []
