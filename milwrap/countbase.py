@@ -219,9 +219,9 @@ def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margi
     
     # Apply uncertainty penalty if provided (prefer certain predictions)
     if uncertainty_scores is not None and len(uncertainty_scores) == len(probs):
-        # Adaptive uncertainty penalty: start small to avoid early bias
-        uncertainty_weight = 0.05 + 0.15 * min(1.0, len(uncertainty_scores) / 100.0)
-        log_odds = log_odds - uncertainty_weight * uncertainty_scores
+        # Note: uncertainty weight is handled by the caller based on iteration
+        # This is now a pure pass-through of pre-weighted scores
+        log_odds = log_odds - uncertainty_scores
     
     # Sort by log-odds in descending order
     sorted_indices = np.argsort(log_odds)[::-1]
@@ -405,48 +405,49 @@ class MilCountBasedMultiClassLearner:
         # Initialize simple parameters
         n_bags = len(bags)
         
-        # Adaptive temperature decay
-        temperature_start = 2.0  # Higher starting temperature for exploration
-        temperature_end = 0.1    # Final temperature for precise assignments
+        # Temperature decay settings (based on crossover optimization)
+        temperature_start = 5.0  # Higher starting temperature for better exploration
+        temperature_min = 0.7    # Higher minimum to avoid over-cooling
         temperature_current = temperature_start
+        
+        # Decay rates
+        gamma_base = 0.88  # Main decay rate
+        gamma_fast = 0.70  # Accelerated rate when stalled
+        patience = 2       # Iterations with minimal improvement to trigger fast decay
         
         # Self-paced learning: track bag difficulty scores
         bag_difficulty = np.zeros(n_bags)
         
-        # Track convergence metrics
-        prev_total_changes = n_bags * 10  # Initialize with high value
-        stagnation_counter = 0
+        # Track convergence for stagnation detection
+        prev_accuracies = []  # Track recent accuracies for stagnation detection
         
         # Simple confidence-based freezing (fixed threshold)
         confidence_threshold = 0.97  # Higher threshold for more selective freezing
-        margin_lambda = 0.25  # Standard margin importance
+        margin_lambda = 0.20  # Fine-tuned from 0.25 for better balance
         
         for i_iter in range(max_iter):
             # Initialize total changes counter for this iteration
             total_changes = 0
             
-            # Adaptive temperature decay based on convergence
-            if i_iter > 0 and 'prev_iter_changes' in locals():
-                # Check convergence status
-                change_ratio = prev_iter_changes / (prev_total_changes + 1e-6)
+            # Simple temperature decay with stagnation detection
+            if i_iter > 0:
+                # Check for stagnation if we have accuracy history
+                is_stagnant = False
+                if len(prev_accuracies) >= patience and debug_true_y is not None:
+                    # Check if accuracy improvement is minimal
+                    recent_improvements = []
+                    for i in range(1, len(prev_accuracies[-patience:])):
+                        improvement = prev_accuracies[-patience:][i] - prev_accuracies[-patience:][i-1]
+                        recent_improvements.append(improvement)
+                    
+                    if all(imp < 0.001 for imp in recent_improvements):
+                        is_stagnant = True
                 
-                if change_ratio > 0.9:  # Many changes, slow down cooling
-                    temperature_decay_rate = 0.95
-                    stagnation_counter = 0
-                elif change_ratio < 0.1:  # Few changes, might be stuck
-                    stagnation_counter += 1
-                    if stagnation_counter >= 2:  # Reheat if stuck
-                        temperature_current = min(temperature_current * 1.2, temperature_start * 0.5)
-                        stagnation_counter = 0
-                    else:
-                        temperature_decay_rate = 0.85  # Faster cooling
-                else:  # Normal convergence
-                    temperature_decay_rate = 0.9
-                    stagnation_counter = 0
-                
-                # Apply decay
-                temperature_current = max(temperature_end, temperature_current * temperature_decay_rate)
-                prev_total_changes = total_changes
+                # Apply appropriate decay rate
+                if is_stagnant:
+                    temperature_current = max(temperature_min, gamma_fast * temperature_current)
+                else:
+                    temperature_current = max(temperature_min, gamma_base * temperature_current)
             
             temperature = temperature_current
             
@@ -499,13 +500,21 @@ class MilCountBasedMultiClassLearner:
                 
                 # For binary classification, use exact k-of-n solver
                 if n_classes == 2:
-                    # Progressive constraint tightening (curriculum learning)
-                    constraint_progress = min(1.0, i_iter / 5.0)  # Full constraints by iter 5
-                    slack_factor = 1.0 + 0.05 * (1.0 - constraint_progress)  # 5% to 0% slack
+                    # Constraint slack strategy (crossover optimization)
+                    if i_iter <= 1:
+                        slack_percent = 0.02  # 2% for first two iterations
+                    elif i_iter == 2:
+                        slack_percent = 0.01  # 1% for iteration 2
+                    elif i_iter <= 4:
+                        slack_percent = 0.005  # 0.5% for iterations 3-4
+                    else:
+                        slack_percent = 0.0  # 0% from iteration 5 onwards
                     
-                    effective_lower_0 = lower_threshold[i_bag, 0] * (2.0 - slack_factor)
+                    slack_factor = 1.0 + slack_percent
+                    
+                    effective_lower_0 = lower_threshold[i_bag, 0] * (1.0 - slack_percent)
                     effective_upper_0 = upper_threshold[i_bag, 0] * slack_factor
-                    effective_lower_1 = lower_threshold[i_bag, 1] * (2.0 - slack_factor)
+                    effective_lower_1 = lower_threshold[i_bag, 1] * (1.0 - slack_percent)
                     effective_upper_1 = upper_threshold[i_bag, 1] * slack_factor
                     
                     # For binary case, we optimize for class 1
@@ -545,32 +554,35 @@ class MilCountBasedMultiClassLearner:
                         # Compute AEM scores for the bag (only after initial iterations)
                         aem_scores_active = None
                         if i_iter >= 2:  # Start using AEM after warm-up
-                            # Adaptive lambda_entropy based on multiple factors
-                            base_lambda = 0.08 if initial_y is None else 0.04  # Slightly higher base
+                            # Simple AEM with cosine annealing (o3 recommendation)
+                            base_lambda = 0.08  # Fine-tuned from 0.10
                             
-                            # Factor 1: Constraint violations (higher violations = more entropy needed)
-                            constraint_penalty = bag_difficulty[i_bag] / (n_instances + 1e-6)
-                            constraint_factor = 1.0 + 0.5 * min(constraint_penalty, 1.0)
-                            
-                            # Factor 2: Convergence status (stagnation = more entropy)
-                            convergence_factor = 1.0
-                            if stagnation_counter > 0:
-                                convergence_factor = 1.2  # Boost entropy when stuck
-                            
-                            # Factor 3: Bag size (larger bags need more entropy)
-                            size_factor = 1.0 + 0.2 * np.log(max(1, n_instances / 20))
-                            
-                            # Combine factors with time decay
-                            time_decay = 0.5 + 0.5 * (1 - i_iter / max_iter)  # Slower decay
-                            lambda_entropy = base_lambda * constraint_factor * convergence_factor * size_factor * time_decay
+                            # Cosine annealing to 0 after second-to-last iteration
+                            if i_iter >= max_iter - 2:
+                                lambda_entropy = 0.0
+                            else:
+                                # Cosine schedule from base_lambda to 0
+                                progress = (i_iter - 2) / max(1, max_iter - 4)
+                                lambda_entropy = base_lambda * 0.5 * (1 + np.cos(np.pi * progress))
                             
                             # Compute AEM scores for all instances in the bag
                             bag_aem_scores = compute_attention_entropy_maximization(probs, lambda_entropy)
                             aem_scores_active = bag_aem_scores[active_indices]
                         
-                        # Compute uncertainty scores for active instances
-                        uncertainty_scores = compute_instance_uncertainty(probs)
-                        uncertainty_scores_active = uncertainty_scores[active_indices]
+                        # Compute uncertainty scores for active instances with iteration-based weighting
+                        uncertainty_scores_active = None
+                        if i_iter >= 2:  # Start using uncertainty after warm-up (o3 recommendation)
+                            # Calculate base uncertainty scores
+                            uncertainty_scores = compute_instance_uncertainty(probs)
+                            
+                            # Apply iteration-based weighting
+                            if i_iter == 2:
+                                uncertainty_weight = 0.12 * (temperature / temperature_start)  # ~0.10 typically
+                            else:  # i_iter >= 3
+                                uncertainty_weight = min(0.25, 0.12 * (temperature / temperature_start))
+                            
+                            # Weight the scores for active instances
+                            uncertainty_scores_active = uncertainty_scores[active_indices] * uncertainty_weight
                         
                         # Solve exact assignment for active instances with all scores
                         optimal_assignment_active = exact_k_of_n_assignment(
@@ -617,10 +629,17 @@ class MilCountBasedMultiClassLearner:
                     for i_class in target_classes:
                         class_count = class_count_dict.get(i_class, 0)
                         
-                        # Progressive constraint tightening
-                        constraint_progress = min(1.0, i_iter / 5.0)
-                        slack_factor = 1.0 + 0.05 * (1.0 - constraint_progress)
-                        effective_lower = lower_threshold[i_bag, i_class] * (2.0 - slack_factor)
+                        # Constraint slack strategy (same as binary case)
+                        if i_iter <= 1:
+                            slack_percent = 0.02  # 2% for first two iterations
+                        elif i_iter == 2:
+                            slack_percent = 0.01  # 1% for iteration 2
+                        elif i_iter <= 4:
+                            slack_percent = 0.005  # 0.5% for iterations 3-4
+                        else:
+                            slack_percent = 0.0  # 0% from iteration 5 onwards
+                        
+                        effective_lower = lower_threshold[i_bag, i_class] * (1.0 - slack_percent)
                         
                         if class_count < effective_lower:
                             # Need more instances of this class
@@ -681,8 +700,18 @@ class MilCountBasedMultiClassLearner:
                     for i_class in target_classes:
                         class_count = class_count_dict.get(i_class, 0)
                         
-                        # Progressive constraint tightening for upper threshold
-                        effective_upper = upper_threshold[i_bag, i_class] * slack_factor
+                        # Recompute slack for upper threshold (same strategy)
+                        if i_iter <= 1:
+                            slack_percent_upper = 0.02
+                        elif i_iter == 2:
+                            slack_percent_upper = 0.01
+                        elif i_iter <= 4:
+                            slack_percent_upper = 0.005
+                        else:
+                            slack_percent_upper = 0.0
+                        
+                        # Use same slack strategy for upper threshold
+                        effective_upper = upper_threshold[i_bag, i_class] * (1.0 + slack_percent_upper)
                         
                         if class_count > effective_upper:
                             # Too many instances of this class
@@ -777,17 +806,16 @@ class MilCountBasedMultiClassLearner:
                 print(num_changes_instance)
                 if debug_true_y is not None:
                     print("instance unit accuracy")
-                    print(
-                        np.mean(
-                            np.hstack([self.classifier.predict(bag) for bag in bags]) == np.hstack(debug_true_y),
-                        ),
+                    accuracy = np.mean(
+                        np.hstack([self.classifier.predict(bag) for bag in bags]) == np.hstack(debug_true_y),
                     )
+                    print(accuracy)
+                    # Track accuracy history for stagnation detection
+                    prev_accuracies.append(accuracy)
                     print("instance unit accuracy (label adjusted)")
                     print(np.mean(np.hstack(y) == np.hstack(debug_true_y)))
                 print("-----")
 
-            # Track changes for adaptive temperature
-            prev_iter_changes = total_changes
             
             # Continue to iteration 9 for evaluation, even if converged
             min_iterations = 9
