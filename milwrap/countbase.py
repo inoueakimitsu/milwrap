@@ -13,27 +13,159 @@ import scipy.stats
 from numpy.typing import NDArray
 
 
-def compute_stabilized_soft_count_loss(
+def fast_soft_rank_approximation(
+    values: NDArray[np.float64],
+    temperature: float = 1.0,
+) -> NDArray[np.float64]:
+    """Fast differentiable ranking approximation.
+    
+    Returns soft ranks directly instead of full permutation matrix for efficiency.
+    
+    Args:
+    ----
+        values: Array of values to rank.
+        temperature: Temperature for softness (lower = harder sort).
+        
+    Returns:
+    -------
+        Soft ranks for each element (0 = highest, n-1 = lowest).
+        
+    """
+    n = len(values)
+    if n == 0:
+        return np.array([])
+    
+    # For efficiency with large arrays, use a simpler approach
+    # Based on "Fast Differentiable Sorting and Ranking" (ICML 2020)
+    
+    # Compute pairwise comparisons more efficiently
+    values_expanded = values[:, np.newaxis]
+    
+    # Soft indicator: I[values[i] < values[j]]
+    # Using sigmoid for smooth approximation
+    pairwise_comparisons = 1 / (1 + np.exp((values_expanded - values_expanded.T) / temperature))
+    
+    # Soft rank = sum of indicators that other elements are smaller
+    # This gives rank in ascending order (0 = smallest)
+    # For descending order, we need n - rank - 1
+    soft_ranks_ascending = np.sum(pairwise_comparisons, axis=1) - 1  # Subtract 1 to start from 0
+    soft_ranks_descending = n - soft_ranks_ascending - 1
+    
+    return soft_ranks_descending
+
+
+def compute_softsort_based_count_loss(
     probs: NDArray[np.float64],
     target_count: int,
     temperature: float = 0.5,
 ) -> tuple[float, float]:
-    """Compute numerically stable soft count loss using proportion-based approach.
+    """Compute count loss using SoftSort for differentiable top-k selection.
     
-    Uses softmax-with-temperature for bounded soft counting and returns both
-    the loss and the constraint violation for Deep-ALM optimization.
+    This replaces the softmax attention with a more direct top-k approximation
+    using differentiable sorting, providing better gradient flow for count constraints.
     
     Args:
     ----
         probs: Probability array for instances belonging to a class.
         target_count: Target number of instances for the class.
-        temperature: Temperature parameter for soft counting (lower = sharper).
+        temperature: Temperature parameter for SoftSort (lower = sharper).
         
     Returns:
     -------
         Tuple of (loss_value, constraint_violation) for Deep-ALM.
         
     """
+    if len(probs) == 0 or target_count < 0:
+        return 0.0, 0.0
+    
+    n_instances = len(probs)
+    
+    if target_count == 0:
+        # For zero target, minimize the sum of probabilities
+        soft_count = np.sum(probs)
+        # Squared hinge loss for zero target
+        loss = 0.5 * soft_count ** 2
+        constraint_violation = soft_count
+        return loss, constraint_violation
+    
+    # Use fast soft ranking to get differentiable ranks
+    soft_ranks = fast_soft_rank_approximation(probs, temperature)
+    
+    # Create soft top-k selection based on ranks
+    k = min(target_count, n_instances)
+    
+    # Soft indicator for being in top-k
+    # rank < k means instance is in top-k (since ranks start from 0)
+    # Use sigmoid for smooth approximation
+    boundary_distance = k - 0.5 - soft_ranks  # Distance from the k-th position boundary
+    # Clip to prevent overflow
+    clipped_distance = np.clip(boundary_distance / (temperature * 0.5), -50, 50)
+    smooth_indicators = 1 / (1 + np.exp(-clipped_distance))
+    
+    # Compute soft count as weighted sum
+    soft_count = np.sum(probs * smooth_indicators)
+    
+    # Alternative: Direct soft top-k using sorted probabilities
+    # This is more stable for very small temperature values
+    if temperature < 0.1:
+        # Hard sort for very low temperatures
+        sorted_indices = np.argsort(probs)[::-1]
+        sorted_probs = probs[sorted_indices]
+        
+        # Smooth cutoff at position k
+        positions = np.arange(n_instances)
+        cutoff_weights = 1 / (1 + np.exp((positions - k + 0.5) / 0.1))
+        soft_count_v2 = np.sum(sorted_probs * cutoff_weights)
+        
+        # Blend with rank-based approach
+        soft_count = 0.7 * soft_count + 0.3 * soft_count_v2
+    
+    # Compute loss with smooth L1 (Huber) loss for better optimization
+    residual = soft_count - target_count
+    if abs(residual) < 1.0:
+        loss = 0.5 * residual ** 2
+    else:
+        loss = abs(residual) - 0.5
+    
+    # Add regularization to encourage decisive rankings
+    # Entropy of the soft indicators
+    indicator_entropy = -np.sum(smooth_indicators * np.log(smooth_indicators + 1e-8) + 
+                               (1 - smooth_indicators) * np.log(1 - smooth_indicators + 1e-8))
+    entropy_reg = 0.001 * indicator_entropy / n_instances
+    loss += entropy_reg
+    
+    # Constraint violation for Deep-ALM
+    constraint_violation = soft_count - target_count
+    
+    return loss, constraint_violation
+
+
+def compute_stabilized_soft_count_loss(
+    probs: NDArray[np.float64],
+    target_count: int,
+    temperature: float = 0.5,
+    use_softsort: bool = True,
+) -> tuple[float, float]:
+    """Compute numerically stable soft count loss.
+    
+    Can use either SoftSort-based or softmax-based approach.
+    
+    Args:
+    ----
+        probs: Probability array for instances belonging to a class.
+        target_count: Target number of instances for the class.
+        temperature: Temperature parameter for soft counting (lower = sharper).
+        use_softsort: Whether to use SoftSort (True) or softmax approach (False).
+        
+    Returns:
+    -------
+        Tuple of (loss_value, constraint_violation) for Deep-ALM.
+        
+    """
+    if use_softsort:
+        return compute_softsort_based_count_loss(probs, target_count, temperature)
+    
+    # Original implementation with softmax
     if len(probs) == 0 or target_count < 0:
         return 0.0, 0.0
     
@@ -287,8 +419,8 @@ class MilCountBasedMultiClassLearner:
         constraint_tol = 0.25  # Relative tolerance for constraint satisfaction
         
         # Enhanced temperature annealing with cosine schedule
-        temperature_start = 2.2  # Higher initial temperature for better exploration
-        temperature_end = 0.05  # Even lower final temperature for sharper decisions
+        temperature_start = 2.0  # Slightly lower initial temperature
+        temperature_end = 0.1  # Higher final temperature for stability
         
         # MIL-Dropout parameters (from high-scoring branch)
         mil_dropout_rate = 0.05  # Drop 5% of high-scoring instances for better stability
@@ -307,8 +439,22 @@ class MilCountBasedMultiClassLearner:
         momentum_factor = 0.9
         
         # Enhanced count loss weight with schedule (adjusted for stabilized loss)
-        count_loss_weight_init = 0.5  # Moderate initial weight for stabilized loss
-        count_loss_weight_final = 1.2  # Balanced final weight
+        count_loss_weight_init = 0.5  # Back to original weight
+        count_loss_weight_final = 1.2  # Back to original weight
+        
+        # SoftSort parameters
+        use_softsort = True  # Enable SoftSort for better count constraint handling
+        softsort_start_iter = 2  # Start after initial warmup
+        
+        # Pseudo-contrastive learning parameters
+        use_contrastive = True  # Enable contrastive learning
+        contrastive_weight = 0.02  # Lower weight for contrastive loss
+        contrastive_temperature = 1.5  # Higher temperature for smoother similarity
+        contrastive_margin = 0.05  # Smaller margin for contrastive loss
+        
+        # Uncertainty weighting parameters
+        use_uncertainty_weighting = True  # Enable uncertainty-based instance weighting
+        uncertainty_start_iter = 4  # Start after initial training
         
         # Enhanced curriculum learning parameters
         # Start with moderately relaxed constraints and gradually tighten
@@ -467,6 +613,12 @@ class MilCountBasedMultiClassLearner:
             has_changed = False
             total_count_loss = 0.0
             total_constraint_violation = 0.0  # Track constraint violations
+            total_contrastive_loss = 0.0  # Track contrastive loss
+            
+            # Collect probability distributions for contrastive learning
+            contrastive_probs_list = []  # Store all instance probabilities
+            contrastive_labels_list = []  # Store current assigned labels
+            contrastive_bag_indices = []  # Store which bag each instance belongs to
             
             for i_bag in range(len(bags)):
                 # Hybrid approach: combine constraint-based selection with soft assignments
@@ -475,6 +627,23 @@ class MilCountBasedMultiClassLearner:
                     continue
                     
                 probs = fs[i_bag]  # Shape: (n_instances, n_classes)
+                
+                # Collect for contrastive learning
+                contrastive_probs_list.append(probs)
+                contrastive_labels_list.append(y[i_bag])
+                contrastive_bag_indices.extend([i_bag] * n_instances)
+                
+                # Compute uncertainty weights if enabled
+                uncertainty_weights = np.ones(n_instances)
+                if use_uncertainty_weighting and i_iter >= uncertainty_start_iter:
+                    # Use entropy as uncertainty measure
+                    # High entropy = high uncertainty = lower weight
+                    entropy = -np.sum(probs * np.log(probs + 1e-8), axis=1)
+                    max_entropy = np.log(n_classes)
+                    normalized_entropy = entropy / max_entropy
+                    
+                    # Convert entropy to weights (low entropy = high confidence = high weight)
+                    uncertainty_weights = 1.0 - 0.5 * normalized_entropy  # Weights in [0.5, 1.0]
                 
                 # Compute differentiable count loss for this bag
                 bag_count_loss = 0.0
@@ -488,8 +657,16 @@ class MilCountBasedMultiClassLearner:
                         # Only compute if we have enough instances
                         if target_count >= 0 and target_count <= len(class_probs):
                             # Use stabilized loss with Deep-ALM
-                            soft_temp = 0.5 * temperature  # Link to main temperature
-                            loss, violation = compute_stabilized_soft_count_loss(class_probs, target_count, soft_temp)
+                            # Use fixed temperature for SoftSort to avoid instability
+                            if use_softsort and i_iter >= softsort_start_iter:
+                                soft_temp = 1.0  # Fixed temperature for SoftSort
+                            else:
+                                soft_temp = 0.5 * temperature  # Original temperature schedule
+                            # Decide whether to use SoftSort based on iteration
+                            use_softsort_now = use_softsort and i_iter >= softsort_start_iter
+                            loss, violation = compute_stabilized_soft_count_loss(
+                                class_probs, target_count, soft_temp, use_softsort=use_softsort_now
+                            )
                             
                             # Deep-ALM augmented Lagrangian
                             # L_A = L_task + λ·g + (μ/2)·g²
@@ -632,6 +809,10 @@ class MilCountBasedMultiClassLearner:
                                         constraint_score * avg_class_confidence +
                                         quality_score) * (1.0 + 0.5 * attention_score)
                                 
+                                # Apply uncertainty weighting
+                                # High confidence instances (low uncertainty) get higher scores
+                                score *= uncertainty_weights[idx]
+                                
                                 candidates.append((idx, score))
                         
                         # Sort by score and select top candidates
@@ -742,6 +923,136 @@ class MilCountBasedMultiClassLearner:
                     lambda_lower[i_bag, i_class] = np.clip(lambda_lower[i_bag, i_class], -50, 50)
                     lambda_upper[i_bag, i_class] = np.clip(lambda_upper[i_bag, i_class], -50, 50)
 
+            # Compute pseudo-contrastive loss using probability distributions
+            # Memory-efficient version: compute within bags and sample across bags
+            if use_contrastive and i_iter >= 1 and len(contrastive_probs_list) > 0:  # Start after first iteration
+                contrastive_loss_accum = 0.0
+                n_valid_bags = 0
+                
+                # Within-bag contrastive loss
+                for i_bag in range(len(contrastive_probs_list)):
+                    bag_probs = contrastive_probs_list[i_bag]
+                    bag_labels = contrastive_labels_list[i_bag]
+                    n_instances = len(bag_labels)
+                    
+                    if n_instances > 1:
+                        # Normalize probabilities for cosine similarity
+                        probs_normalized = bag_probs / (np.linalg.norm(bag_probs, axis=1, keepdims=True) + 1e-8)
+                        
+                        # Compute similarity matrix for this bag
+                        similarity_matrix = probs_normalized @ probs_normalized.T
+                        
+                        # Create mask for same-class pairs
+                        labels_expanded = bag_labels[:, np.newaxis]
+                        same_class_mask = (labels_expanded == labels_expanded.T).astype(np.float64)
+                        
+                        # Remove diagonal
+                        np.fill_diagonal(same_class_mask, 0)
+                        np.fill_diagonal(similarity_matrix, 0)
+                        
+                        # Temperature-scaled similarities
+                        scaled_similarities = similarity_matrix / contrastive_temperature
+                        
+                        # Count positive pairs
+                        n_positive = np.sum(same_class_mask)
+                        
+                        if n_positive > 0:
+                            # Proper InfoNCE contrastive loss (always >= 0)
+                            # For each instance, compute -log(exp(sim_pos) / sum(exp(sim_all)))
+                            
+                            # Temperature-scaled similarities  
+                            scaled_sim = similarity_matrix / contrastive_temperature
+                            
+                            # For numerical stability, subtract max before exp
+                            max_sim_per_row = np.max(scaled_sim, axis=1, keepdims=True)
+                            exp_sim = np.exp(scaled_sim - max_sim_per_row)
+                            
+                            # Compute InfoNCE loss for each instance
+                            instance_losses = []
+                            for i in range(n_instances):
+                                # Find positive pairs for instance i
+                                pos_mask = same_class_mask[i, :]
+                                if np.sum(pos_mask) > 0:
+                                    # Numerator: sum of exp(sim) for positive pairs
+                                    numerator = np.sum(exp_sim[i, :] * pos_mask)
+                                    # Denominator: sum of exp(sim) for all pairs except self
+                                    denominator = np.sum(exp_sim[i, :]) - exp_sim[i, i]
+                                    
+                                    if denominator > 0 and numerator > 0:
+                                        instance_loss = -np.log(numerator / denominator)
+                                        instance_losses.append(instance_loss)
+                            
+                            if len(instance_losses) > 0:
+                                bag_contrastive_loss = np.mean(instance_losses)
+                                contrastive_loss_accum += bag_contrastive_loss
+                                n_valid_bags += 1
+                
+                # Cross-bag contrastive loss (sample-based for memory efficiency)
+                if len(contrastive_probs_list) > 1:
+                    # Sample a subset of instances from different bags
+                    max_samples_per_bag = 10  # Limit samples to avoid memory issues
+                    sampled_probs = []
+                    sampled_labels = []
+                    
+                    for i_bag in range(min(len(contrastive_probs_list), 20)):  # Limit number of bags
+                        bag_probs = contrastive_probs_list[i_bag]
+                        bag_labels = contrastive_labels_list[i_bag]
+                        n_instances = len(bag_labels)
+                        
+                        if n_instances > 0:
+                            # Sample instances from this bag
+                            n_samples = min(max_samples_per_bag, n_instances)
+                            indices = rng.choice(n_instances, size=n_samples, replace=False)
+                            sampled_probs.append(bag_probs[indices])
+                            sampled_labels.append(bag_labels[indices])
+                    
+                    if len(sampled_probs) > 1:
+                        # Compute cross-bag contrastive loss on samples
+                        sampled_probs_concat = np.vstack(sampled_probs)
+                        sampled_labels_concat = np.hstack(sampled_labels)
+                        
+                        # Normalize
+                        probs_normalized = sampled_probs_concat / (np.linalg.norm(sampled_probs_concat, axis=1, keepdims=True) + 1e-8)
+                        
+                        # Similarity matrix
+                        similarity_matrix = probs_normalized @ probs_normalized.T
+                        
+                        # Same-class mask
+                        labels_expanded = sampled_labels_concat[:, np.newaxis]
+                        same_class_mask = (labels_expanded == labels_expanded.T).astype(np.float64)
+                        np.fill_diagonal(same_class_mask, 0)
+                        
+                        # Compute loss using proper InfoNCE
+                        n_positive = np.sum(same_class_mask)
+                        if n_positive > 0:
+                            # Temperature-scaled similarities
+                            scaled_sim = similarity_matrix / contrastive_temperature
+                            
+                            # Numerical stability
+                            max_sim_per_row = np.max(scaled_sim, axis=1, keepdims=True)
+                            exp_sim = np.exp(scaled_sim - max_sim_per_row)
+                            
+                            # Compute InfoNCE for sampled instances
+                            n_sampled = len(sampled_labels_concat)
+                            instance_losses = []
+                            for i in range(n_sampled):
+                                pos_mask = same_class_mask[i, :]
+                                if np.sum(pos_mask) > 0:
+                                    numerator = np.sum(exp_sim[i, :] * pos_mask)
+                                    denominator = np.sum(exp_sim[i, :]) - exp_sim[i, i]
+                                    
+                                    if denominator > 0 and numerator > 0:
+                                        instance_loss = -np.log(numerator / denominator)
+                                        instance_losses.append(instance_loss)
+                            
+                            if len(instance_losses) > 0:
+                                cross_bag_loss = np.mean(instance_losses)
+                                contrastive_loss_accum += 0.5 * cross_bag_loss  # Weight cross-bag loss less
+                
+                # Average and scale
+                if n_valid_bags > 0:
+                    total_contrastive_loss = contrastive_weight * contrastive_loss_accum / n_valid_bags
+
             # Enhanced tracking with momentum and early stopping
             if debug_true_y is not None:
                 current_accuracy = np.mean(
@@ -814,6 +1125,8 @@ class MilCountBasedMultiClassLearner:
                 print(f"{total_count_loss:.4f}")
                 print("constraint violation penalty")
                 print(f"{total_constraint_violation:.4f}")
+                print("pseudo-contrastive loss")
+                print(f"{total_contrastive_loss:.4f}")
                 if debug_true_y is not None:
                     print("instance unit accuracy")
                     print(
