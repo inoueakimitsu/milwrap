@@ -198,11 +198,49 @@ class MilCountBasedMultiClassLearner:
                         )
                         # Register the instance whose label has been changed
                         changed_indice_list.extend(indice_should_change_to_be_negative)
-                        # Instances above the upper limit will be randomly assigned to other classes
-                        y[i_bag][indice_should_change_to_be_negative] = np.random.choice(
-                            n_classes,
-                            size=len(indice_should_change_to_be_negative),
-                        )
+                        # Instances above the upper limit will be assigned intelligently
+                        # Get current class counts for this bag
+                        current_counts = pd.Series(y[i_bag]).value_counts().to_dict()
+                        
+                        for idx in indice_should_change_to_be_negative:
+                            probs = fs[i_bag][idx]
+                            
+                            # Calculate weighted scores for each class
+                            scores = np.zeros(n_classes)
+                            for c in range(n_classes):
+                                if c == i_class:
+                                    scores[c] = -np.inf  # Exclude current class
+                                    continue
+                                
+                                class_count = current_counts.get(c, 0)
+                                # Base score from probability (favor uncertain predictions)
+                                uncertainty_score = 1.0 - abs(probs[c] - 0.5) * 2
+                                
+                                # Constraint satisfaction bonus
+                                constraint_bonus = 0.0
+                                if class_count < lower_threshold[i_bag, c]:
+                                    # Strong bonus for classes below lower threshold
+                                    constraint_bonus = 2.0 * (lower_threshold[i_bag, c] - class_count) / lower_threshold[i_bag, c]
+                                elif class_count < upper_threshold[i_bag, c]:
+                                    # Small bonus for classes within bounds
+                                    constraint_bonus = 0.5
+                                
+                                # Combine scores: prioritize constraint satisfaction, then uncertainty
+                                scores[c] = constraint_bonus + 0.3 * uncertainty_score
+                            
+                            # Use softmax to convert scores to probabilities
+                            # Temperature parameter controls randomness (lower = more deterministic)
+                            temperature = 0.5
+                            exp_scores = np.exp(scores / temperature)
+                            probabilities = exp_scores / np.sum(exp_scores)
+                            
+                            # Select class based on probabilities
+                            best_class = np.argmax(probabilities)
+                            
+                            y[i_bag][idx] = best_class
+                            # Update current counts
+                            current_counts[i_class] = current_counts.get(i_class, 0) - 1
+                            current_counts[best_class] = current_counts.get(best_class, 0) + 1
                         has_changed = True
 
             if debug:
