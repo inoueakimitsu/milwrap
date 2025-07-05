@@ -143,13 +143,35 @@ class MilCountBasedMultiClassLearner:
         rho = 1.0  # Penalty parameter for augmented Lagrangian
         
         # Temperature for soft assignments (starts high, anneals down)
-        temperature_start = 2.0
-        temperature_end = 0.1
-        temperature_decay = (temperature_end / temperature_start) ** (1.0 / max_iter)
-
+        # Fine-tuned values based on empirical testing
+        temperature_start = 1.5  # Lower starting temperature for more decisive early assignments
+        temperature_end = 0.05  # Lower end temperature for sharper final decisions
+        
+        # Improved temperature schedule using warm restart cosine annealing
+        # This provides better exploration in early iterations and smoother convergence
+        
         for i_iter in range(max_iter):
-            # Temperature annealing
-            temperature = temperature_start * (temperature_decay ** i_iter)
+            # Cosine annealing with warm restarts
+            progress = i_iter / max(1, max_iter - 1)
+            
+            # Option 1: Simple cosine annealing
+            # temperature = temperature_end + 0.5 * (temperature_start - temperature_end) * (1 + np.cos(np.pi * progress))
+            
+            # Option 2: Cosine annealing with warm restart (T_i = 3 iterations)
+            # Shorter cycles for faster convergence
+            cycle_length = 3
+            cycle_progress = (i_iter % cycle_length) / cycle_length
+            cycle_num = i_iter // cycle_length
+            
+            # Decrease the max temperature of each cycle more aggressively
+            cycle_temp_start = temperature_start * (0.7 ** cycle_num)
+            cycle_temp_end = max(temperature_end, cycle_temp_start * 0.4)
+            
+            # Apply cosine annealing within the cycle
+            temperature = cycle_temp_end + 0.5 * (cycle_temp_start - cycle_temp_end) * (1 + np.cos(np.pi * cycle_progress))
+            
+            # Ensure we don't go below minimum temperature
+            temperature = max(temperature_end, temperature)
             
             # Fit
             flatten_bags = np.vstack(bags)
@@ -190,21 +212,45 @@ class MilCountBasedMultiClassLearner:
                         candidates = []
                         for idx in range(n_instances):
                             if idx not in changed_indices and new_y[idx] != i_class:
-                                # Score based on probability and current class constraint status
-                                score = probs[idx, i_class]
+                                # Enhanced scoring function with multiple factors
+                                base_score = probs[idx, i_class]
                                 
-                                # Boost score if moving from over-represented class
+                                # 1. Confidence factor: prefer high-confidence predictions
+                                confidence = np.max(probs[idx, :])
+                                confidence_factor = 1.0 + 0.3 * (base_score / (confidence + 1e-8))
+                                
+                                # 2. Class balance factor: reward moving from over-represented classes
                                 current_class = new_y[idx]
                                 current_class_count = class_count_dict.get(current_class, 0)
+                                balance_factor = 1.0
+                                
                                 if current_class_count > upper_threshold[i_bag, current_class]:
-                                    score *= 1.5
+                                    # Strong boost for moving from severely over-represented class
+                                    excess_ratio = current_class_count / (upper_threshold[i_bag, current_class] + 1e-8)
+                                    balance_factor = 1.0 + 0.5 * np.log1p(excess_ratio)
+                                elif current_class_count > lower_threshold[i_bag, current_class]:
+                                    # Small boost for moving from moderately represented class  
+                                    balance_factor = 1.1
+                                
+                                # 3. Entropy factor: prefer instances with clear class separation
+                                entropy = -np.sum(probs[idx, :] * np.log(probs[idx, :] + 1e-8))
+                                max_entropy = np.log(n_classes)
+                                normalized_entropy = entropy / (max_entropy + 1e-8)
+                                clarity_factor = 1.0 + 0.2 * (1.0 - normalized_entropy)
+                                
+                                # Combine all factors
+                                score = base_score * confidence_factor * balance_factor * clarity_factor
                                 
                                 candidates.append((idx, score))
                         
                         # Sort by score and select top candidates
                         candidates.sort(key=lambda x: x[1], reverse=True)
                         # Gradually increase assignments based on iteration
-                        adjustment_rate = min(1.0, (i_iter + 1) / 3.0)  # Full adjustment by iter 3
+                        # Use sigmoid-based adjustment for smoother transitions
+                        # This allows gentle start, rapid middle phase, and careful fine-tuning
+                        sigmoid_x = (i_iter - 1.0) * 3.0  # Center sigmoid around iteration 1.0, steeper curve
+                        adjustment_rate = 1.0 / (1.0 + np.exp(-sigmoid_x))
+                        adjustment_rate = max(0.2, min(1.0, adjustment_rate))  # Start from 0.2 for gentler initial adjustments
                         n_to_change = max(1, int(deficit * adjustment_rate))
                         
                         for idx, _ in candidates[:n_to_change]:
@@ -235,7 +281,10 @@ class MilCountBasedMultiClassLearner:
                         candidates.sort(key=lambda x: x[1])
                         
                         # Gradually increase adjustments based on iteration
-                        adjustment_rate = min(1.0, (i_iter + 1) / 3.0)
+                        # Use same sigmoid-based adjustment as lower threshold
+                        sigmoid_x = (i_iter - 1.0) * 3.0  # Center sigmoid around iteration 1.0, steeper curve
+                        adjustment_rate = 1.0 / (1.0 + np.exp(-sigmoid_x))
+                        adjustment_rate = max(0.2, min(1.0, adjustment_rate))  # Start from 0.2 for gentler initial adjustments
                         n_to_change = max(1, int(excess * adjustment_rate))
                         
                         for idx, _ in candidates[:n_to_change]:
