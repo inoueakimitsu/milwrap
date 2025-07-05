@@ -127,25 +127,39 @@ class MilCountBasedMultiClassLearner:
 
         # Initialize y
         n_list = [len(bag) for bag in bags]
+        n_bags = len(bags)
+        
         if not initial_y:
             # Improved initialization: consider both lower and upper thresholds
             # Use weighted average to find better initial class assignment
             threshold_center = (lower_threshold + upper_threshold) / 2.0
-            # Add small noise to break ties, slightly larger for better exploration
-            threshold_center += np.random.randn(*threshold_center.shape) * 0.02
+            
+            # Smart initialization: consider constraint feasibility
+            # For each bag, choose class that best satisfies constraints
+            initial_bag_labels = []
+            for i_bag in range(n_bags):
+                scores = np.zeros(n_classes)
+                for i_class in range(n_classes):
+                    # Prefer classes with higher thresholds (more instances needed)
+                    scores[i_class] = threshold_center[i_bag, i_class]
+                    
+                    # Bonus for classes with wider constraint range (more flexibility)
+                    constraint_width = upper_threshold[i_bag, i_class] - lower_threshold[i_bag, i_class]
+                    scores[i_class] += constraint_width * 0.1
+                
+                # Add small noise to break ties
+                scores += np.random.randn(n_classes) * 0.01
+                initial_bag_labels.append(np.argmax(scores))
             
             y = [
                 np.repeat(class_index, n_instance_in_bag)
                 for class_index, n_instance_in_bag in zip(
-                    np.argmax(threshold_center, axis=1),
+                    initial_bag_labels,
                     n_list,
                 )
             ]
         else:
             y = initial_y
-            
-        # Initialize bags count
-        n_bags = len(bags)
         
         # Temperature for soft assignments based on theoretical insights
         # T* ≈ sqrt(π d / 8) ≈ 0.9 * sqrt(d) for feature dimension d
@@ -153,15 +167,19 @@ class MilCountBasedMultiClassLearner:
         
         # Different initialization for auto vs external init
         if initial_y is None:
-            # Auto initialization: use standard temperature
-            temperature_start = 0.9 * np.sqrt(feature_dim)
-            # Standard entropy regularization
-            entropy_weight_scale = 0.1
+            # Auto initialization: slightly higher temperature for better exploration
+            temperature_start = 1.0 * np.sqrt(feature_dim)  # Increased from 0.9
+            # Moderate entropy regularization
+            entropy_weight_scale = 0.12  # Slightly increased
+            # Standard focal gamma
+            focal_gamma = 2.0
         else:
-            # External initialization: adjusted for better robustness
-            temperature_start = 0.85 * np.sqrt(feature_dim)  # Slightly higher than before
+            # External initialization: more conservative approach
+            temperature_start = 0.95 * np.sqrt(feature_dim)  # Higher temperature for more exploration
             # Higher entropy regularization to prevent overfitting to initial labels
-            entropy_weight_scale = 0.15
+            entropy_weight_scale = 0.2  # Increased for robustness
+            # Lower focal gamma to avoid over-focusing on hard examples when initial labels might be noisy
+            focal_gamma = 1.5
         
         temperature_end = 0.05 * temperature_start  # 5% of initial temperature
         
@@ -170,6 +188,13 @@ class MilCountBasedMultiClassLearner:
         constraint_slack_start = 0.15  # 15% slack on constraints initially
         constraint_slack_end = 0.0    # No slack at the end
 
+        # Initialize instance difficulty tracking for focal weighting
+        instance_difficulties = {}  # Track difficulty scores per bag
+        
+        # Initialize adaptive constraint penalty parameters (log-barrier inspired)
+        constraint_penalty_mu = 1.0  # Initial barrier parameter
+        constraint_penalty_decay = 0.9  # Decay rate per iteration
+        
         for i_iter in range(max_iter):
             # Cosine annealing schedule for temperature
             # T(t) = T_min + 0.5 * (T_max - T_min) * (1 + cos(π * t / T))
@@ -182,6 +207,9 @@ class MilCountBasedMultiClassLearner:
             # Constraint slack annealing (for continuation method)
             # Linear decay for simplicity and stability
             constraint_slack = constraint_slack_start * (1.0 - i_iter / max_iter)
+            
+            # Update adaptive constraint penalty
+            constraint_penalty_mu *= constraint_penalty_decay
             
             if debug and i_iter == 0:
                 print(f"Temperature schedule: start={temperature_start:.3f}, end={temperature_end:.3f}")
@@ -196,6 +224,23 @@ class MilCountBasedMultiClassLearner:
             fs = [self.classifier.predict_proba(bag) for bag in bags]
             y_pred = [self.classifier.predict(bag) for bag in bags]
             flatten_original_y = np.hstack(list(y))
+            
+            # Compute instance difficulties for focal weighting
+            if i_iter > 0:  # Start computing after first iteration
+                for i_bag in range(len(bags)):
+                    probs = fs[i_bag]
+                    current_labels = y[i_bag]
+                    
+                    # Difficulty = 1 - probability of correct class (inspired by focal loss)
+                    # Higher difficulty for misclassified or low-confidence instances
+                    difficulties = np.zeros(len(probs))
+                    for idx in range(len(probs)):
+                        correct_prob = probs[idx, current_labels[idx]]
+                        # Clip probability to avoid extreme values
+                        correct_prob = np.clip(correct_prob, 0.01, 0.99)
+                        difficulties[idx] = (1 - correct_prob) ** focal_gamma
+                    
+                    instance_difficulties[i_bag] = difficulties
             
 
             # For every bag - use soft assignments with augmented Lagrangian
@@ -250,9 +295,19 @@ class MilCountBasedMultiClassLearner:
                                 if max_prob < confidence_threshold and i_iter < 3:
                                     continue  # Skip low-confidence instances in early iterations
                                 
+                                # Apply focal weighting: prioritize hard instances
+                                # DISABLED for ablation analysis
+                                # if i_bag in instance_difficulties and i_iter > 1:
+                                #     difficulty = instance_difficulties[i_bag][idx]
+                                #     # Higher weight for harder instances (but not too extreme)
+                                #     focal_weight = 1.0 + difficulty * 0.5
+                                #     score *= focal_weight
+                                
                                 # Boost score if moving from over-represented class
                                 current_class = new_y[idx]
                                 current_class_count = class_count_dict.get(current_class, 0)
+                                
+                                # Constraint-based scoring (simplified version)
                                 if current_class_count > upper_threshold[i_bag, current_class]:
                                     score *= 2.0  # Boost for constraint satisfaction
                                 elif current_class_count <= lower_threshold[i_bag, current_class]:
@@ -263,11 +318,16 @@ class MilCountBasedMultiClassLearner:
                         # Sort by score and select top candidates
                         candidates.sort(key=lambda x: x[1], reverse=True)
                         # Gradually increase assignments based on iteration
-                        # More conservative for external init
-                        if initial_y is not None and i_iter < 2:
-                            adjustment_rate = min(0.5, (i_iter + 1) / 4.0)  # Slower for external init
+                        # More conservative in early iterations
+                        if i_iter == 0:
+                            # Very conservative in first iteration
+                            adjustment_rate = 0.3
+                        elif initial_y is not None and i_iter < 3:
+                            # Slower for external init
+                            adjustment_rate = min(0.7, (i_iter + 1) / 4.0)
                         else:
-                            adjustment_rate = min(1.0, (i_iter + 1) / 3.0)  # Full adjustment by iter 3
+                            # Standard adjustment
+                            adjustment_rate = min(1.0, (i_iter + 1) / 3.0)
                         n_to_change = max(1, int(deficit * adjustment_rate))
                         
                         for idx, _ in candidates[:n_to_change]:
@@ -298,7 +358,10 @@ class MilCountBasedMultiClassLearner:
                         candidates.sort(key=lambda x: x[1])
                         
                         # Gradually increase adjustments based on iteration
-                        adjustment_rate = min(1.0, (i_iter + 1) / 3.0)
+                        if i_iter == 0:
+                            adjustment_rate = 0.3
+                        else:
+                            adjustment_rate = min(1.0, (i_iter + 1) / 3.0)
                         n_to_change = max(1, int(excess * adjustment_rate))
                         
                         for idx, _ in candidates[:n_to_change]:
@@ -327,9 +390,10 @@ class MilCountBasedMultiClassLearner:
                             
                             # Apply temperature-controlled softmax with Gumbel noise for exploration
                             # Add Gumbel noise for better exploration in early iterations
-                            if i_iter < 4:
+                            if i_iter < 3:
                                 gumbel_noise = -np.log(-np.log(np.random.uniform(0.01, 0.99, n_classes)))
-                                scores += gumbel_noise * 0.1  # Small noise factor
+                                # Very small noise, mainly for tie-breaking
+                                scores += gumbel_noise * 0.05
                             
                             exp_scores = np.exp(scores / temperature)
                             probabilities = exp_scores / np.sum(exp_scores)
@@ -391,8 +455,15 @@ class MilCountBasedMultiClassLearner:
                 # Labels have converged, but continue training classifier
                 if debug:
                     print(f"Labels converged at iteration {i_iter}, continuing to refine classifier...")
+                
                 # Train with additional inner iterations when labels are stable
-                for inner_iter in range(5):  # 5 inner epochs after convergence
+                # More refinement for early convergence
+                if i_iter <= 5:
+                    refinement_epochs = 7  # More refinement for early convergence
+                else:
+                    refinement_epochs = 5  # Standard refinement
+                    
+                for inner_iter in range(refinement_epochs):
                     self.classifier.fit(flatten_bags, flatten_y)
                         
             elif not has_changed and i_iter < 4:
