@@ -142,39 +142,34 @@ class MilCountBasedMultiClassLearner:
         else:
             y = initial_y
             
-        # Initialize Lagrangian multipliers for constraints
+        # Initialize soft count loss parameters
         n_bags = len(bags)
-        lambda_lower = np.zeros((n_bags, n_classes))
-        lambda_upper = np.zeros((n_bags, n_classes))
-        rho = 1.0  # Penalty parameter for augmented Lagrangian
+        count_loss_weight = 1.0  # Weight for differentiable count loss
+        count_loss_temperature = 1.0  # Temperature for soft count computation
         
-        # Adaptive temperature with momentum
-        temperature_start = 2.0
-        temperature_end = 0.08  # Slightly lower for finer convergence
+        # Simplified adaptive temperature with momentum
+        temperature_start = 2.0  # Higher start for more exploration
+        temperature_end = 0.05  # Lower end for finer convergence
         temperature = temperature_start
-        temperature_momentum = 0.9  # Momentum factor for temperature updates
-        temperature_velocity = 0.0
+        temperature_momentum = 0.9  # Restore original momentum
         
         # Track constraint satisfaction progress
-        prev_violations = float('inf')
-        violations_momentum = 0.0
+        prev_count_loss = float('inf')
+        count_loss_momentum = 0.0
         
-        # Enhanced freezing for high-confidence instances
+        # Entropy-based uncertainty freezing
         frozen_instances = [set() for _ in bags]
-        freeze_confidence_base = 0.85  # Base confidence threshold
-        freeze_confidence_final = 0.95  # Final confidence threshold
+        freeze_entropy_threshold_start = 0.3  # More conservative start
+        freeze_entropy_threshold_end = 0.05  # Even more conservative end
+        freeze_warmup_iters = 3  # Wait longer before freezing
 
         for i_iter in range(max_iter):
-            # Adaptive temperature annealing with momentum
-            # Compute target temperature based on iteration
-            target_temp = temperature_start * ((temperature_end / temperature_start) ** (i_iter / max_iter))
+            # Simplified temperature annealing
+            progress = i_iter / max_iter
+            temperature = temperature_start * ((temperature_end / temperature_start) ** progress)
             
-            # Apply momentum to temperature updates
-            temperature_velocity = temperature_momentum * temperature_velocity + (1 - temperature_momentum) * (target_temp - temperature)
-            temperature = max(temperature_end, temperature + 0.3 * temperature_velocity)
-            
-            # Dynamic freeze threshold
-            freeze_threshold = freeze_confidence_base + (freeze_confidence_final - freeze_confidence_base) * (i_iter / max_iter)
+            # Dynamic entropy threshold for freezing
+            freeze_entropy_threshold = freeze_entropy_threshold_start * ((freeze_entropy_threshold_end / freeze_entropy_threshold_start) ** progress)
             
             # Fit
             flatten_bags = np.vstack(bags)
@@ -193,14 +188,21 @@ class MilCountBasedMultiClassLearner:
                 n_instances = len(bags[i_bag])
                 probs = fs[i_bag]  # Shape: (n_instances, n_classes)
                 
-                # Freeze high-confidence instances after warmup
-                if i_iter >= 2:
-                    max_probs = np.max(probs, axis=1)
+                # Compute attention weights based on prediction entropy
+                instance_entropy = -np.sum(probs * np.log(probs + 1e-8), axis=1)
+                # Higher entropy = more uncertain = more attention needed
+                attention_weights = np.exp(instance_entropy / temperature)
+                attention_weights = attention_weights / np.sum(attention_weights)
+                
+                # Entropy-based uncertainty freezing after warmup
+                if i_iter >= freeze_warmup_iters:
+                    # Calculate predictive entropy for each instance
+                    entropy = -np.sum(probs * np.log(probs + 1e-8), axis=1) / np.log(n_classes)
                     predicted_classes = np.argmax(probs, axis=1)
                     
                     for idx in range(n_instances):
                         if (idx not in frozen_instances[i_bag] and 
-                            max_probs[idx] > freeze_threshold and 
+                            entropy[idx] < freeze_entropy_threshold and 
                             y[i_bag][idx] == predicted_classes[idx]):
                             frozen_instances[i_bag].add(idx)
                 
@@ -226,8 +228,8 @@ class MilCountBasedMultiClassLearner:
                         candidates = []
                         for idx in range(n_instances):
                             if idx not in changed_indices and idx not in frozen_instances[i_bag] and new_y[idx] != i_class:
-                                # Score based on probability and current class constraint status
-                                score = probs[idx, i_class]
+                                # Score based on probability, attention weight, and current class constraint status
+                                score = probs[idx, i_class] * (1.0 + attention_weights[idx])
                                 
                                 # Boost score if moving from over-represented class
                                 current_class = new_y[idx]
@@ -287,14 +289,17 @@ class MilCountBasedMultiClassLearner:
                                 # Base score from probability
                                 scores[c] = np.log(probs[idx, c] + 1e-8)
                                 
-                                # Constraint bonus
+                                # Differentiable constraint penalty
                                 c_count = class_count_dict.get(c, 0)
+                                # Smooth penalty based on distance from feasible region
                                 if c_count < lower_threshold[i_bag, c]:
-                                    scores[c] += 2.0
-                                elif c_count < upper_threshold[i_bag, c]:
-                                    scores[c] += 0.5
+                                    deficit = lower_threshold[i_bag, c] - c_count
+                                    scores[c] += count_loss_weight * (2.0 - deficit * 0.1)
+                                elif c_count > upper_threshold[i_bag, c]:
+                                    excess = c_count - upper_threshold[i_bag, c] 
+                                    scores[c] -= count_loss_weight * (1.0 + excess * 0.1)
                                 else:
-                                    scores[c] -= 1.0
+                                    scores[c] += 0.5  # Small bonus for feasible region
                             
                             # Apply temperature-controlled softmax
                             # Gumbel noise disabled for now (ablation analysis)
@@ -319,29 +324,35 @@ class MilCountBasedMultiClassLearner:
                     has_changed = True
                     y[i_bag] = new_y
 
-            # Track constraint violations for adaptive temperature
+            # Compute differentiable count loss
             predicted_count = np.nan_to_num(
                 pd.DataFrame([pd.Series(b).value_counts().to_dict() for b in y])[list(range(n_classes))].values,
             )
+            
+            # Soft penalty for constraint violations
             lower_violations = np.maximum(lower_threshold - predicted_count, 0)
             upper_violations = np.maximum(predicted_count - upper_threshold, 0)
-            total_violations = np.sum(lower_violations) + np.sum(upper_violations)
             
-            # Adaptive temperature adjustment based on violation reduction
+            # Differentiable count loss with squared penalty
+            count_loss = np.sum(lower_violations ** 2) + np.sum(upper_violations ** 2)
+            
+            # Adaptive count loss weight with momentum
             if i_iter > 0:
-                violation_reduction = prev_violations - total_violations
-                violations_momentum = 0.8 * violations_momentum + 0.2 * violation_reduction
+                loss_change = (prev_count_loss - count_loss) / (prev_count_loss + 1e-8)
+                count_loss_momentum = 0.8 * count_loss_momentum + 0.2 * loss_change
                 
-                # Slow down temperature decay if violations are reducing too slowly
-                if violations_momentum < 0.1 and total_violations > 0:
-                    temperature *= 1.1  # Slight reheating
-                    temperature = min(temperature, temperature_start * 0.8)
+                # Smooth weight adjustment based on momentum
+                if count_loss_momentum > 0.05:  # Good progress
+                    count_loss_weight *= (1.0 - 0.05 * count_loss_momentum)
+                elif count_loss_momentum < -0.05:  # Getting worse
+                    count_loss_weight *= (1.0 - 0.1 * count_loss_momentum)  # Negative momentum increases weight
+                count_loss_weight = np.clip(count_loss_weight, 0.5, 5.0)
             
-            prev_violations = total_violations
+            prev_count_loss = count_loss
             
             if debug:
                 print(f"iter: {i_iter}")
-                print(f"temperature: {temperature:.3f}, frozen: {sum(len(f) for f in frozen_instances)}")
+                print(f"temperature: {temperature:.3f}, frozen: {sum(len(f) for f in frozen_instances)}, count_loss: {count_loss:.3f}, loss_weight: {count_loss_weight:.3f}")
                 print("false negative instances")
                 count_false_negative = np.minimum(predicted_count - lower_threshold, 0)
                 print(np.sum(count_false_negative))
@@ -364,14 +375,39 @@ class MilCountBasedMultiClassLearner:
 
             # Continue to iteration 9 for evaluation, even if converged
             min_iterations = 9
-            if not has_changed and i_iter >= 4:
+            if not has_changed and i_iter >= 2 and i_iter < 6:
+                # Early convergence - apply warm restart to escape local optima
+                if debug:
+                    print(f"Early convergence at iteration {i_iter}, applying warm restart...")
+                
+                # Unfreeze some instances to allow exploration
+                num_to_unfreeze = int(sum(len(f) for f in frozen_instances) * 0.2)  # Unfreeze 20%
+                if num_to_unfreeze > 0:
+                    for i_bag in range(len(bags)):
+                        if len(frozen_instances[i_bag]) > 0:
+                            to_unfreeze = min(len(frozen_instances[i_bag]) // 5, num_to_unfreeze)
+                            if to_unfreeze > 0:
+                                # Unfreeze instances with highest entropy among frozen ones
+                                frozen_list = list(frozen_instances[i_bag])
+                                bag_probs = fs[i_bag]
+                                frozen_entropy = [-np.sum(bag_probs[idx] * np.log(bag_probs[idx] + 1e-8), axis=0) for idx in frozen_list]
+                                frozen_entropy_idx = np.argsort(frozen_entropy)[-to_unfreeze:]
+                                for idx in frozen_entropy_idx:
+                                    frozen_instances[i_bag].remove(frozen_list[idx])
+                                num_to_unfreeze -= to_unfreeze
+                
+                # Increase temperature slightly to encourage exploration
+                temperature = min(temperature * 1.5, temperature_start * 0.7)
+                has_changed = True  # Force another iteration
+                
+            elif not has_changed and i_iter >= 6:
                 # Labels have converged, but continue training classifier
                 if debug:
                     print(f"Labels converged at iteration {i_iter}, continuing to refine classifier...")
                 # Enhanced training with adaptive learning when labels are stable
                 # Use bootstrapping with class balancing
                 best_inner_acc = 0.0
-                for inner_iter in range(8):  # More inner iterations
+                for inner_iter in range(5):  # Reduced inner iterations
                     # Bootstrap sampling with class balance preservation
                     if inner_iter % 2 == 0:
                         # Normal training
@@ -394,9 +430,6 @@ class MilCountBasedMultiClassLearner:
                     inner_acc = np.mean(predictions == flatten_y)
                     if inner_acc > best_inner_acc:
                         best_inner_acc = inner_acc
-            elif not has_changed and i_iter < 4:
-                if debug:
-                    print(f"Early convergence at iteration {i_iter}, continuing exploration...")
             
             # Only break after minimum iterations
             if i_iter >= min_iterations - 1:
