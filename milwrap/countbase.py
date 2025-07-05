@@ -140,7 +140,7 @@ class MilCountBasedMultiClassLearner:
         n_bags = len(bags)
         lambda_lower = np.zeros((n_bags, n_classes))
         lambda_upper = np.zeros((n_bags, n_classes))
-        rho = 1.2  # Penalty parameter for augmented Lagrangian (slightly increased)
+        rho = 1.0  # Penalty parameter for augmented Lagrangian
         
         # Temperature for soft assignments (starts high, anneals down)
         temperature_start = 2.0
@@ -304,8 +304,21 @@ class MilCountBasedMultiClassLearner:
                     print(np.mean(np.hstack(y) == np.hstack(debug_true_y)))
                 print("-----")
 
-            # Early stopping when converged
-            if not has_changed:
+            # Continue to iteration 9 for evaluation, even if converged
+            min_iterations = 9
+            if not has_changed and i_iter >= 4:
+                # Labels have converged, but continue training classifier
+                if debug:
+                    print(f"Labels converged at iteration {i_iter}, continuing to refine classifier...")
+                # Train with additional inner iterations when labels are stable
+                for inner_iter in range(5):  # 5 inner epochs after convergence
+                    self.classifier.fit(flatten_bags, flatten_y)
+            elif not has_changed and i_iter < 4:
+                if debug:
+                    print(f"Early convergence at iteration {i_iter}, continuing exploration...")
+            
+            # Only break after minimum iterations
+            if i_iter >= min_iterations - 1:
                 break
 
         return self.classifier, y
