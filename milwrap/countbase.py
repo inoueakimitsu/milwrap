@@ -5,7 +5,7 @@ that use count-based constraints to learn from bags of instances.
 """
 
 import random
-from typing import List, Sequence
+from typing import List, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -72,6 +72,107 @@ def get_order_based_initial_y(
             get_order_based_initial_bag_labels((lower_threshold + upper_threshold) / 2),
         )
     ]
+
+
+def sinkhorn_constrained_ot(
+    cost_matrix: NDArray[np.float64],
+    row_marginals: NDArray[np.float64],
+    col_marginals: NDArray[np.float64],
+    reg: float = 1.0,
+    max_iter: int = 50,
+    threshold: float = 1e-6,
+) -> NDArray[np.float64]:
+    """Solve constrained optimal transport using Sinkhorn algorithm.
+    
+    Args:
+    ----
+        cost_matrix: Cost matrix (n_instances, n_classes)
+        row_marginals: Row marginals (n_instances,), should sum to 1 for each instance
+        col_marginals: Column marginals (n_classes,), target class counts
+        reg: Entropy regularization parameter
+        max_iter: Maximum iterations
+        threshold: Convergence threshold
+        
+    Returns:
+    -------
+        Transport plan P (n_instances, n_classes)
+    
+    """
+    n_instances, n_classes = cost_matrix.shape
+    
+    # Initialize
+    K = np.exp(-cost_matrix / reg)
+    u = np.ones(n_instances) / n_instances
+    v = np.ones(n_classes) / n_classes
+    
+    # Normalize marginals
+    row_marginals = row_marginals / row_marginals.sum()
+    col_marginals = col_marginals / col_marginals.sum()
+    
+    for _ in range(max_iter):
+        u_prev = u.copy()
+        
+        # Update u (row scaling)
+        v = col_marginals / (K.T @ u + 1e-16)
+        # Update v (column scaling)  
+        u = row_marginals / (K @ v + 1e-16)
+        
+        # Check convergence
+        if np.max(np.abs(u - u_prev)) < threshold:
+            break
+    
+    # Compute transport plan
+    P = np.diag(u) @ K @ np.diag(v)
+    
+    # Ensure row sums are 1 (probability distribution)
+    P = P / P.sum(axis=1, keepdims=True)
+    
+    return P
+
+
+def compute_attention_entropy(attention_weights: NDArray[np.float64]) -> float:
+    """Compute entropy of attention weights.
+    
+    Args:
+    ----
+        attention_weights: Attention weights (n_instances, n_classes)
+        
+    Returns:
+    -------
+        Average entropy across instances
+        
+    """
+    # Add small epsilon to avoid log(0)
+    eps = 1e-8
+    attention_weights = np.clip(attention_weights, eps, 1 - eps)
+    
+    # Compute entropy for each instance
+    entropy_per_instance = -np.sum(attention_weights * np.log(attention_weights), axis=1)
+    
+    # Return average entropy
+    return np.mean(entropy_per_instance)
+
+
+def compute_effective_sample_size(attention_weights: NDArray[np.float64]) -> float:
+    """Compute effective sample size (ESS) = 1 / sum(p^2).
+    
+    Args:
+    ----
+        attention_weights: Attention weights (n_instances, n_classes)
+        
+    Returns:
+    -------
+        Average ESS across instances
+        
+    """
+    # Compute sum of squared probabilities for each instance
+    sum_p_squared = np.sum(attention_weights ** 2, axis=1)
+    
+    # Compute ESS for each instance
+    ess_per_instance = 1.0 / (sum_p_squared + 1e-16)
+    
+    # Return average ESS
+    return np.mean(ess_per_instance)
 
 
 class MilCountBasedMultiClassLearner:
@@ -147,14 +248,20 @@ class MilCountBasedMultiClassLearner:
         lambda_upper = np.zeros((n_bags, n_classes))
         rho = 1.0  # Penalty parameter for augmented Lagrangian
         
-        # Temperature for soft assignments with exponential annealing
-        temperature_start = 2.0
-        temperature_end = 0.1
-        temperature_decay = (temperature_end / temperature_start) ** (1.0 / max_iter)
+        # Temperature control parameters
+        temperature = 1.0  # Initial temperature
+        target_entropy = 0.5  # Target entropy level (0 = deterministic, log(n_classes) = uniform)
+        target_ess = 2.0  # Target effective sample size
+        temp_adjustment_rate = 0.1  # Learning rate for temperature adjustment
+        
+        # AEM regularization parameters
+        aem_lambda_start = 0.5
+        aem_lambda_end = 0.0
+        aem_lambda_decay = (aem_lambda_end / aem_lambda_start) ** (1.0 / max_iter) if aem_lambda_start > 0 else 1.0
 
         for i_iter in range(max_iter):
-            # Exponential annealing
-            temperature = temperature_start * (temperature_decay ** i_iter)
+            # AEM regularization decay
+            aem_lambda = aem_lambda_start * (aem_lambda_decay ** i_iter)
             
             # Fit
             flatten_bags = np.vstack(bags)
@@ -166,148 +273,87 @@ class MilCountBasedMultiClassLearner:
             y_pred = [self.classifier.predict(bag) for bag in bags]
             flatten_original_y = np.hstack(list(y))
 
-            # For every bag - use soft assignments with probabilistic modeling
+            # For every bag - use constrained optimal transport
             has_changed = False
+            all_attention_weights = []  # For entropy computation
+            
             for i_bag in range(len(bags)):
                 n_instances = len(bags[i_bag])
                 probs = fs[i_bag]  # Shape: (n_instances, n_classes)
                 
-                # Use Gumbel-Softmax for probabilistic assignment
-                # Add Gumbel noise for exploration with adaptive strength
-                if i_iter < 6:  # Apply in first 6 iterations
+                # Create cost matrix from negative log probabilities
+                cost_matrix = -np.log(probs + 1e-16)
+                
+                # Add Gumbel noise for exploration (decreasing over iterations)
+                if i_iter < 6:
                     gumbel_noise = -np.log(-np.log(np.random.uniform(0.01, 0.99, probs.shape)))
-                    # Adaptive noise strength: stronger early, weaker later
                     noise_strength = 0.15 * np.exp(-i_iter / 3.0)
-                    probs_with_noise = probs + noise_strength * gumbel_noise
-                    # Re-normalize
-                    probs_with_noise = probs_with_noise / probs_with_noise.sum(axis=1, keepdims=True)
-                else:
-                    probs_with_noise = probs
+                    cost_matrix += noise_strength * gumbel_noise
                 
-                # Get current class counts
-                class_count_dict = pd.Series(y[i_bag]).value_counts().to_dict()
+                # Add AEM regularization to cost matrix
+                if aem_lambda > 0:
+                    # Penalize low entropy (encourage exploration)
+                    entropy_penalty = -aem_lambda * np.log(probs + 1e-16)
+                    cost_matrix += entropy_penalty
                 
-                # Track which instances have been reassigned in this iteration
-                changed_indices = set()
-                new_y = y[i_bag].copy()
+                # Set up marginals for Sinkhorn
+                row_marginals = np.ones(n_instances)  # Each instance must be assigned
                 
-                # Unified approach for all cases
-                target_classes = list(range(n_classes))
-                random.shuffle(target_classes)
+                # Column marginals based on constraints with gradual tightening
+                col_marginals = np.zeros(n_classes)
+                slack_factor = max(0.0, 1.0 - (i_iter / 4.0))  # Reduce slack over first 4 iterations
                 
-                # Priority 1: Fix lower threshold violations
-                for i_class in target_classes:
-                    class_count = class_count_dict.get(i_class, 0)
+                for i_class in range(n_classes):
+                    lower = lower_threshold[i_bag, i_class]
+                    upper = upper_threshold[i_bag, i_class]
                     
-                    # Apply minimal slack only in first iteration for robustness
-                    effective_lower = lower_threshold[i_bag, i_class]
-                    if i_iter == 0:  # Only first iteration
-                        effective_lower = effective_lower * 0.95  # 5% slack
+                    # Apply slack in early iterations
+                    if slack_factor > 0:
+                        lower = lower * (1.0 - 0.05 * slack_factor)
+                        upper = upper * (1.0 + 0.05 * slack_factor)
                     
-                    if class_count < effective_lower:
-                        # Need more instances of this class
-                        deficit = int(effective_lower - class_count)
-                        
-                        # Find best candidates: high probability for this class, not already changed
-                        candidates = []
-                        for idx in range(n_instances):
-                            if idx not in changed_indices and new_y[idx] != i_class:
-                                # Score based on probability (with noise) and current class constraint status
-                                score = probs_with_noise[idx, i_class]
-                                
-                                # Boost score if moving from over-represented class
-                                current_class = new_y[idx]
-                                current_class_count = class_count_dict.get(current_class, 0)
-                                if current_class_count > upper_threshold[i_bag, current_class]:
-                                    score *= 2.0  # Stronger boost for constraint satisfaction
-                                elif current_class_count <= lower_threshold[i_bag, current_class]:
-                                    score *= 0.5  # Penalty for taking from under-represented class
-                                
-                                candidates.append((idx, score))
-                        
-                        # Sort by score and select top candidates
-                        candidates.sort(key=lambda x: x[1], reverse=True)
-                        # Gradually increase assignments based on iteration
-                        adjustment_rate = min(1.0, (i_iter + 1) / 3.0)  # Full adjustment by iter 3
-                        n_to_change = max(1, int(deficit * adjustment_rate))
-                        
-                        for idx, _ in candidates[:n_to_change]:
-                            old_class = new_y[idx]
-                            new_y[idx] = i_class
-                            changed_indices.add(idx)
-                            # Update counts
-                            class_count_dict[i_class] = class_count_dict.get(i_class, 0) + 1
-                            class_count_dict[old_class] = class_count_dict.get(old_class, 0) - 1
-                            if class_count_dict[old_class] == 0:
-                                del class_count_dict[old_class]
-                    
-                # Priority 2: Fix upper threshold violations
-                for i_class in target_classes:
-                    class_count = class_count_dict.get(i_class, 0)
-                    
-                    # Apply minimal slack only in first iteration for robustness
-                    effective_upper = upper_threshold[i_bag, i_class]
-                    if i_iter == 0:  # Only first iteration
-                        effective_upper = effective_upper * 1.05  # 5% slack
-                    
-                    if class_count > effective_upper:
-                        # Too many instances of this class
-                        excess = int(class_count - effective_upper)
-                        
-                        # Find instances to reassign: low probability for this class
-                        candidates = []
-                        for idx in range(n_instances):
-                            if idx not in changed_indices and new_y[idx] == i_class:
-                                candidates.append((idx, probs[idx, i_class]))
-                        
-                        # Sort by probability (ascending) and reassign
-                        candidates.sort(key=lambda x: x[1])
-                        
-                        # Gradually increase adjustments based on iteration
-                        adjustment_rate = min(1.0, (i_iter + 1) / 3.0)
-                        n_to_change = max(1, int(excess * adjustment_rate))
-                        
-                        for idx, _ in candidates[:n_to_change]:
-                            # Use soft assignment with temperature to choose new class
-                            scores = np.zeros(n_classes)
-                            for c in range(n_classes):
-                                if c == i_class:
-                                    scores[c] = -np.inf
-                                    continue
-                                
-                                # Base score from probability
-                                scores[c] = np.log(probs[idx, c] + 1e-8)
-                                
-                                # Constraint bonus
-                                c_count = class_count_dict.get(c, 0)
-                                if c_count < lower_threshold[i_bag, c]:
-                                    scores[c] += 2.0
-                                elif c_count < upper_threshold[i_bag, c]:
-                                    scores[c] += 0.5
-                                else:
-                                    scores[c] -= 1.0
-                            
-                            # Apply temperature-controlled softmax
-                            exp_scores = np.exp(scores / temperature)
-                            probabilities = exp_scores / np.sum(exp_scores)
-                            
-                            # Choose new class
-                            new_class = np.random.choice(n_classes, p=probabilities)
-                            
-                            old_class = new_y[idx]
-                            new_y[idx] = new_class
-                            changed_indices.add(idx)
-                            # Update counts
-                            class_count_dict[i_class] -= 1
-                            if class_count_dict[i_class] == 0:
-                                del class_count_dict[i_class]
-                            class_count_dict[new_class] = class_count_dict.get(new_class, 0) + 1
+                    # Set target count as midpoint of constraints
+                    target_count = (lower + upper) / 2.0
+                    col_marginals[i_class] = target_count
+                
+                # Solve constrained OT problem
+                P = sinkhorn_constrained_ot(
+                    cost_matrix, 
+                    row_marginals, 
+                    col_marginals,
+                    reg=temperature,
+                    max_iter=30,
+                    threshold=1e-5
+                )
+                
+                # Store attention weights for entropy computation
+                all_attention_weights.append(P)
+                
+                # Convert soft assignments to hard assignments
+                new_y = np.argmax(P, axis=1)
                 
                 # Check if assignments changed
                 if not np.array_equal(y[i_bag], new_y):
                     has_changed = True
                     y[i_bag] = new_y
-
+            
+            # Adaptive temperature control based on entropy/ESS
+            if i_iter > 0 and len(all_attention_weights) > 0:
+                # Compute average entropy and ESS across all bags
+                avg_entropy = np.mean([compute_attention_entropy(P) for P in all_attention_weights])
+                avg_ess = np.mean([compute_effective_sample_size(P) for P in all_attention_weights])
+                
+                # Adjust temperature based on entropy/ESS
+                if avg_entropy < target_entropy:
+                    # Increase temperature to encourage exploration
+                    temperature *= (1 + temp_adjustment_rate)
+                elif avg_entropy > target_entropy * 1.5:
+                    # Decrease temperature to encourage exploitation
+                    temperature *= (1 - temp_adjustment_rate)
+                
+                # Clamp temperature to reasonable range
+                temperature = np.clip(temperature, 0.1, 3.0)
+            
             if debug:
                 print("iter:", i_iter)
                 predicted_count = np.nan_to_num(
@@ -333,6 +379,8 @@ class MilCountBasedMultiClassLearner:
                     print(np.mean(np.hstack(y) == np.hstack(debug_true_y)))
                 print("-----")
                 print(f"Temperature: {temperature:.3f}")
+                if i_iter > 0 and len(all_attention_weights) > 0:
+                    print(f"Avg Entropy: {avg_entropy:.3f}, Avg ESS: {avg_ess:.3f}")
 
             # Continue to iteration 9 for evaluation, even if converged
             min_iterations = 9
