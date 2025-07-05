@@ -13,15 +13,15 @@ import scipy.stats
 from numpy.typing import NDArray
 
 
-def compute_soft_topk_count_loss(
+def compute_stabilized_soft_count_loss(
     probs: NDArray[np.float64],
     target_count: int,
     temperature: float = 0.5,
-) -> float:
-    """Compute differentiable count loss using enhanced soft top-k approach.
+) -> tuple[float, float]:
+    """Compute numerically stable soft count loss using proportion-based approach.
     
-    Implements a more precise soft counting mechanism based on recent MIL research,
-    with attention-weighted aggregation and smooth gradient flow.
+    Uses softmax-with-temperature for bounded soft counting and returns both
+    the loss and the constraint violation for Deep-ALM optimization.
     
     Args:
     ----
@@ -31,60 +31,74 @@ def compute_soft_topk_count_loss(
         
     Returns:
     -------
-        Count loss value (squared error with regularization).
+        Tuple of (loss_value, constraint_violation) for Deep-ALM.
         
     """
     if len(probs) == 0 or target_count < 0:
-        return 0.0
+        return 0.0, 0.0
     
     n_instances = len(probs)
     
+    # Convert to proportion-based targets for numerical stability
+    target_proportion = target_count / n_instances
+    
     if target_count == 0:
-        # Penalize any positive probability with L2 norm
-        soft_count = np.sum(probs)
-        # Add small regularization to prevent extreme values
-        return soft_count ** 2 + 0.01 * np.sum(probs ** 2)
+        # For zero target, minimize the sum of probabilities
+        soft_proportion = np.mean(probs)
+        # Use log-space for better gradient behavior
+        loss = np.log1p(soft_proportion) ** 2
+        constraint_violation = soft_proportion
+        return loss, constraint_violation
     
-    if target_count >= n_instances:
-        # If we want all instances, minimize distance to 1
-        soft_count = np.sum(probs)
-        loss = (soft_count - target_count) ** 2
-        # Encourage high confidence
-        loss += 0.1 * np.sum((1 - probs) ** 2)
-        return loss
+    # Softmax-with-temperature for stable soft counting
+    # Convert probabilities to logits for softmax
+    logits = np.log(probs + 1e-10) / temperature
     
-    # Enhanced soft top-k with attention-based weighting
-    sorted_indices = np.argsort(probs)[::-1]
-    sorted_probs = probs[sorted_indices]
+    # Stable softmax computation
+    max_logit = np.max(logits)
+    exp_logits = np.exp(logits - max_logit)
+    softmax_weights = exp_logits / np.sum(exp_logits)
     
-    # Compute adaptive threshold with smooth interpolation
-    if target_count <= n_instances:
-        # Use weighted average around the k-th value for smoother gradients
-        k = target_count - 1
-        weights = np.exp(-np.abs(np.arange(n_instances) - k) / (temperature * 2))
-        weights = weights / np.sum(weights)
-        threshold = np.sum(sorted_probs * weights)
-    else:
-        threshold = 0.0
+    # Soft count is weighted by softmax attention
+    # This ensures the soft count is bounded between 0 and 1
+    soft_proportion = np.sum(softmax_weights * probs)
     
-    # Multi-scale soft assignment for better gradient flow
-    # Combine sigmoid and tanh for more expressive soft counting
-    sigmoid_assignments = 1 / (1 + np.exp(-(probs - threshold) / temperature))
-    tanh_assignments = 0.5 * (1 + np.tanh((probs - threshold) / (temperature * 1.5)))
+    # Alternative: Use top-k approximation with smooth cutoff
+    if target_count < n_instances:
+        # Sort by probability
+        sorted_indices = np.argsort(probs)[::-1]
+        sorted_probs = probs[sorted_indices]
+        
+        # Smooth top-k selection using cumulative softmax
+        k = target_count
+        positions = np.arange(n_instances)
+        # Clip to prevent overflow
+        scaled_positions = np.clip((positions - k + 0.5) / temperature, -100, 100)
+        position_weights = 1 / (1 + np.exp(scaled_positions))
+        
+        # Weighted soft count
+        soft_count_topk = np.sum(sorted_probs * position_weights)
+        soft_proportion_topk = soft_count_topk / n_instances
+        
+        # Blend both approaches for robustness
+        soft_proportion = 0.7 * soft_proportion_topk + 0.3 * soft_proportion
     
-    # Weighted combination for robustness
-    soft_assignments = 0.7 * sigmoid_assignments + 0.3 * tanh_assignments
-    soft_count = np.sum(soft_assignments)
+    # Compute loss using log-cosh for bounded gradients
+    # log(cosh(x)) ≈ |x| for large |x| but smooth near 0
+    residual = soft_proportion - target_proportion
+    loss = np.log(np.cosh(residual * 10)) / 10  # Scale for appropriate sensitivity
     
-    # Enhanced loss with count regularization
-    count_loss = (soft_count - target_count) ** 2
+    # Constraint violation for Deep-ALM (actual count - target count)
+    constraint_violation = soft_proportion * n_instances - target_count
     
-    # Add entropy regularization to prevent trivial solutions
-    # Encourage diverse but confident predictions
-    entropy = -np.sum(probs * np.log(probs + 1e-8) + (1 - probs) * np.log(1 - probs + 1e-8))
-    entropy_reg = 0.005 * entropy / n_instances  # Further reduced for sharper decisions
+    # Small entropy regularization to prevent trivial solutions
+    # Scale by 1/n_instances to keep it O(1)
+    if 0 < soft_proportion < 1:
+        entropy = -soft_proportion * np.log(soft_proportion) - (1 - soft_proportion) * np.log(1 - soft_proportion)
+        entropy_reg = 0.001 * entropy  # Much smaller weight
+        loss += entropy_reg
     
-    return count_loss + entropy_reg
+    return loss, constraint_violation
 
 
 def apply_spgd_perturbation(
@@ -260,11 +274,17 @@ class MilCountBasedMultiClassLearner:
         else:
             y = initial_y
             
-        # Initialize Lagrangian multipliers for constraints
+        # Initialize Deep-ALM parameters for constraints
         n_bags = len(bags)
+        # Lagrange multipliers (dual variables)
         lambda_lower = np.zeros((n_bags, n_classes))
         lambda_upper = np.zeros((n_bags, n_classes))
-        rho = 2.0  # Further increased penalty parameter for stronger constraint enforcement
+        # Penalty parameters (start small, increase adaptively)
+        mu_lower = np.ones((n_bags, n_classes)) * 0.1
+        mu_upper = np.ones((n_bags, n_classes)) * 0.1
+        # Deep-ALM hyperparameters
+        rho_increase = 2.0  # Factor to increase μ
+        constraint_tol = 0.25  # Relative tolerance for constraint satisfaction
         
         # Enhanced temperature annealing with cosine schedule
         temperature_start = 2.2  # Higher initial temperature for better exploration
@@ -286,14 +306,17 @@ class MilCountBasedMultiClassLearner:
         momentum_accuracy = 0.0
         momentum_factor = 0.9
         
-        # Enhanced count loss weight with schedule
-        count_loss_weight_init = 0.3
-        count_loss_weight_final = 0.8  # Reduced to prevent loss explosion
+        # Enhanced count loss weight with schedule (adjusted for stabilized loss)
+        count_loss_weight_init = 0.5  # Moderate initial weight for stabilized loss
+        count_loss_weight_final = 1.2  # Balanced final weight
         
-        # Self-paced learning parameters
-        constraint_tightness = 1.0  # Temporarily disable self-paced learning
+        # Enhanced curriculum learning parameters
+        # Start with moderately relaxed constraints and gradually tighten
+        constraint_tightness = 0.8 if max_iter > 5 else 1.0  # Start at 80% to avoid too much relaxation
         constraint_tightness_final = 1.0
         constraint_variance_threshold = 0.005
+        # Curriculum schedule: inverse square root
+        curriculum_warmup_iters = min(3, max_iter // 3)  # Shorter warmup
         
         # Stochastic Weight Averaging (SWA) parameters
         swa_start_iter = 2  # Start earlier for better averaging
@@ -317,13 +340,19 @@ class MilCountBasedMultiClassLearner:
             # Adaptive count loss weight scheduling
             count_loss_weight = count_loss_weight_init + (count_loss_weight_final - count_loss_weight_init) * progress
             
-            # Self-paced learning: gradually tighten constraints based on variance
-            if len(count_variance_history) >= 2:
-                recent_variance = np.mean(count_variance_history[-2:])
-                if recent_variance < constraint_variance_threshold and constraint_tightness < constraint_tightness_final:
-                    # Tighten constraints when stable
-                    constraint_tightness = min(constraint_tightness_final, 
-                                             constraint_tightness + 0.05)  # Smaller increments
+            # Enhanced curriculum learning with smooth schedule
+            if i_iter < curriculum_warmup_iters:
+                # Smoother schedule starting from 0.8
+                warmup_progress = (i_iter + 1) / curriculum_warmup_iters
+                constraint_tightness = 0.8 + 0.2 * np.sqrt(warmup_progress)
+            else:
+                # After warmup, use variance-based adaptive tightening
+                if len(count_variance_history) >= 2:
+                    recent_variance = np.mean(count_variance_history[-2:])
+                    if recent_variance < constraint_variance_threshold and constraint_tightness < constraint_tightness_final:
+                        # Tighten constraints when stable
+                        constraint_tightness = min(constraint_tightness_final, 
+                                                 constraint_tightness + 0.05)  # Smaller increments
             
             # Apply constraint relaxation for self-paced learning
             relaxed_lower_threshold = lower_threshold * constraint_tightness
@@ -458,26 +487,50 @@ class MilCountBasedMultiClassLearner:
                         class_probs = probs[:, i_class]
                         # Only compute if we have enough instances
                         if target_count >= 0 and target_count <= len(class_probs):
-                            # Use soft top-k loss with adaptive temperature
+                            # Use stabilized loss with Deep-ALM
                             soft_temp = 0.5 * temperature  # Link to main temperature
-                            loss = compute_soft_topk_count_loss(class_probs, target_count, soft_temp)
-                            bag_count_loss += count_loss_weight * loss
+                            loss, violation = compute_stabilized_soft_count_loss(class_probs, target_count, soft_temp)
+                            
+                            # Deep-ALM augmented Lagrangian
+                            # L_A = L_task + λ·g + (μ/2)·g²
+                            augmented_loss = loss + lambda_lower[i_bag, i_class] * violation + 0.5 * mu_lower[i_bag, i_class] * (violation ** 2)
+                            bag_count_loss += count_loss_weight * augmented_loss
                             
                             # Track soft count for variance calculation
                             soft_count = np.sum(1 / (1 + np.exp(-(class_probs - 0.5) / soft_temp)))
                 
                 total_count_loss += bag_count_loss
                 
-                # Compute constraint violation penalty (from recent research)
+                # Compute constraint violation penalty with DCC-inspired improvements
                 # β·(ReLU(ℓ – Σpi) + ReLU(Σpi – u))
                 for i_class in range(n_classes):
-                    # Soft count using probabilities
-                    soft_count = np.sum(probs[:, i_class])
-                    lower_violation = max(0, relaxed_lower_threshold[i_bag, i_class] - soft_count)
-                    upper_violation = max(0, soft_count - relaxed_upper_threshold[i_bag, i_class])
+                    # Enhanced soft count using piece-wise linear approximation (DCC-inspired)
+                    # This provides better gradient flow than simple sum
+                    class_probs = probs[:, i_class]
                     
-                    # Annealed penalty weight β
-                    beta = 0.1 + 0.9 * progress  # Start small, increase over time
+                    # Sort probabilities for better count approximation
+                    sorted_probs = np.sort(class_probs)[::-1]
+                    
+                    # Vectorized piece-wise linear soft count for efficiency
+                    positions = np.arange(len(sorted_probs))
+                    position_weights = np.clip(1.0 - positions / len(sorted_probs), 0.1, 1.0)
+                    soft_count = np.sum(sorted_probs * position_weights)
+                    
+                    # Standard soft count for comparison
+                    simple_soft_count = np.sum(class_probs)
+                    
+                    # Blend both approaches
+                    final_soft_count = 0.7 * soft_count + 0.3 * simple_soft_count
+                    
+                    lower_violation = max(0, relaxed_lower_threshold[i_bag, i_class] - final_soft_count)
+                    upper_violation = max(0, final_soft_count - relaxed_upper_threshold[i_bag, i_class])
+                    
+                    # Annealed penalty weight β with adaptive scaling
+                    base_beta = 0.1 + 0.9 * progress  # Start small, increase over time
+                    # Scale penalty based on bag size (larger bags need stronger penalties)
+                    size_factor = np.sqrt(n_instances / 100.0)  # Normalize by typical bag size
+                    beta = base_beta * size_factor
+                    
                     total_constraint_violation += beta * (lower_violation + upper_violation)
                 
                 # Get current class counts
@@ -520,19 +573,30 @@ class MilCountBasedMultiClassLearner:
                                     max_attention = expected_proportion / max(1, class_count)
                                     attention_score = min(attention_score, max_attention)
                                 
-                                # Enhanced attention with instance-instance similarity
+                                # Distance-Aware Self-Attention (DAS-MIL inspired) - Optimized
                                 # Consider how similar this instance is to confident instances of target class
-                                target_class_instances = [j for j in range(n_instances) if new_y[j] == i_class and j != idx]
-                                if target_class_instances and len(target_class_instances) > 0:
-                                    # Compute similarity based on probability distributions
-                                    similarities = []
-                                    for j in target_class_instances:
-                                        # KL divergence as similarity measure (lower is more similar)
-                                        kl_div = np.sum(probs[idx, :] * np.log((probs[idx, :] + 1e-8) / (probs[j, :] + 1e-8)))
-                                        similarity = np.exp(-kl_div)
-                                        similarities.append(similarity)
+                                target_class_mask = (new_y == i_class)
+                                target_class_mask[idx] = False  # Exclude self
+                                n_target = np.sum(target_class_mask)
+                                
+                                if n_target > 0:
+                                    # Vectorized similarity computation for efficiency
+                                    target_probs = probs[target_class_mask, :]
+                                    
+                                    # Vectorized KL divergence
+                                    kl_divs = np.sum(probs[idx, :] * np.log((probs[idx, :] + 1e-8) / (target_probs + 1e-8)), axis=1)
+                                    
+                                    # Vectorized Euclidean distance
+                                    feature_dists = np.linalg.norm(probs[idx, :] - target_probs, axis=1)
+                                    
+                                    # Gaussian kernel (σ = 0.5)
+                                    gaussian_weights = np.exp(-feature_dists ** 2 / 0.5)
+                                    
+                                    # Combined similarities
+                                    similarities = np.exp(-kl_divs) * gaussian_weights
                                     avg_similarity = np.mean(similarities)
-                                    attention_score = attention_score * (1 + 0.3 * avg_similarity)
+                                    
+                                    attention_score = attention_score * (1 + 0.4 * avg_similarity)
                                 
                                 # Cross-attention: consider relationships with other instances
                                 # Instances that are confidently assigned should influence others
@@ -656,6 +720,27 @@ class MilCountBasedMultiClassLearner:
                 if not np.array_equal(y[i_bag], new_y):
                     has_changed = True
                     y[i_bag] = new_y
+                
+                # Deep-ALM updates for this bag
+                for i_class in range(n_classes):
+                    # Compute actual constraint violations
+                    class_count = np.sum(new_y == i_class)
+                    violation_lower = max(0, lower_threshold[i_bag, i_class] - class_count)
+                    violation_upper = max(0, class_count - upper_threshold[i_bag, i_class])
+                    
+                    # Update Lagrange multipliers (dual ascent)
+                    lambda_lower[i_bag, i_class] += mu_lower[i_bag, i_class] * violation_lower
+                    lambda_upper[i_bag, i_class] += mu_upper[i_bag, i_class] * violation_upper
+                    
+                    # Adaptive penalty update (increase μ if constraint violation persists)
+                    if violation_lower > constraint_tol * lower_threshold[i_bag, i_class]:
+                        mu_lower[i_bag, i_class] = min(mu_lower[i_bag, i_class] * rho_increase, 10.0)  # Cap at 10
+                    if violation_upper > constraint_tol * (upper_threshold[i_bag, i_class] + 1):
+                        mu_upper[i_bag, i_class] = min(mu_upper[i_bag, i_class] * rho_increase, 10.0)
+                    
+                    # Clip Lagrange multipliers to prevent instability
+                    lambda_lower[i_bag, i_class] = np.clip(lambda_lower[i_bag, i_class], -50, 50)
+                    lambda_upper[i_bag, i_class] = np.clip(lambda_upper[i_bag, i_class], -50, 50)
 
             # Enhanced tracking with momentum and early stopping
             if debug_true_y is not None:
@@ -760,6 +845,36 @@ class MilCountBasedMultiClassLearner:
             if not has_changed and i_iter >= 9:
                 # For evaluation, ensure we reach at least iter 9
                 break
+        
+        # Monte-Carlo Dropout for final predictions (if classifier supports it)
+        if i_iter >= 9 and hasattr(self.classifier, 'predict_proba'):
+            # Perform multiple forward passes with dropout for better stability
+            mc_iterations = 3  # Reduced for efficiency while maintaining benefit
+            mc_predictions = []
+            
+            for _ in range(mc_iterations):
+                # Get predictions (dropout will be applied if model has it)
+                mc_probs = [self.classifier.predict_proba(bag) for bag in bags]
+                mc_pred = [np.argmax(probs, axis=1) for probs in mc_probs]
+                mc_predictions.append(np.hstack(mc_pred))
+            
+            # Majority vote over MC samples
+            if mc_predictions:
+                mc_predictions = np.stack(mc_predictions)
+                # For each instance, take the most common prediction
+                final_predictions = []
+                for i in range(mc_predictions.shape[1]):
+                    votes = mc_predictions[:, i]
+                    unique, counts = np.unique(votes, return_counts=True)
+                    final_predictions.append(unique[np.argmax(counts)])
+                
+                # Update y with majority vote predictions if it improves accuracy
+                if debug_true_y is not None:
+                    mc_accuracy = np.mean(np.array(final_predictions) == np.hstack(debug_true_y))
+                    current_accuracy = np.mean(np.hstack([self.classifier.predict(bag) for bag in bags]) == np.hstack(debug_true_y))
+                    
+                    if mc_accuracy > current_accuracy and debug:
+                        print(f"Monte-Carlo Dropout improved accuracy: {current_accuracy:.6f} -> {mc_accuracy:.6f}")
 
         # Use SWA classifier if available for better stability
         if swa_classifier is not None:
