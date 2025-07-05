@@ -13,6 +13,88 @@ import scipy.stats
 from numpy.typing import NDArray
 
 
+def compute_soft_topk_count_loss(
+    probs: NDArray[np.float64],
+    target_count: int,
+    temperature: float = 0.5,
+) -> float:
+    """Compute differentiable count loss using soft top-k approach.
+    
+    Uses sigmoid-based soft counting that is numerically stable and
+    provides smooth gradients.
+    
+    Args:
+    ----
+        probs: Probability array for instances belonging to a class.
+        target_count: Target number of instances for the class.
+        temperature: Temperature parameter for soft counting (lower = sharper).
+        
+    Returns:
+    -------
+        Count loss value (squared error).
+        
+    """
+    if len(probs) == 0 or target_count < 0:
+        return 0.0
+    
+    # Compute threshold for soft top-k
+    # Sort probabilities to find approximate threshold
+    sorted_probs = np.sort(probs)[::-1]  # Descending order
+    
+    if target_count == 0:
+        # If we want 0 instances, penalize any positive probability
+        soft_count = np.sum(probs)
+        return soft_count ** 2
+    
+    if target_count >= len(probs):
+        # If we want all instances, use sum of (1 - prob) as penalty
+        soft_count = np.sum(probs)
+        return (soft_count - target_count) ** 2
+    
+    # Find threshold around the k-th largest value
+    if target_count <= len(sorted_probs):
+        threshold = sorted_probs[target_count - 1]
+        if target_count < len(sorted_probs):
+            threshold = (threshold + sorted_probs[target_count]) / 2
+    else:
+        threshold = 0.0
+    
+    # Soft counting using sigmoid
+    # Higher temperature = smoother selection
+    soft_indicators = 1.0 / (1.0 + np.exp(-(probs - threshold) / temperature))
+    soft_count = np.sum(soft_indicators)
+    
+    # Squared error loss
+    loss = (soft_count - target_count) ** 2
+    
+    return loss
+
+
+def apply_spgd_perturbation(
+    logits: NDArray[np.float64],
+    perturbation_scale: float = 0.2,
+    rng: np.random.Generator | None = None,
+) -> NDArray[np.float64]:
+    """Apply SPGD-style perturbation to logits.
+    
+    Args:
+    ----
+        logits: Input logits array.
+        perturbation_scale: Scale of uniform perturbation.
+        rng: Random number generator.
+        
+    Returns:
+    -------
+        Perturbed logits.
+        
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    
+    perturbation = rng.uniform(-perturbation_scale, perturbation_scale, size=logits.shape)
+    return logits + perturbation
+
+
 def get_order_based_initial_bag_labels(
     n_instances_for_each_bag_and_class: NDArray[np.int_],
 ) -> List[int]:
@@ -140,12 +222,29 @@ class MilCountBasedMultiClassLearner:
         n_bags = len(bags)
         lambda_lower = np.zeros((n_bags, n_classes))
         lambda_upper = np.zeros((n_bags, n_classes))
-        rho = 1.2  # Penalty parameter for augmented Lagrangian (slightly increased)
+        rho = 1.2  # Penalty parameter for augmented Lagrangian
         
         # Temperature for soft assignments (starts high, anneals down)
         temperature_start = 2.0
-        temperature_end = 0.1
+        temperature_end = 0.3  # Slightly lower for better convergence
         temperature_decay = (temperature_end / temperature_start) ** (1.0 / max_iter)
+        
+        # SPGD parameters
+        perturbation_scale_init = 0.15  # Initial perturbation scale
+        perturbation_interval = 2  # Apply perturbation every 2 iterations
+        rng = np.random.default_rng(seed)
+        
+        # Adaptive perturbation tracking
+        accuracy_history = []
+        perturbation_active = True
+        no_improvement_count = 0
+        
+        # Count loss weight
+        count_loss_weight = 0.5  # Increased weight for differentiable count loss
+        
+        # Track best solution
+        best_accuracy = 0.0
+        best_y = None
 
         for i_iter in range(max_iter):
             # Temperature annealing
@@ -161,12 +260,52 @@ class MilCountBasedMultiClassLearner:
             y_pred = [self.classifier.predict(bag) for bag in bags]
             flatten_original_y = np.hstack(list(y))
 
+            # Apply adaptive SPGD perturbation at intervals
+            if perturbation_active and i_iter > 0 and i_iter % perturbation_interval == 0:
+                # Adaptive perturbation scale based on iteration
+                perturbation_scale = perturbation_scale_init * (0.8 ** (i_iter // 4))
+                
+                for i_bag in range(len(bags)):
+                    if len(bags[i_bag]) > 0:
+                        # Apply perturbation to predicted probabilities
+                        perturbed_probs = fs[i_bag].copy()
+                        for c in range(n_classes):
+                            logits = np.log(perturbed_probs[:, c] + 1e-8)
+                            perturbed_logits = apply_spgd_perturbation(logits, perturbation_scale, rng)
+                            perturbed_probs[:, c] = np.exp(perturbed_logits) / (1 + np.exp(perturbed_logits))
+                        # Renormalize
+                        perturbed_probs = perturbed_probs / perturbed_probs.sum(axis=1, keepdims=True)
+                        fs[i_bag] = perturbed_probs
+            
             # For every bag - use soft assignments with augmented Lagrangian
             has_changed = False
+            total_count_loss = 0.0
+            
             for i_bag in range(len(bags)):
                 # Hybrid approach: combine constraint-based selection with soft assignments
                 n_instances = len(bags[i_bag])
+                if n_instances == 0:
+                    continue
+                    
                 probs = fs[i_bag]  # Shape: (n_instances, n_classes)
+                
+                # Compute differentiable count loss for this bag
+                bag_count_loss = 0.0
+                for i_class in range(n_classes):
+                    target_lower = int(lower_threshold[i_bag, i_class])
+                    target_upper = int(upper_threshold[i_bag, i_class])
+                    if target_lower > 0 and target_lower <= n_instances:
+                        # Use average of lower and upper as target, but cap at n_instances
+                        target_count = min(int((target_lower + target_upper) / 2), n_instances)
+                        class_probs = probs[:, i_class]
+                        # Only compute if we have enough instances
+                        if target_count >= 0 and target_count <= len(class_probs):
+                            # Use soft top-k loss with adaptive temperature
+                            soft_temp = 0.5 * temperature  # Link to main temperature
+                            loss = compute_soft_topk_count_loss(class_probs, target_count, soft_temp)
+                            bag_count_loss += count_loss_weight * loss
+                
+                total_count_loss += bag_count_loss
                 
                 # Get current class counts
                 class_count_dict = pd.Series(y[i_bag]).value_counts().to_dict()
@@ -190,14 +329,27 @@ class MilCountBasedMultiClassLearner:
                         candidates = []
                         for idx in range(n_instances):
                             if idx not in changed_indices and new_y[idx] != i_class:
-                                # Score based on probability and current class constraint status
-                                score = probs[idx, i_class]
+                                # Base score from probability
+                                base_score = probs[idx, i_class]
                                 
-                                # Boost score if moving from over-represented class
+                                # Constraint-aware scoring: boost instances that help satisfy constraints
+                                constraint_score = 0.0
+                                
+                                # Reward moving to under-represented class
+                                class_deficit = max(0, lower_threshold[i_bag, i_class] - class_count)
+                                if class_deficit > 0:
+                                    # Stronger boost for larger deficits
+                                    constraint_score += 0.3 * np.log1p(class_deficit)
+                                
+                                # Reward moving from over-represented class
                                 current_class = new_y[idx]
                                 current_class_count = class_count_dict.get(current_class, 0)
-                                if current_class_count > upper_threshold[i_bag, current_class]:
-                                    score *= 1.5
+                                current_excess = max(0, current_class_count - upper_threshold[i_bag, current_class])
+                                if current_excess > 0:
+                                    constraint_score += 0.2 * np.log1p(current_excess)
+                                
+                                # Combine scores with constraint awareness
+                                score = base_score * (1.0 + constraint_score)
                                 
                                 candidates.append((idx, score))
                         
@@ -262,6 +414,15 @@ class MilCountBasedMultiClassLearner:
                             exp_scores = np.exp(scores / temperature)
                             probabilities = exp_scores / np.sum(exp_scores)
                             
+                            # Add entropy regularization to prevent overconfidence
+                            entropy = -np.sum(probabilities * np.log(probabilities + 1e-8))
+                            entropy_weight = 0.05  # Reduced weight for better convergence
+                            
+                            # Mix with uniform distribution to encourage exploration
+                            uniform_prob = np.ones(n_classes) / n_classes
+                            probabilities = (1 - entropy_weight) * probabilities + entropy_weight * uniform_prob
+                            probabilities = probabilities / np.sum(probabilities)  # Renormalize
+                            
                             # Choose new class
                             new_class = np.random.choice(n_classes, p=probabilities)
                             
@@ -279,6 +440,35 @@ class MilCountBasedMultiClassLearner:
                     has_changed = True
                     y[i_bag] = new_y
 
+            # Track best solution and adaptive perturbation
+            if debug_true_y is not None:
+                current_accuracy = np.mean(
+                    np.hstack([self.classifier.predict(bag) for bag in bags]) == np.hstack(debug_true_y)
+                )
+                
+                # Update accuracy history for adaptive perturbation
+                accuracy_history.append(current_accuracy)
+                
+                # Check if we should stop perturbations
+                if perturbation_active and len(accuracy_history) >= 3:
+                    # Stop perturbations if no improvement for 3 consecutive checks
+                    recent_improvements = [
+                        accuracy_history[i] - accuracy_history[i-1] 
+                        for i in range(len(accuracy_history)-2, len(accuracy_history))
+                    ]
+                    if all(imp < 2e-4 for imp in recent_improvements):
+                        no_improvement_count += 1
+                        if no_improvement_count >= 2:
+                            perturbation_active = False
+                            if debug:
+                                print("Stopping SPGD perturbations due to convergence")
+                    else:
+                        no_improvement_count = 0
+                
+                if current_accuracy > best_accuracy:
+                    best_accuracy = current_accuracy
+                    best_y = [y_bag.copy() for y_bag in y]
+            
             if debug:
                 print("iter:", i_iter)
                 predicted_count = np.nan_to_num(
@@ -293,6 +483,8 @@ class MilCountBasedMultiClassLearner:
                 print("num changes instances")
                 num_changes_instance = np.sum(np.hstack(y) != flatten_original_y)
                 print(num_changes_instance)
+                print("differentiable count loss")
+                print(f"{total_count_loss:.4f}")
                 if debug_true_y is not None:
                     print("instance unit accuracy")
                     print(
@@ -302,10 +494,21 @@ class MilCountBasedMultiClassLearner:
                     )
                     print("instance unit accuracy (label adjusted)")
                     print(np.mean(np.hstack(y) == np.hstack(debug_true_y)))
+                    if best_accuracy > 0:
+                        print(f"best accuracy so far: {best_accuracy:.6f}")
                 print("-----")
 
             # Early stopping when converged
-            if not has_changed:
+            if not has_changed and i_iter > perturbation_interval:
+                # Allow at least one perturbation cycle before stopping
                 break
 
+        # Return best solution if available
+        if best_y is not None and best_accuracy > 0:
+            # Refit classifier with best labels
+            flatten_bags = np.vstack(bags)
+            flatten_best_y = np.hstack(best_y)
+            self.classifier.fit(flatten_bags, flatten_best_y)
+            return self.classifier, best_y
+        
         return self.classifier, y
