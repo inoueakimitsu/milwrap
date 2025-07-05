@@ -175,7 +175,7 @@ def compute_margin_aware_confidence(probs: NDArray[np.float64], target_class: in
     return confidence
 
 
-def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margin_scores=None, aem_scores=None, uncertainty_scores=None, embeddings=None, diversity_weight=0.1):
+def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margin_scores=None, aem_scores=None, uncertainty_scores=None, embeddings=None, diversity_weight=0.1, use_diversity_optimization=False):
     """Solve exact k-of-n assignment problem with optional margin weighting.
     
     Find optimal assignment of instances to positive class such that
@@ -191,6 +191,7 @@ def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margi
         uncertainty_scores: uncertainty scores for weighting (optional)
         embeddings: instance embeddings for diversity computation (optional)
         diversity_weight: weight for diversity bonus (optional)
+        use_diversity_optimization: enable diversity-aware selection (optional)
         
     Returns:
         optimal_assignments: binary array of assignments
@@ -249,7 +250,54 @@ def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margi
     # Create assignment vector
     assignments = np.zeros(n, dtype=int)
     if best_k > 0:
-        assignments[sorted_indices[:best_k]] = 1
+        if use_diversity_optimization and embeddings is not None and best_k > 1:
+            # Use greedy diverse selection
+            selected_indices = []
+            remaining_indices = sorted_indices.tolist()
+            
+            # Select first instance (highest score)
+            selected_indices.append(remaining_indices.pop(0))
+            
+            # Select remaining instances to maximize diversity
+            while len(selected_indices) < best_k and remaining_indices:
+                best_idx = None
+                best_combined_score = -np.inf
+                
+                for idx in remaining_indices[:min(10, len(remaining_indices))]:  # Consider top 10 candidates
+                    # Base score from log-odds
+                    base_score = log_odds[idx]
+                    
+                    # Compute minimum distance to already selected instances
+                    min_distance = np.inf
+                    for sel_idx in selected_indices:
+                        if embeddings is not None:
+                            # Use cosine distance
+                            sim = np.dot(embeddings[idx], embeddings[sel_idx]) / (
+                                np.linalg.norm(embeddings[idx]) * np.linalg.norm(embeddings[sel_idx]) + 1e-10
+                            )
+                            distance = 1.0 - sim
+                        else:
+                            # Use probability difference as distance
+                            distance = abs(probs[idx] - probs[sel_idx])
+                        min_distance = min(min_distance, distance)
+                    
+                    # Combined score: base score + diversity bonus
+                    combined_score = base_score + diversity_weight * min_distance
+                    
+                    if combined_score > best_combined_score:
+                        best_combined_score = combined_score
+                        best_idx = idx
+                
+                if best_idx is not None:
+                    selected_indices.append(best_idx)
+                    remaining_indices.remove(best_idx)
+            
+            # Apply assignments
+            for idx in selected_indices:
+                assignments[idx] = 1
+        else:
+            # Standard selection: top k by score
+            assignments[sorted_indices[:best_k]] = 1
     
     return assignments
 
@@ -407,12 +455,12 @@ class MilCountBasedMultiClassLearner:
         
         # Temperature decay settings (based on crossover optimization)
         temperature_start = 5.0  # Higher starting temperature for better exploration
-        temperature_min = 0.7    # Higher minimum to avoid over-cooling
+        temperature_min = 0.65   # Slightly lower minimum for better convergence
         temperature_current = temperature_start
         
         # Decay rates
-        gamma_base = 0.88  # Main decay rate
-        gamma_fast = 0.70  # Accelerated rate when stalled
+        gamma_base = 0.87  # Slightly faster decay
+        gamma_fast = 0.68  # Accelerated rate when stalled
         patience = 2       # Iterations with minimal improvement to trigger fast decay
         
         # Self-paced learning: track bag difficulty scores
@@ -577,19 +625,25 @@ class MilCountBasedMultiClassLearner:
                             
                             # Apply iteration-based weighting
                             if i_iter == 2:
-                                uncertainty_weight = 0.12 * (temperature / temperature_start)  # ~0.10 typically
+                                uncertainty_weight = 0.10 * (temperature / temperature_start)  # ~0.08 typically
                             else:  # i_iter >= 3
-                                uncertainty_weight = min(0.25, 0.12 * (temperature / temperature_start))
+                                uncertainty_weight = min(0.22, 0.10 * (temperature / temperature_start))
                             
                             # Weight the scores for active instances
                             uncertainty_scores_active = uncertainty_scores[active_indices] * uncertainty_weight
                         
                         # Solve exact assignment for active instances with all scores
+                        # Enable diversity optimization after initial iterations
+                        use_diversity = i_iter >= 4 and n_active > 10 and k_max_active > 3  # More conservative conditions
+                        
                         optimal_assignment_active = exact_k_of_n_assignment(
                             active_probs, k_min_active, k_max_active, 
                             margin_scores=margin_scores, 
                             aem_scores=aem_scores_active,
-                            uncertainty_scores=uncertainty_scores_active
+                            uncertainty_scores=uncertainty_scores_active,
+                            embeddings=probs[active_indices] if use_diversity else None,
+                            diversity_weight=0.08,  # Reduced diversity weight
+                            use_diversity_optimization=use_diversity
                         )
                         
                         # Map back to full assignment
@@ -656,7 +710,7 @@ class MilCountBasedMultiClassLearner:
                                     # Add margin-aware confidence
                                     margin_conf = compute_margin_aware_confidence(probs[idx], i_class, margin_lambda=margin_lambda)
                                     # Incorporate uncertainty (prefer certain predictions)
-                                    uncertainty_penalty = uncertainty_scores[idx] * 0.2
+                                    uncertainty_penalty = uncertainty_scores[idx] * 0.18
                                     
                                     # Add diversity bonus if this instance is different from already selected ones
                                     diversity_bonus = 0.0
