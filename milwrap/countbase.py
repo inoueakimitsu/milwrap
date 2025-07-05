@@ -13,8 +13,75 @@ import scipy.stats
 from numpy.typing import NDArray
 
 
-def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None):
-    """Solve exact k-of-n assignment problem.
+def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambda_entropy: float = 0.08) -> NDArray[np.float64]:
+    """Compute AEM (Attention Entropy Maximization) regularized scores.
+    
+    Based on AEM research: adds -H(α) regularizer to prevent over-concentrated attention,
+    keeping entropy high enough for multiple diagnostic instances to share probability mass.
+    
+    Args:
+    ----
+        bag_probs: Instance probability matrix of shape (n_instances, n_classes).
+        lambda_entropy: Entropy regularization strength (default 0.08).
+        
+    Returns:
+    -------
+        AEM-regularized scores for each instance.
+        
+    """
+    if len(bag_probs.shape) != 2 or bag_probs.shape[0] == 0:
+        return np.ones(bag_probs.shape[0])
+    
+    n_instances, n_classes = bag_probs.shape
+    
+    # Calculate instance-wise attention weights (softmax over max probabilities)
+    max_probs = np.max(bag_probs, axis=1)
+    attention_weights = np.exp(max_probs) / (np.sum(np.exp(max_probs)) + 1e-10)
+    
+    # Calculate attention entropy: H(α) = -Σ αᵢ log(αᵢ)
+    attention_entropy = -np.sum(attention_weights * np.log(attention_weights + 1e-10))
+    
+    # AEM regularization: encourage higher entropy (less concentrated attention)
+    entropy_bonus = lambda_entropy * attention_entropy
+    
+    # Apply entropy bonus to instance scores
+    aem_scores = max_probs + entropy_bonus * attention_weights
+    
+    return aem_scores
+
+
+def compute_margin_aware_confidence(probs: NDArray[np.float64], target_class: int, margin_lambda: float = 0.25) -> float:
+    """Compute margin-aware confidence scores.
+    
+    Args:
+    ----
+        probs: Probability vector for an instance.
+        target_class: The target class index.
+        margin_lambda: Margin weight parameter.
+        
+    Returns:
+    -------
+        Margin-aware confidence score.
+        
+    """
+    if len(probs) < 2:
+        return probs[target_class] if target_class < len(probs) else 0.0
+    
+    target_prob = probs[target_class]
+    other_probs = np.concatenate([probs[:target_class], probs[target_class+1:]])
+    max_other_prob = np.max(other_probs) if len(other_probs) > 0 else 0.0
+    
+    # Margin between target class and strongest competitor
+    margin = target_prob - max_other_prob
+    
+    # Combine probability and margin
+    confidence = target_prob + margin_lambda * margin
+    
+    return confidence
+
+
+def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, aem_scores=None):
+    """Solve exact k-of-n assignment problem with optional AEM weighting.
     
     Find optimal assignment of instances to positive class such that
     k_min <= sum(assignments) <= k_max, maximizing sum(log(p_i))
@@ -24,6 +91,7 @@ def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None):
         k_min: minimum number of positive instances
         k_max: maximum number of positive instances
         current_assignments: current assignments (optional)
+        aem_scores: AEM scores for weighting (optional)
         
     Returns:
         optimal_assignments: binary array of assignments
@@ -41,6 +109,10 @@ def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None):
     # Compute log-odds ratios
     eps = 1e-8
     log_odds = np.log(probs + eps) - np.log(1 - probs + eps)
+    
+    # Apply AEM weighting if provided
+    if aem_scores is not None and len(aem_scores) == len(probs):
+        log_odds = log_odds + 0.1 * aem_scores  # AEM integration weight
     
     # Sort by log-odds in descending order
     sorted_indices = np.argsort(log_odds)[::-1]
@@ -236,6 +308,25 @@ class MilCountBasedMultiClassLearner:
         current_temperature = temperature_start
         label_change_rate = 1.0  # Track label change rate for adaptive annealing
         
+        # Detect initialization type (external vs auto)
+        is_external_init = initial_y is not None
+        
+        # AEM parameters with different values for auto vs external initialization
+        if is_external_init:
+            lambda_entropy_base = 0.02  # Much lower for external init (already peaked)
+            aem_weight = 0.05  # Much lower weight to preserve good initialization
+            warmup_fraction = 0.0  # No warmup for external init
+            decay_strength = 3.0  # Faster decay
+            margin_lambda = 0.2  # Higher margin lambda for external init
+            margin_weight = 0.2  # Higher margin contribution
+        else:
+            lambda_entropy_base = 0.06  # Higher for auto init (needs more entropy)
+            aem_weight = 0.1  # Standard weight
+            warmup_fraction = 0.3  # 30% warmup
+            decay_strength = 2.0  # Standard decay
+            margin_lambda = 0.15  # Lower margin lambda for auto init
+            margin_weight = 0.15  # Standard margin contribution
+        
         # Self-paced learning: track bag difficulty scores
         bag_difficulty = np.zeros(n_bags)
         
@@ -301,6 +392,23 @@ class MilCountBasedMultiClassLearner:
                         if max_probs[idx] > confidence_threshold and y[i_bag][idx] == predicted_classes[idx]:
                             frozen_indices.add(idx)
                 
+                # Adaptive AEM scheduling: warm-up then decay
+                warmup_iters = int(warmup_fraction * max_iter)
+                if warmup_iters > 0 and i_iter < warmup_iters:
+                    # Warm-up phase
+                    lambda_entropy = lambda_entropy_base * (i_iter + 1) / warmup_iters
+                elif warmup_iters == 0:
+                    # No warmup, go straight to decay
+                    decay_progress = i_iter / max_iter
+                    lambda_entropy = lambda_entropy_base * np.exp(-decay_strength * decay_progress)
+                else:
+                    # Decay phase after warmup
+                    decay_progress = (i_iter - warmup_iters) / (max_iter - warmup_iters)
+                    lambda_entropy = lambda_entropy_base * np.exp(-decay_strength * decay_progress)
+                
+                # Compute AEM scores for this bag
+                aem_scores = compute_attention_entropy_maximization(probs, lambda_entropy=lambda_entropy)
+                
                 # For binary classification, use exact k-of-n solver
                 if n_classes == 2:
                     # Apply minimal slack only in first iteration for robustness
@@ -343,7 +451,7 @@ class MilCountBasedMultiClassLearner:
                         # Get probabilities for active instances only
                         active_probs = probs[active_indices, 1]
                         
-                        # Solve exact assignment for active instances
+                        # Solve exact assignment for active instances (without AEM to avoid double-counting)
                         optimal_assignment_active = exact_k_of_n_assignment(active_probs, k_min_active, k_max_active)
                         
                         # Map back to full assignment
@@ -398,8 +506,15 @@ class MilCountBasedMultiClassLearner:
                             candidates = []
                             for idx in range(n_instances):
                                 if idx not in changed_indices and idx not in frozen_indices and new_y[idx] != i_class:
-                                    # Base score from probability
-                                    score = probs[idx, i_class]
+                                    # Base score from probability with AEM enhancement
+                                    base_score = probs[idx, i_class]
+                                    # For external init, only apply AEM when confidence is low
+                                    if is_external_init and base_score > 0.7:
+                                        aem_bonus = 0.0  # High confidence, no AEM needed
+                                    else:
+                                        aem_bonus = aem_weight * aem_scores[idx]  # AEM integration with adaptive weight
+                                    margin_conf = compute_margin_aware_confidence(probs[idx], i_class, margin_lambda=margin_lambda)
+                                    score = base_score + aem_bonus + margin_weight * (margin_conf - base_score)
                                     
                                     # Boost score if moving from over-represented class
                                     current_class = new_y[idx]
@@ -462,8 +577,17 @@ class MilCountBasedMultiClassLearner:
                                         scores[c] = -np.inf
                                         continue
                                     
-                                    # Base score from probability
-                                    scores[c] = np.log(probs[idx, c] + 1e-8)
+                                    # Base score from probability with AEM enhancement
+                                    base_log_score = np.log(probs[idx, c] + 1e-8)
+                                    # Conditional AEM application
+                                    if is_external_init and probs[idx, c] > 0.7:
+                                        aem_bonus = 0.0  # High confidence for external init, no AEM
+                                    elif probs[idx, c] > 0.5:
+                                        aem_bonus = aem_weight * aem_scores[idx]
+                                    else:
+                                        aem_bonus = 0.5 * aem_weight * aem_scores[idx]
+                                    margin_conf = compute_margin_aware_confidence(probs[idx], c, margin_lambda=margin_lambda)
+                                    scores[c] = base_log_score + aem_bonus + 0.1 * np.log(max(margin_conf, 1e-8) + 1e-8)
                                     
                                     # Constraint bonus
                                     c_count = class_count_dict.get(c, 0)
@@ -512,7 +636,7 @@ class MilCountBasedMultiClassLearner:
                 bag_difficulty[i_bag] = constraint_violation
 
             if debug:
-                print(f"iter: {i_iter}, temperature: {temperature:.3f}")
+                print(f"iter: {i_iter}, temperature: {temperature:.3f}, lambda_entropy: {lambda_entropy:.4f}")
                 predicted_count = np.nan_to_num(
                     pd.DataFrame([pd.Series(b).value_counts().to_dict() for b in y])[list(range(n_classes))].values,
                 )
