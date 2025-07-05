@@ -126,19 +126,38 @@ class MilCountBasedMultiClassLearner:
         # Initialize y
         n_list = [len(bag) for bag in bags]
         if not initial_y:
-            # Improved initialization: consider both lower and upper thresholds
-            # Use weighted average to find better initial class assignment
-            threshold_center = (lower_threshold + upper_threshold) / 2.0
-            # Add small noise to break ties
-            threshold_center += np.random.randn(*threshold_center.shape) * 0.01
-            
-            y = [
-                np.repeat(class_index, n_instance_in_bag)
-                for class_index, n_instance_in_bag in zip(
-                    np.argmax(threshold_center, axis=1),
-                    n_list,
-                )
-            ]
+            # Improved initialization: consider constraint satisfaction potential
+            y = []
+            for i_bag, n_instances_in_bag in enumerate(n_list):
+                # Calculate constraint satisfaction score for each class
+                constraint_scores = np.zeros(n_classes)
+                
+                for i_class in range(n_classes):
+                    # Favor classes where n_instances fits well within constraints
+                    lower_bound = lower_threshold[i_bag, i_class]
+                    upper_bound = upper_threshold[i_bag, i_class]
+                    center = (lower_bound + upper_bound) / 2.0
+                    
+                    # Score based on how well n_instances fits the constraints
+                    if n_instances_in_bag < lower_bound:
+                        # Can't satisfy lower bound - heavily penalize
+                        constraint_scores[i_class] = -1000
+                    elif n_instances_in_bag > upper_bound:
+                        # Exceeds upper bound - penalize based on excess
+                        excess_ratio = (n_instances_in_bag - upper_bound) / upper_bound
+                        constraint_scores[i_class] = -10 * excess_ratio
+                    else:
+                        # Within bounds - score based on distance from center
+                        range_size = upper_bound - lower_bound + 1e-6
+                        distance_from_center = abs(n_instances_in_bag - center)
+                        constraint_scores[i_class] = 1.0 - (distance_from_center / range_size)
+                
+                # Add small noise to break ties
+                constraint_scores += np.random.randn(n_classes) * 0.01
+                
+                # Select class with best constraint satisfaction potential
+                best_class = np.argmax(constraint_scores)
+                y.append(np.repeat(best_class, n_instances_in_bag))
         else:
             y = initial_y
             
@@ -148,7 +167,14 @@ class MilCountBasedMultiClassLearner:
         lambda_upper = np.zeros((n_bags, n_classes))
         rho = 1.0  # Penalty parameter for augmented Lagrangian
         
-        # Temperature for soft assignments (starts high, anneals down)
+        # Per-bag convergence tracking
+        residual_ema = np.zeros(n_bags)  # Exponential moving average of residuals
+        ema_beta = 0.7  # EMA smoothing factor - more responsive to recent changes
+        bag_temperatures = np.ones(n_bags) * 2.0  # Per-bag temperatures
+        temperature_alpha = 0.02  # Temperature adaptation rate - slower adaptation
+        temperature_min = 0.1
+        
+        # Global temperature parameters for bags without adaptive tracking
         temperature_start = 2.0
         temperature_end = 0.1
         temperature_decay = (temperature_end / temperature_start) ** (1.0 / max_iter)
@@ -168,6 +194,39 @@ class MilCountBasedMultiClassLearner:
             flatten_original_y = np.hstack(list(y))
             
 
+            # Compute residuals for each bag
+            for i_bag in range(n_bags):
+                # Get current class counts
+                class_counts = pd.Series(y[i_bag]).value_counts()
+                residual = 0.0
+                
+                for i_class in range(n_classes):
+                    count = class_counts.get(i_class, 0)
+                    # Compute violation from both lower and upper bounds
+                    lower_violation = max(0, lower_threshold[i_bag, i_class] - count)
+                    upper_violation = max(0, count - upper_threshold[i_bag, i_class])
+                    residual += lower_violation + upper_violation
+                
+                # Update EMA of residuals
+                residual_ema[i_bag] = ema_beta * residual_ema[i_bag] + (1 - ema_beta) * residual
+                
+                # Update per-bag temperature based on residual
+                # Bags with higher residuals maintain higher temperature (more exploration)
+                if residual_ema[i_bag] > 0.5:  # Significant constraint violation
+                    # Slow down temperature decay for difficult bags
+                    decay_factor = 0.98  # Very slow decay
+                elif residual_ema[i_bag] > 0.1:  # Minor constraint violation
+                    # Moderate temperature decay
+                    decay_factor = 0.95
+                else:
+                    # For converged bags, use standard decay
+                    decay_factor = temperature_decay
+                
+                bag_temperatures[i_bag] = max(
+                    temperature_min,
+                    bag_temperatures[i_bag] * decay_factor
+                )
+            
             # For every bag - use soft assignments with augmented Lagrangian
             has_changed = False
             for i_bag in range(len(bags)):
@@ -189,10 +248,11 @@ class MilCountBasedMultiClassLearner:
                 for i_class in target_classes:
                     class_count = class_count_dict.get(i_class, 0)
                     
-                    # Apply constraint slack for first iteration only
-                    if i_iter == 0:
-                        # 5% slack in first iteration
-                        effective_lower = lower_threshold[i_bag, i_class] * 0.95
+                    # Apply adaptive constraint slack based on convergence
+                    if residual_ema[i_bag] > 1.0 and i_iter < 3:
+                        # For difficult bags in early iterations, allow more slack
+                        slack_factor = 0.95 if i_iter == 0 else 0.98
+                        effective_lower = lower_threshold[i_bag, i_class] * slack_factor
                     else:
                         effective_lower = lower_threshold[i_bag, i_class]
                     
@@ -206,6 +266,13 @@ class MilCountBasedMultiClassLearner:
                             if idx not in changed_indices and new_y[idx] != i_class:
                                 # Base score from probability
                                 score = probs[idx, i_class]
+                                
+                                # Apply margin-based confidence weighting
+                                # Instances with clear predictions (far from 0.5) get higher weight
+                                # Use gentler weighting to avoid over-confidence
+                                max_prob = np.max(probs[idx])
+                                confidence_weight = 0.8 + 0.4 * abs(max_prob - 0.5)  # Range: 0.8 to 1.2
+                                score *= confidence_weight
                                 
                                 # Boost score if moving from over-represented class
                                 current_class = new_y[idx]
@@ -238,8 +305,10 @@ class MilCountBasedMultiClassLearner:
                     class_count = class_count_dict.get(i_class, 0)
                     
                     # Apply adaptive constraint slack for upper threshold
-                    if i_iter == 0:
-                        effective_upper = upper_threshold[i_bag, i_class] * 1.05
+                    if residual_ema[i_bag] > 1.0 and i_iter < 3:
+                        # For difficult bags in early iterations, allow more slack
+                        slack_factor = 1.05 if i_iter == 0 else 1.02
+                        effective_upper = upper_threshold[i_bag, i_class] * slack_factor
                     else:
                         effective_upper = upper_threshold[i_bag, i_class]
                     
@@ -251,7 +320,12 @@ class MilCountBasedMultiClassLearner:
                         candidates = []
                         for idx in range(n_instances):
                             if idx not in changed_indices and new_y[idx] == i_class:
-                                candidates.append((idx, probs[idx, i_class]))
+                                # Use inverse confidence weight for removal candidates
+                                # Uncertain instances (near 0.5) are better candidates for removal
+                                max_prob = np.max(probs[idx])
+                                uncertainty_weight = 1.0 - abs(max_prob - 0.5)
+                                weighted_score = probs[idx, i_class] * uncertainty_weight
+                                candidates.append((idx, weighted_score))
                         
                         # Sort by probability (ascending) and reassign
                         candidates.sort(key=lambda x: x[1])
@@ -280,8 +354,8 @@ class MilCountBasedMultiClassLearner:
                                 else:
                                     scores[c] -= 1.0
                             
-                            # Apply temperature
-                            exp_scores = np.exp(scores / temperature)
+                            # Apply bag-specific temperature
+                            exp_scores = np.exp(scores / bag_temperatures[i_bag])
                             probabilities = exp_scores / np.sum(exp_scores)
                             
                             # Choose new class
@@ -302,7 +376,10 @@ class MilCountBasedMultiClassLearner:
                     y[i_bag] = new_y
 
             if debug:
-                print(f"iter: {i_iter}, temperature: {temperature:.3f}")
+                avg_temp = np.mean(bag_temperatures)
+                max_residual = np.max(residual_ema)
+                converged_bags = np.sum(residual_ema < 0.1)
+                print(f"iter: {i_iter}, avg_temp: {avg_temp:.3f}, max_residual: {max_residual:.3f}, converged_bags: {converged_bags}/{n_bags}")
                 predicted_count = np.nan_to_num(
                     pd.DataFrame([pd.Series(b).value_counts().to_dict() for b in y])[list(range(n_classes))].values,
                 )
