@@ -130,7 +130,7 @@ class MilCountBasedMultiClassLearner:
             # Use weighted average to find better initial class assignment
             threshold_center = (lower_threshold + upper_threshold) / 2.0
             # Add small noise to break ties
-            threshold_center += np.random.randn(*threshold_center.shape) * 0.01
+            threshold_center += np.random.randn(*threshold_center.shape) * 0.015
             
             y = [
                 np.repeat(class_index, n_instance_in_bag)
@@ -188,14 +188,10 @@ class MilCountBasedMultiClassLearner:
                 for i_class in target_classes:
                     class_count = class_count_dict.get(i_class, 0)
                     
-                    # Apply minimal slack only in first iteration for robustness
-                    effective_lower = lower_threshold[i_bag, i_class]
-                    if i_iter == 0:  # Only first iteration
-                        effective_lower = effective_lower * 0.95  # 5% slack
-                    
-                    if class_count < effective_lower:
+                    # Use exact constraints without slack
+                    if class_count < lower_threshold[i_bag, i_class]:
                         # Need more instances of this class
-                        deficit = int(effective_lower - class_count)
+                        deficit = int(lower_threshold[i_bag, i_class] - class_count)
                         
                         # Find best candidates: high probability for this class, not already changed
                         candidates = []
@@ -216,8 +212,8 @@ class MilCountBasedMultiClassLearner:
                         
                         # Sort by score and select top candidates
                         candidates.sort(key=lambda x: x[1], reverse=True)
-                        # Gradually increase assignments based on iteration
-                        adjustment_rate = min(1.0, (i_iter + 1) / 3.0)  # Full adjustment by iter 3
+                        # More aggressive adjustment rate - full by iteration 2
+                        adjustment_rate = min(1.0, (i_iter + 1) / 2.0)
                         n_to_change = max(1, int(deficit * adjustment_rate))
                         
                         for idx, _ in candidates[:n_to_change]:
@@ -234,14 +230,10 @@ class MilCountBasedMultiClassLearner:
                 for i_class in target_classes:
                     class_count = class_count_dict.get(i_class, 0)
                     
-                    # Apply minimal slack only in first iteration for robustness
-                    effective_upper = upper_threshold[i_bag, i_class]
-                    if i_iter == 0:  # Only first iteration
-                        effective_upper = effective_upper * 1.05  # 5% slack
-                    
-                    if class_count > effective_upper:
+                    # Use exact constraints without slack
+                    if class_count > upper_threshold[i_bag, i_class]:
                         # Too many instances of this class
-                        excess = int(class_count - effective_upper)
+                        excess = int(class_count - upper_threshold[i_bag, i_class])
                         
                         # Find instances to reassign: low probability for this class
                         candidates = []
@@ -252,8 +244,8 @@ class MilCountBasedMultiClassLearner:
                         # Sort by probability (ascending) and reassign
                         candidates.sort(key=lambda x: x[1])
                         
-                        # Gradually increase adjustments based on iteration
-                        adjustment_rate = min(1.0, (i_iter + 1) / 3.0)
+                        # More aggressive adjustment rate - full by iteration 2
+                        adjustment_rate = min(1.0, (i_iter + 1) / 2.0)
                         n_to_change = max(1, int(excess * adjustment_rate))
                         
                         for idx, _ in candidates[:n_to_change]:
@@ -330,12 +322,12 @@ class MilCountBasedMultiClassLearner:
                 # Labels have converged, but continue training classifier
                 if debug:
                     print(f"Labels converged at iteration {i_iter}, continuing to refine classifier...")
-                # Train with additional inner iterations when labels are stable
-                for inner_iter in range(5):  # 5 inner epochs after convergence
+                # Reduced inner training iterations (2 instead of 5)
+                for inner_iter in range(2):
                     self.classifier.fit(flatten_bags, flatten_y)
-            elif not has_changed and i_iter < 4:
+            elif not has_changed:
                 if debug:
-                    print(f"Early convergence at iteration {i_iter}, continuing exploration...")
+                    print(f"Labels converged at iteration {i_iter}")
             
             # Only break after minimum iterations
             if i_iter >= min_iterations - 1:
