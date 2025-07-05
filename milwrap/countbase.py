@@ -5,7 +5,7 @@ that use count-based constraints to learn from bags of instances.
 """
 
 import random
-from typing import List, Sequence
+from typing import List, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -74,6 +74,169 @@ def get_order_based_initial_y(
     ]
 
 
+def sinkhorn_constrained_ot(
+    cost_matrix: NDArray[np.float64],
+    row_marginals: NDArray[np.float64],
+    col_marginals: NDArray[np.float64],
+    reg: float = 1.0,
+    max_iter: int = 50,
+    threshold: float = 1e-6,
+    dynamic_reg: bool = True,
+    reg_decay: float = 0.95,
+    debiased: bool = True,
+) -> Tuple[NDArray[np.float64], float]:
+    """Solve constrained optimal transport using Sinkhorn algorithm with dynamic regularization.
+    
+    Args:
+    ----
+        cost_matrix: Cost matrix (n_instances, n_classes)
+        row_marginals: Row marginals (n_instances,), should sum to 1 for each instance
+        col_marginals: Column marginals (n_classes,), target class counts
+        reg: Initial entropy regularization parameter
+        max_iter: Maximum iterations
+        threshold: Convergence threshold
+        dynamic_reg: Whether to use dynamic regularization scheduling
+        reg_decay: Decay factor for dynamic regularization
+        debiased: Whether to use debiasing with Richardson extrapolation
+        
+    Returns:
+    -------
+        Tuple of (Transport plan P, final regularization value)
+    
+    """
+    n_instances, n_classes = cost_matrix.shape
+    
+    # Normalize marginals
+    row_marginals = row_marginals / (row_marginals.sum() + 1e-16)
+    col_marginals = col_marginals / (col_marginals.sum() + 1e-16)
+    
+    # Dynamic regularization scheduling
+    current_reg = reg
+    best_P = None
+    best_dual_gap = float('inf')
+    
+    # Initialize with higher regularization for stability
+    if dynamic_reg:
+        current_reg = reg * 2.0
+    
+    for outer_iter in range(3 if dynamic_reg else 1):  # Multiple rounds with decreasing reg
+        # Initialize
+        K = np.exp(-cost_matrix / current_reg)
+        u = np.ones(n_instances)
+        v = np.ones(n_classes)
+        
+        for inner_iter in range(max_iter):
+            u_prev = u.copy()
+            
+            # Update with stabilization
+            v = col_marginals / (K.T @ u + 1e-16)
+            v = np.clip(v, 1e-8, 1e8)  # Numerical stability
+            
+            u = row_marginals / (K @ v + 1e-16)
+            u = np.clip(u, 1e-8, 1e8)  # Numerical stability
+            
+            # Check convergence using dual gap
+            P_temp = np.diag(u) @ K @ np.diag(v)
+            row_sum = P_temp.sum(axis=1)
+            col_sum = P_temp.sum(axis=0)
+            
+            # Dual gap as convergence criterion
+            dual_gap = np.max([
+                np.max(np.abs(row_sum - row_marginals)),
+                np.max(np.abs(col_sum - col_marginals))
+            ])
+            
+            if dual_gap < threshold:
+                break
+                
+            # Acceleration step (Anderson acceleration simplified)
+            if inner_iter > 0 and inner_iter % 5 == 0:
+                u = 0.8 * u + 0.2 * u_prev  # Momentum
+        
+        # Compute transport plan
+        P = np.diag(u) @ K @ np.diag(v)
+        
+        # Ensure row sums are 1 (probability distribution)
+        P = P / (P.sum(axis=1, keepdims=True) + 1e-16)
+        
+        # Track best solution
+        if dual_gap < best_dual_gap:
+            best_dual_gap = dual_gap
+            best_P = P.copy()
+        
+        # Decay regularization for next round
+        if dynamic_reg and outer_iter < 2:
+            current_reg *= reg_decay
+    
+    # Debiasing with Richardson extrapolation
+    if debiased and best_P is not None and dynamic_reg:
+        # Compute solution with half regularization
+        K_half = np.exp(-cost_matrix / (current_reg / 2))
+        u_half = np.ones(n_instances)
+        v_half = np.ones(n_classes)
+        
+        for _ in range(max_iter // 2):  # Fewer iterations for debiasing
+            v_half = col_marginals / (K_half.T @ u_half + 1e-16)
+            v_half = np.clip(v_half, 1e-8, 1e8)
+            u_half = row_marginals / (K_half @ v_half + 1e-16)
+            u_half = np.clip(u_half, 1e-8, 1e8)
+        
+        P_half = np.diag(u_half) @ K_half @ np.diag(v_half)
+        P_half = P_half / (P_half.sum(axis=1, keepdims=True) + 1e-16)
+        
+        # Richardson extrapolation: P_debiased = 2*P_half - P
+        P_debiased = 2 * P_half - best_P
+        P_debiased = np.clip(P_debiased, 0, None)  # Ensure non-negative
+        P_debiased = P_debiased / (P_debiased.sum(axis=1, keepdims=True) + 1e-16)
+        
+        best_P = P_debiased
+    
+    return best_P if best_P is not None else P, current_reg
+
+
+def compute_attention_entropy(attention_weights: NDArray[np.float64]) -> float:
+    """Compute entropy of attention weights.
+    
+    Args:
+    ----
+        attention_weights: Attention weights (n_instances, n_classes)
+        
+    Returns:
+    -------
+        Average entropy across instances
+        
+    """
+    # Add small epsilon to avoid log(0)
+    eps = 1e-8
+    attention_weights = np.clip(attention_weights, eps, 1 - eps)
+    
+    # Compute entropy for each instance
+    entropy_per_instance = -np.sum(attention_weights * np.log(attention_weights), axis=1)
+    
+    # Return average entropy
+    return np.mean(entropy_per_instance)
+
+
+def compute_effective_sample_size(attention_weights: NDArray[np.float64]) -> float:
+    """Compute effective sample size (ESS) = 1 / sum(p^2).
+    
+    Args:
+    ----
+        attention_weights: Attention weights (n_instances, n_classes)
+        
+    Returns:
+    -------
+        Average ESS across instances
+        
+    """
+    # Compute sum of squared probabilities for each instance
+    sum_p_squared = np.sum(attention_weights ** 2, axis=1)
+    
+    # Compute ESS for each instance
+    ess_per_instance = 1.0 / (sum_p_squared + 1e-16)
+    
+    # Return average ESS
+    return np.mean(ess_per_instance)
 
 
 class MilCountBasedMultiClassLearner:
@@ -173,6 +336,21 @@ class MilCountBasedMultiClassLearner:
         constraint_slack_start = 0.2  # 20% slack on constraints initially (reduced from 0.3)
         constraint_slack_end = 0.0    # No slack at the end
         constraint_slack_decay = constraint_slack_end / (constraint_slack_start + 1e-8)
+        
+        # OT entropy tracking for adaptive temperature control
+        target_entropy = 0.5  # Target entropy level
+        target_ess = 2.0  # Target effective sample size
+        temp_adjustment_rate = 0.1  # Learning rate for temperature adjustment
+        
+        # Meta-gradient temperature optimization
+        temperature_momentum = 0.0  # Momentum for temperature updates
+        temperature_lr = 0.02  # Learning rate for meta-gradient
+        momentum_beta = 0.9  # Momentum coefficient
+        
+        # AEM regularization parameters for OT cost matrix
+        aem_lambda_start = 0.5
+        aem_lambda_end = 0.0
+        aem_lambda_decay = (aem_lambda_end / aem_lambda_start) ** (1.0 / max_iter) if aem_lambda_start > 0 else 1.0
 
         for i_iter in range(max_iter):
             # Temperature annealing
@@ -201,8 +379,13 @@ class MilCountBasedMultiClassLearner:
                 # Lower confidence -> higher temperature (more exploration)
                 instance_temp_scale[i_bag] = 2.0 - max_probs  # Range: [1.0, 2.0]
 
-            # For every bag - use soft assignments with augmented Lagrangian
+            # For every bag - use optimal transport with augmented Lagrangian
             has_changed = False
+            all_attention_weights = []  # For entropy computation
+            
+            # AEM regularization decay
+            aem_lambda = aem_lambda_start * (aem_lambda_decay ** i_iter)
+            
             for i_bag in range(len(bags)):
                 # Hybrid approach: combine constraint-based selection with soft assignments
                 n_instances = len(bags[i_bag])
@@ -220,19 +403,93 @@ class MilCountBasedMultiClassLearner:
                         if max_probs[idx] > confidence_threshold and y[i_bag][idx] == predicted_classes[idx]:
                             frozen_indices.add(idx)
                 
-                # Get current class counts
-                class_count_dict = pd.Series(y[i_bag]).value_counts().to_dict()
+                # Create active indices (non-frozen instances)
+                active_indices = [idx for idx in range(n_instances) if idx not in frozen_indices]
+                n_active = len(active_indices)
                 
-                # Track which instances have been reassigned in this iteration
-                changed_indices = set()
-                new_y = y[i_bag].copy()
+                if n_active == 0:  # All instances frozen, skip
+                    continue
                 
-                # Priority 1: Fix constraint violations using most confident instances
-                target_classes = list(range(n_classes))
-                random.shuffle(target_classes)
+                # Create cost matrix for active instances only
+                active_probs = probs[active_indices, :]
+                cost_matrix = -np.log(active_probs + 1e-16)
                 
+                # Add Gumbel noise for exploration (decreasing over iterations)
+                if i_iter < 6:
+                    gumbel_noise = -np.log(-np.log(np.random.uniform(0.01, 0.99, cost_matrix.shape)))
+                    noise_strength = 0.15 * np.exp(-i_iter / 3.0)
+                    cost_matrix += noise_strength * gumbel_noise
+                
+                # Add AEM regularization to cost matrix
+                if aem_lambda > 0:
+                    # Penalize low entropy (encourage exploration)
+                    entropy_penalty = -aem_lambda * np.log(active_probs + 1e-16)
+                    cost_matrix += entropy_penalty
+                
+                # Add ADMM penalties based on current constraint violations
+                # Get current class counts for frozen instances
+                frozen_counts = np.zeros(n_classes)
+                for idx in frozen_indices:
+                    frozen_counts[y[i_bag][idx]] += 1
+                
+                # Set up marginals for Sinkhorn
+                row_marginals = np.ones(n_active)  # Each active instance must be assigned
+                
+                # Column marginals based on constraints with continuation
+                col_marginals = np.zeros(n_classes)
+                for i_class in range(n_classes):
+                    lower = lower_threshold[i_bag, i_class] * (1.0 - constraint_slack)
+                    upper = upper_threshold[i_bag, i_class] * (1.0 + constraint_slack)
+                    
+                    # Account for frozen instances
+                    remaining_lower = max(0, lower - frozen_counts[i_class])
+                    remaining_upper = max(0, upper - frozen_counts[i_class])
+                    
+                    # Set target count as midpoint of remaining constraints
+                    target_count = (remaining_lower + remaining_upper) / 2.0
+                    col_marginals[i_class] = target_count
+                
+                # Handle edge case where constraints are already satisfied by frozen instances
+                if np.sum(col_marginals) > 0:
+                    # Apply instance-aware temperature scaling
+                    avg_instance_temp_scale = np.mean(instance_temp_scale[i_bag][active_indices])
+                    effective_temperature = temperature * avg_instance_temp_scale
+                    
+                    # Solve constrained OT problem with dynamic regularization and debiasing
+                    P, final_reg = sinkhorn_constrained_ot(
+                        cost_matrix, 
+                        row_marginals, 
+                        col_marginals,
+                        reg=effective_temperature,
+                        max_iter=30,
+                        threshold=1e-5,
+                        dynamic_reg=True,
+                        reg_decay=0.95,
+                        debiased=True
+                    )
+                    
+                    # Store attention weights for entropy computation
+                    all_attention_weights.append(P)
+                    
+                    # Convert soft assignments to hard assignments
+                    active_new_y = np.argmax(P, axis=1)
+                    
+                    # Update full assignment array
+                    new_y = y[i_bag].copy()
+                    for i, idx in enumerate(active_indices):
+                        new_y[idx] = active_new_y[i]
+                    
+                    # Check if assignments changed
+                    if not np.array_equal(y[i_bag], new_y):
+                        has_changed = True
+                        y[i_bag] = new_y
+                
+                # Skip the old constraint logic (will be removed later)
+                continue
+                
+                # OLD LOGIC STARTS HERE - TO BE REMOVED
                 for i_class in target_classes:
-                    class_count = class_count_dict.get(i_class, 0)
+                    class_count = 0  # dummy to avoid error
                     
                     if class_count < lower_threshold[i_bag, i_class]:
                         # Need more instances of this class
@@ -352,6 +609,48 @@ class MilCountBasedMultiClassLearner:
                 if not np.array_equal(y[i_bag], new_y):
                     has_changed = True
                     y[i_bag] = new_y
+            
+            # Adaptive temperature control based on entropy/ESS with meta-gradient
+            if i_iter > 0 and len(all_attention_weights) > 0:
+                # Compute average entropy and ESS across all bags
+                avg_entropy = np.mean([compute_attention_entropy(P) for P in all_attention_weights])
+                avg_ess = np.mean([compute_effective_sample_size(P) for P in all_attention_weights])
+                
+                # Compute constraint satisfaction metrics
+                predicted_count = np.nan_to_num(
+                    pd.DataFrame([pd.Series(b).value_counts().to_dict() for b in y])[list(range(n_classes))].values,
+                )
+                constraint_violations = np.sum(np.maximum(0, lower_threshold - predicted_count)) + \
+                                      np.sum(np.maximum(0, predicted_count - upper_threshold))
+                
+                # Meta-gradient computation
+                # Loss = entropy_error + constraint_penalty
+                entropy_error = (avg_entropy - target_entropy) ** 2
+                constraint_penalty = 0.1 * constraint_violations / n_bags
+                meta_loss = entropy_error + constraint_penalty
+                
+                # Gradient w.r.t temperature (approximated)
+                # Higher temp -> higher entropy, lower constraint satisfaction
+                entropy_gradient = 2 * (avg_entropy - target_entropy) * (avg_entropy / temperature)
+                constraint_gradient = -0.1 * constraint_violations / (n_bags * temperature)
+                
+                # Total gradient
+                temperature_gradient = entropy_gradient + constraint_gradient
+                
+                # Update temperature with momentum
+                temperature_momentum = momentum_beta * temperature_momentum - temperature_lr * temperature_gradient
+                temperature = temperature * np.exp(temperature_momentum)  # Multiplicative update
+                
+                # Clamp temperature to reasonable range
+                temperature = np.clip(temperature, 0.1, 3.0)
+                
+                # Fallback to simple adjustment if meta-gradient is unstable
+                if np.isnan(temperature) or np.isinf(temperature):
+                    temperature = temperature_start * (temperature_decay ** i_iter)
+                    if avg_entropy < target_entropy:
+                        temperature *= 1.1
+                    elif avg_entropy > target_entropy * 1.5:
+                        temperature *= 0.9
 
             if debug:
                 print("iter:", i_iter)
@@ -377,6 +676,9 @@ class MilCountBasedMultiClassLearner:
                     print("instance unit accuracy (label adjusted)")
                     print(np.mean(np.hstack(y) == np.hstack(debug_true_y)))
                 print("-----")
+                print(f"Temperature: {temperature:.3f}")
+                if i_iter > 0 and len(all_attention_weights) > 0:
+                    print(f"Avg Entropy: {avg_entropy:.3f}, Avg ESS: {avg_ess:.3f}")
 
             # Continue to iteration 9 for evaluation, even if converged
             min_iterations = 9
