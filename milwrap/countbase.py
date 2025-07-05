@@ -136,24 +136,70 @@ class MilCountBasedMultiClassLearner:
         else:
             y = initial_y
             
-        # Initialize Lagrangian multipliers for constraints
+        # Initialize Lagrangian multipliers for constraints (Deep-ALM approach)
         n_bags = len(bags)
         lambda_lower = np.zeros((n_bags, n_classes))
         lambda_upper = np.zeros((n_bags, n_classes))
-        rho = 1.0  # Penalty parameter for augmented Lagrangian
+        rho = 0.1  # Start with moderate penalty parameter
+        rho_increase_rate = 1.5  # Increase rho more gradually
         
-        # Temperature for soft assignments (starts high, anneals down)
-        temperature_start = 2.0
-        temperature_end = 0.1
-        temperature_decay = (temperature_end / temperature_start) ** (1.0 / max_iter)
+        # Temperature for soft assignments with cosine annealing
+        temperature_max = 2.0
+        temperature_min = 0.1  # Keep original minimum
+        restart_interval = max_iter  # No warm restarts for now
+        
+        # MIL-Dropout parameters
+        mil_dropout_rate = 0.01  # Drop top 1% of instances
 
         for i_iter in range(max_iter):
-            # Temperature annealing
-            temperature = temperature_start * (temperature_decay ** i_iter)
+            # Cosine annealing with warm restarts
+            restart_cycle = i_iter % restart_interval
+            temperature = temperature_min + 0.5 * (temperature_max - temperature_min) * (
+                1 + np.cos(np.pi * restart_cycle / restart_interval)
+            )
             
-            # Fit
-            flatten_bags = np.vstack(bags)
-            flatten_y = np.hstack(y)
+            # Prepare training data with MIL-Dropout
+            training_bags = []
+            training_y = []
+            
+            for i_bag in range(len(bags)):
+                bag_instances = bags[i_bag]
+                bag_labels = y[i_bag]
+                n_instances = len(bag_instances)
+                
+                if n_instances > 1 and i_iter > 0:  # Apply MIL-Dropout after first iteration
+                    # Calculate instance scores based on current predictions
+                    if hasattr(self.classifier, 'predict_proba'):
+                        try:
+                            instance_probs = self.classifier.predict_proba(bag_instances)
+                            # Score = max probability for predicted class
+                            instance_scores = np.max(instance_probs, axis=1)
+                            
+                            # Determine number to drop
+                            n_drop = max(1, int(n_instances * mil_dropout_rate))
+                            n_keep = n_instances - n_drop
+                            
+                            # Find top-k instances and randomly drop some
+                            top_k_indices = np.argsort(instance_scores)[-n_drop*2:]  # Get top candidates
+                            drop_indices = np.random.choice(top_k_indices, size=min(n_drop, len(top_k_indices)), replace=False)
+                            keep_indices = np.setdiff1d(np.arange(n_instances), drop_indices)
+                            
+                            training_bags.append(bag_instances[keep_indices])
+                            training_y.append(bag_labels[keep_indices])
+                        except:
+                            # Fallback if prediction fails
+                            training_bags.append(bag_instances)
+                            training_y.append(bag_labels)
+                    else:
+                        training_bags.append(bag_instances)
+                        training_y.append(bag_labels)
+                else:
+                    training_bags.append(bag_instances)
+                    training_y.append(bag_labels)
+            
+            # Fit classifier with potentially dropped instances
+            flatten_bags = np.vstack(training_bags)
+            flatten_y = np.hstack(training_y)
             self.classifier.fit(flatten_bags, flatten_y)
 
             # Compute outputs
@@ -190,14 +236,21 @@ class MilCountBasedMultiClassLearner:
                         candidates = []
                         for idx in range(n_instances):
                             if idx not in changed_indices and new_y[idx] != i_class:
-                                # Score based on probability and current class constraint status
+                                # Deep-ALM scoring for candidate selection
                                 score = probs[idx, i_class]
                                 
-                                # Boost score if moving from over-represented class
+                                # Add Lagrangian-based scoring
                                 current_class = new_y[idx]
                                 current_class_count = class_count_dict.get(current_class, 0)
-                                if current_class_count > upper_threshold[i_bag, current_class]:
-                                    score *= 1.5
+                                
+                                # Reward moving to under-represented class
+                                v_lower_target = max(0, lower_threshold[i_bag, i_class] - class_count)
+                                score += lambda_lower[i_bag, i_class] * v_lower_target
+                                
+                                # Reward moving from over-represented class
+                                v_upper_current = max(0, current_class_count - upper_threshold[i_bag, current_class])
+                                if v_upper_current > 0:
+                                    score += lambda_upper[i_bag, current_class] * v_upper_current
                                 
                                 candidates.append((idx, score))
                         
@@ -249,8 +302,21 @@ class MilCountBasedMultiClassLearner:
                                 # Base score from probability
                                 scores[c] = np.log(probs[idx, c] + 1e-8)
                                 
-                                # Constraint bonus
+                                # Deep-ALM: Use Lagrangian multipliers for constraint scoring
                                 c_count = class_count_dict.get(c, 0)
+                                
+                                # Lower constraint violation: v_lower = max(0, lower_threshold - count)
+                                v_lower = max(0, lower_threshold[i_bag, c] - c_count)
+                                # Upper constraint violation: v_upper = max(0, count - upper_threshold)
+                                v_upper = max(0, c_count - upper_threshold[i_bag, c])
+                                
+                                # Hybrid scoring: Deep-ALM + heuristic bonuses
+                                # Augmented Lagrangian scoring
+                                lagrangian_weight = 0.15  # Minimal Lagrangian influence
+                                scores[c] += lagrangian_weight * (lambda_lower[i_bag, c] * v_lower - lambda_upper[i_bag, c] * v_upper)
+                                scores[c] += lagrangian_weight * rho * (v_lower - v_upper)
+                                
+                                # Add heuristic bonuses (original values)
                                 if c_count < lower_threshold[i_bag, c]:
                                     scores[c] += 2.0
                                 elif c_count < upper_threshold[i_bag, c]:
@@ -261,6 +327,14 @@ class MilCountBasedMultiClassLearner:
                             # Apply temperature-controlled softmax
                             exp_scores = np.exp(scores / temperature)
                             probabilities = exp_scores / np.sum(exp_scores)
+                            
+                            # AEM: Add entropy bonus to encourage exploration
+                            entropy = -np.sum(probabilities * np.log(probabilities + 1e-8))
+                            entropy_weight = 0.05  # As suggested by o3
+                            # Adjust probabilities slightly towards uniform distribution
+                            uniform_prob = 1.0 / n_classes
+                            probabilities = (1 - entropy_weight) * probabilities + entropy_weight * uniform_prob
+                            probabilities = probabilities / np.sum(probabilities)  # Renormalize
                             
                             # Choose new class
                             new_class = np.random.choice(n_classes, p=probabilities)
@@ -277,6 +351,37 @@ class MilCountBasedMultiClassLearner:
                 if not np.array_equal(y[i_bag], new_y):
                     has_changed = True
                     y[i_bag] = new_y
+
+            # Deep-ALM: Update Lagrangian multipliers and penalty parameter
+            total_violations = 0
+            for i_bag in range(len(bags)):
+                # Calculate final class counts for this bag
+                class_count_dict = pd.Series(y[i_bag]).value_counts().to_dict()
+                
+                for i_class in range(n_classes):
+                    class_count = class_count_dict.get(i_class, 0)
+                    
+                    # Lower constraint violation
+                    v_lower = max(0, lower_threshold[i_bag, i_class] - class_count)
+                    if v_lower > 0:
+                        # Update multiplier (gradient ascent)
+                        lambda_lower[i_bag, i_class] += rho * v_lower
+                        # Clip to prevent unbounded growth
+                        lambda_lower[i_bag, i_class] = min(lambda_lower[i_bag, i_class], 5.0)
+                        total_violations += v_lower
+                    
+                    # Upper constraint violation
+                    v_upper = max(0, class_count - upper_threshold[i_bag, i_class])
+                    if v_upper > 0:
+                        # Update multiplier (gradient ascent)
+                        lambda_upper[i_bag, i_class] += rho * v_upper
+                        # Clip to prevent unbounded growth
+                        lambda_upper[i_bag, i_class] = min(lambda_upper[i_bag, i_class], 5.0)
+                        total_violations += v_upper
+            
+            # Adaptively increase rho if violations persist
+            if total_violations > 0 and i_iter > 0 and i_iter % 2 == 0:
+                rho = min(rho * rho_increase_rate, 1.0)  # Cap at 1.0
 
             if debug:
                 print("iter:", i_iter)
@@ -304,6 +409,6 @@ class MilCountBasedMultiClassLearner:
                 print("-----")
 
             if not has_changed:
-                break
+                pass  # Continue to max_iter for evaluation
 
         return self.classifier, y
