@@ -156,16 +156,33 @@ class MilCountBasedMultiClassLearner:
         # Temperature for soft assignments (starts high, anneals down)
         # Optimal temperature scales with sqrt(d) where d is feature dimension
         feature_dim = bags[0].shape[1] if len(bags) > 0 and len(bags[0]) > 0 else 7
-        temperature_start = np.sqrt(feature_dim) * 0.5  # Scale factor tuned empirically
+        # Higher initial temperature for better exploration
+        temperature_start = np.sqrt(feature_dim) * 1.5  # Increased from 0.5 to 1.5
         temperature_end = 0.1
         temperature_decay = (temperature_end / temperature_start) ** (1.0 / max_iter)
         
         # Instance-aware temperature scaling factors
         instance_temp_scale = [np.ones(len(bag)) for bag in bags]
+        
+        # Entropy regularization parameters
+        entropy_weight_start = 0.3  # Moderate entropy regularization at start (reduced from 0.5)
+        entropy_weight_end = 0.0    # No entropy regularization at end
+        entropy_decay = (entropy_weight_end + 1e-8) / (entropy_weight_start + 1e-8)
+        
+        # Constraint continuation parameters (gradual constraint tightening)
+        constraint_slack_start = 0.2  # 20% slack on constraints initially (reduced from 0.3)
+        constraint_slack_end = 0.0    # No slack at the end
+        constraint_slack_decay = constraint_slack_end / (constraint_slack_start + 1e-8)
 
         for i_iter in range(max_iter):
             # Temperature annealing
             temperature = temperature_start * (temperature_decay ** i_iter)
+            
+            # Entropy weight annealing
+            entropy_weight = entropy_weight_start * (entropy_decay ** i_iter)
+            
+            # Constraint slack annealing (for continuation method)
+            constraint_slack = constraint_slack_start * (1.0 - i_iter / max_iter)
             
             # Fit
             flatten_bags = np.vstack(bags)
@@ -191,6 +208,18 @@ class MilCountBasedMultiClassLearner:
                 n_instances = len(bags[i_bag])
                 probs = fs[i_bag]  # Shape: (n_instances, n_classes)
                 
+                # Self-paced learning: identify high-confidence instances to freeze
+                max_probs = np.max(probs, axis=1)
+                predicted_classes = np.argmax(probs, axis=1)
+                
+                # Freeze instances with high confidence (adaptive threshold)
+                confidence_threshold = 0.9 - 0.3 * (i_iter / max_iter)  # Start strict, relax over time
+                frozen_indices = set()
+                if i_iter >= 2:  # Start freezing after initial exploration
+                    for idx in range(n_instances):
+                        if max_probs[idx] > confidence_threshold and y[i_bag][idx] == predicted_classes[idx]:
+                            frozen_indices.add(idx)
+                
                 # Get current class counts
                 class_count_dict = pd.Series(y[i_bag]).value_counts().to_dict()
                 
@@ -209,10 +238,10 @@ class MilCountBasedMultiClassLearner:
                         # Need more instances of this class
                         deficit = int(lower_threshold[i_bag, i_class] - class_count)
                         
-                        # Find best candidates: high probability for this class, not already changed
+                        # Find best candidates: high probability for this class, not already changed, not frozen
                         candidates = []
                         for idx in range(n_instances):
-                            if idx not in changed_indices and new_y[idx] != i_class:
+                            if idx not in changed_indices and idx not in frozen_indices and new_y[idx] != i_class:
                                 # Score based on probability and current class constraint status
                                 score = probs[idx, i_class]
                                 
@@ -252,10 +281,10 @@ class MilCountBasedMultiClassLearner:
                         # Too many instances of this class
                         excess = int(class_count - upper_threshold[i_bag, i_class])
                         
-                        # Find instances to reassign: low probability for this class
+                        # Find instances to reassign: low probability for this class, not frozen
                         candidates = []
                         for idx in range(n_instances):
-                            if idx not in changed_indices and new_y[idx] == i_class:
+                            if idx not in changed_indices and idx not in frozen_indices and new_y[idx] == i_class:
                                 candidates.append((idx, probs[idx, i_class]))
                         
                         # Sort by probability (ascending) and reassign
@@ -276,12 +305,16 @@ class MilCountBasedMultiClassLearner:
                                 # Base score from probability
                                 scores[c] = np.log(probs[idx, c] + 1e-8)
                                 
-                                # Constraint bonus with adaptive penalties
+                                # Constraint bonus with adaptive penalties and continuation
                                 c_count = class_count_dict.get(c, 0)
-                                if c_count < lower_threshold[i_bag, c]:
+                                # Apply constraint slack for continuation method
+                                lower_bound = lower_threshold[i_bag, c] * (1.0 - constraint_slack)
+                                upper_bound = upper_threshold[i_bag, c] * (1.0 + constraint_slack)
+                                
+                                if c_count < lower_bound:
                                     # Use adaptive penalty for under-represented classes
                                     scores[c] += rho_lower[i_bag, c] * 2.0
-                                elif c_count < upper_threshold[i_bag, c]:
+                                elif c_count < upper_bound:
                                     scores[c] += 0.5
                                 else:
                                     # Use adaptive penalty for over-represented classes
@@ -293,6 +326,15 @@ class MilCountBasedMultiClassLearner:
                             
                             exp_scores = np.exp(scores / instance_temperature)
                             probabilities = exp_scores / np.sum(exp_scores)
+                            
+                            # Apply entropy regularization to encourage diversity
+                            if entropy_weight > 0:
+                                entropy = -np.sum(probabilities * np.log(probabilities + 1e-8))
+                                # Adjust probabilities to increase entropy
+                                uniform_probs = np.ones(n_classes) / n_classes
+                                probabilities = (1.0 - entropy_weight) * probabilities + entropy_weight * uniform_probs
+                                # Renormalize
+                                probabilities = probabilities / np.sum(probabilities)
                             
                             # Choose new class
                             new_class = np.random.choice(n_classes, p=probabilities)
