@@ -140,7 +140,7 @@ class MilCountBasedMultiClassLearner:
         n_bags = len(bags)
         lambda_lower = np.zeros((n_bags, n_classes))
         lambda_upper = np.zeros((n_bags, n_classes))
-        rho = 1.0  # Penalty parameter for augmented Lagrangian
+        rho = 1.2  # Penalty parameter for augmented Lagrangian (slightly increased)
         
         # Temperature for soft assignments (starts high, anneals down)
         temperature_start = 2.0
@@ -265,6 +265,7 @@ class MilCountBasedMultiClassLearner:
                             # Choose new class
                             new_class = np.random.choice(n_classes, p=probabilities)
                             
+                            old_class = new_y[idx]
                             new_y[idx] = new_class
                             changed_indices.add(idx)
                             # Update counts
@@ -303,6 +304,7 @@ class MilCountBasedMultiClassLearner:
                     print(np.mean(np.hstack(y) == np.hstack(debug_true_y)))
                 print("-----")
 
+            # Early stopping when converged
             if not has_changed:
                 break
 
