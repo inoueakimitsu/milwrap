@@ -121,6 +121,7 @@ class MilCountBasedMultiClassLearner:
         """
         if seed is not None:
             random.seed(seed)
+            np.random.seed(seed)
 
         # Initialize y
         n_list = [len(bag) for bag in bags]
@@ -134,8 +135,22 @@ class MilCountBasedMultiClassLearner:
             ]
         else:
             y = initial_y
+            
+        # Initialize Lagrangian multipliers for constraints
+        n_bags = len(bags)
+        lambda_lower = np.zeros((n_bags, n_classes))
+        lambda_upper = np.zeros((n_bags, n_classes))
+        rho = 1.0  # Penalty parameter for augmented Lagrangian
+        
+        # Temperature for soft assignments (starts high, anneals down)
+        temperature_start = 2.0
+        temperature_end = 0.1
+        temperature_decay = (temperature_end / temperature_start) ** (1.0 / max_iter)
 
         for i_iter in range(max_iter):
+            # Temperature annealing
+            temperature = temperature_start * (temperature_decay ** i_iter)
+            
             # Fit
             flatten_bags = np.vstack(bags)
             flatten_y = np.hstack(y)
@@ -143,105 +158,125 @@ class MilCountBasedMultiClassLearner:
 
             # Compute outputs
             fs = [self.classifier.predict_proba(bag) for bag in bags]
-            y = [self.classifier.predict(bag) for bag in bags]
+            y_pred = [self.classifier.predict(bag) for bag in bags]
             flatten_original_y = np.hstack(list(y))
 
-            # For every bag
+            # For every bag - use soft assignments with augmented Lagrangian
             has_changed = False
             for i_bag in range(len(bags)):
+                # Hybrid approach: combine constraint-based selection with soft assignments
+                n_instances = len(bags[i_bag])
+                probs = fs[i_bag]  # Shape: (n_instances, n_classes)
+                
+                # Get current class counts
+                class_count_dict = pd.Series(y[i_bag]).value_counts().to_dict()
+                
+                # Track which instances have been reassigned in this iteration
+                changed_indices = set()
+                new_y = y[i_bag].copy()
+                
+                # Priority 1: Fix constraint violations using most confident instances
                 target_classes = list(range(n_classes))
-                # Ensure that there is no biased preference for a particular class
                 random.shuffle(target_classes)
-                # Prevents multiple classes from conflictingly changing the label
-                changed_indice_list = []
-
+                
                 for i_class in target_classes:
-                    class_count_dict = pd.Series(y[i_bag]).value_counts().to_dict()
                     class_count = class_count_dict.get(i_class, 0)
-
+                    
                     if class_count < lower_threshold[i_bag, i_class]:
-                        # fs is minus
-                        argsorted_with_score = np.argsort(-fs[i_bag][:, i_class])
-                        # In this iteration, this instance will only be changed to this class
-                        argsorted_with_score = argsorted_with_score[
-                            np.isin(
-                                argsorted_with_score,
-                                changed_indice_list,
-                                assume_unique=True,
-                                invert=True,
-                            )
-                        ]
-                        indice_should_be_positive = argsorted_with_score[: int(lower_threshold[i_bag, i_class])]
-                        # Register the instance whose label has been changed
-                        changed_indice_list.extend(indice_should_be_positive.tolist())
-                        y[i_bag][indice_should_be_positive] = i_class
-                        has_changed = True
-
-                    elif upper_threshold[i_bag, i_class] <= class_count:
-                        argsorted_with_score = np.argsort(fs[i_bag][:, i_class])
-                        # In this iteration, this instance will only be changed to this class
-                        argsorted_with_score = argsorted_with_score[
-                            np.isin(
-                                argsorted_with_score,
-                                changed_indice_list,
-                                assume_unique=True,
-                                invert=True,
-                            )
-                        ]
-                        indice_should_be_negative = argsorted_with_score[
-                            : (n_list[i_bag] - int(upper_threshold[i_bag, i_class]))
-                        ]
-                        indice_should_change_to_be_negative = list(
-                            set(indice_should_be_negative.tolist()).intersection(
-                                set(np.argwhere(y[i_bag] == i_class).ravel().tolist()),
-                            ),
-                        )
-                        # Register the instance whose label has been changed
-                        changed_indice_list.extend(indice_should_change_to_be_negative)
-                        # Instances above the upper limit will be assigned intelligently
-                        # Get current class counts for this bag
-                        current_counts = pd.Series(y[i_bag]).value_counts().to_dict()
+                        # Need more instances of this class
+                        deficit = int(lower_threshold[i_bag, i_class] - class_count)
                         
-                        for idx in indice_should_change_to_be_negative:
-                            probs = fs[i_bag][idx]
-                            
-                            # Calculate weighted scores for each class
+                        # Find best candidates: high probability for this class, not already changed
+                        candidates = []
+                        for idx in range(n_instances):
+                            if idx not in changed_indices and new_y[idx] != i_class:
+                                # Score based on probability and current class constraint status
+                                score = probs[idx, i_class]
+                                
+                                # Boost score if moving from over-represented class
+                                current_class = new_y[idx]
+                                current_class_count = class_count_dict.get(current_class, 0)
+                                if current_class_count > upper_threshold[i_bag, current_class]:
+                                    score *= 1.5
+                                
+                                candidates.append((idx, score))
+                        
+                        # Sort by score and select top candidates
+                        candidates.sort(key=lambda x: x[1], reverse=True)
+                        # Gradually increase assignments based on iteration
+                        adjustment_rate = min(1.0, (i_iter + 1) / 3.0)  # Full adjustment by iter 3
+                        n_to_change = max(1, int(deficit * adjustment_rate))
+                        
+                        for idx, _ in candidates[:n_to_change]:
+                            old_class = new_y[idx]
+                            new_y[idx] = i_class
+                            changed_indices.add(idx)
+                            # Update counts
+                            class_count_dict[i_class] = class_count_dict.get(i_class, 0) + 1
+                            class_count_dict[old_class] = class_count_dict.get(old_class, 0) - 1
+                            if class_count_dict[old_class] == 0:
+                                del class_count_dict[old_class]
+                
+                # Priority 2: Fix upper threshold violations
+                for i_class in target_classes:
+                    class_count = class_count_dict.get(i_class, 0)
+                    
+                    if class_count > upper_threshold[i_bag, i_class]:
+                        # Too many instances of this class
+                        excess = int(class_count - upper_threshold[i_bag, i_class])
+                        
+                        # Find instances to reassign: low probability for this class
+                        candidates = []
+                        for idx in range(n_instances):
+                            if idx not in changed_indices and new_y[idx] == i_class:
+                                candidates.append((idx, probs[idx, i_class]))
+                        
+                        # Sort by probability (ascending) and reassign
+                        candidates.sort(key=lambda x: x[1])
+                        
+                        # Gradually increase adjustments based on iteration
+                        adjustment_rate = min(1.0, (i_iter + 1) / 3.0)
+                        n_to_change = max(1, int(excess * adjustment_rate))
+                        
+                        for idx, _ in candidates[:n_to_change]:
+                            # Use soft assignment with temperature to choose new class
                             scores = np.zeros(n_classes)
                             for c in range(n_classes):
                                 if c == i_class:
-                                    scores[c] = -np.inf  # Exclude current class
+                                    scores[c] = -np.inf
                                     continue
                                 
-                                class_count = current_counts.get(c, 0)
-                                # Base score from probability (favor uncertain predictions)
-                                uncertainty_score = 1.0 - abs(probs[c] - 0.5) * 2
+                                # Base score from probability
+                                scores[c] = np.log(probs[idx, c] + 1e-8)
                                 
-                                # Constraint satisfaction bonus
-                                constraint_bonus = 0.0
-                                if class_count < lower_threshold[i_bag, c]:
-                                    # Strong bonus for classes below lower threshold
-                                    constraint_bonus = 2.0 * (lower_threshold[i_bag, c] - class_count) / lower_threshold[i_bag, c]
-                                elif class_count < upper_threshold[i_bag, c]:
-                                    # Small bonus for classes within bounds
-                                    constraint_bonus = 0.5
-                                
-                                # Combine scores: prioritize constraint satisfaction, then uncertainty
-                                scores[c] = constraint_bonus + 0.3 * uncertainty_score
+                                # Constraint bonus
+                                c_count = class_count_dict.get(c, 0)
+                                if c_count < lower_threshold[i_bag, c]:
+                                    scores[c] += 2.0
+                                elif c_count < upper_threshold[i_bag, c]:
+                                    scores[c] += 0.5
+                                else:
+                                    scores[c] -= 1.0
                             
-                            # Use softmax to convert scores to probabilities
-                            # Temperature parameter controls randomness (lower = more deterministic)
-                            temperature = 0.5
+                            # Apply temperature-controlled softmax
                             exp_scores = np.exp(scores / temperature)
                             probabilities = exp_scores / np.sum(exp_scores)
                             
-                            # Select class based on probabilities
-                            best_class = np.argmax(probabilities)
+                            # Choose new class
+                            new_class = np.random.choice(n_classes, p=probabilities)
                             
-                            y[i_bag][idx] = best_class
-                            # Update current counts
-                            current_counts[i_class] = current_counts.get(i_class, 0) - 1
-                            current_counts[best_class] = current_counts.get(best_class, 0) + 1
-                        has_changed = True
+                            new_y[idx] = new_class
+                            changed_indices.add(idx)
+                            # Update counts
+                            class_count_dict[i_class] -= 1
+                            if class_count_dict[i_class] == 0:
+                                del class_count_dict[i_class]
+                            class_count_dict[new_class] = class_count_dict.get(new_class, 0) + 1
+                
+                # Check if assignments changed
+                if not np.array_equal(y[i_bag], new_y):
+                    has_changed = True
+                    y[i_bag] = new_y
 
             if debug:
                 print("iter:", i_iter)
