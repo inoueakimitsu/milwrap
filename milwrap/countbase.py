@@ -62,6 +62,89 @@ def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambd
     return max_probs + entropy_bonus
 
 
+def compute_instance_uncertainty(bag_probs: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Compute uncertainty scores for instances based on prediction entropy.
+    
+    Args:
+        bag_probs: Instance probability matrix of shape (n_instances, n_classes).
+        
+    Returns:
+        Uncertainty scores for each instance (higher = more uncertain).
+    """
+    if len(bag_probs.shape) != 2 or bag_probs.shape[0] == 0:
+        return np.zeros(bag_probs.shape[0])
+    
+    # Compute entropy of predictions as uncertainty measure
+    # H(p) = -Σ p_i * log(p_i)
+    eps = 1e-10
+    entropy = -np.sum(bag_probs * np.log(bag_probs + eps), axis=1)
+    
+    # Normalize by log(n_classes) to get values in [0, 1]
+    n_classes = bag_probs.shape[1]
+    if n_classes > 1:
+        normalized_entropy = entropy / np.log(n_classes)
+    else:
+        normalized_entropy = np.zeros_like(entropy)
+    
+    return normalized_entropy
+
+
+def compute_soft_count_loss(predicted_counts: NDArray[np.float64], lower_threshold: NDArray[np.float64], 
+                          upper_threshold: NDArray[np.float64], temperature: float = 0.25) -> float:
+    """Compute differentiable soft count loss for constraint violations.
+    
+    Args:
+        predicted_counts: Predicted soft counts for each class.
+        lower_threshold: Lower threshold for each class.
+        upper_threshold: Upper threshold for each class.
+        temperature: Temperature for soft counting.
+        
+    Returns:
+        Soft count loss value.
+    """
+    # Lower bound violations: ReLU(lower - count)²
+    lower_violations = np.maximum(0, lower_threshold - predicted_counts)
+    lower_loss = np.sum(lower_violations ** 2)
+    
+    # Upper bound violations: ReLU(count - upper)²
+    upper_violations = np.maximum(0, predicted_counts - upper_threshold)
+    upper_loss = np.sum(upper_violations ** 2)
+    
+    return (lower_loss + upper_loss) * temperature
+
+
+def compute_diversity_score(selected_instances: NDArray[np.float64], embeddings: NDArray[np.float64]) -> float:
+    """Compute diversity score for selected instances using cosine distance.
+    
+    Args:
+        selected_instances: Binary array indicating selected instances.
+        embeddings: Feature embeddings or probabilities for instances.
+        
+    Returns:
+        Diversity score (higher = more diverse).
+    """
+    selected_idx = np.where(selected_instances > 0)[0]
+    if len(selected_idx) < 2:
+        return 1.0  # Maximum diversity for single/no selection
+    
+    # Use probability distributions as embeddings
+    selected_embeddings = embeddings[selected_idx]
+    
+    # Compute pairwise cosine similarities
+    norms = np.linalg.norm(selected_embeddings, axis=1, keepdims=True) + 1e-10
+    normalized = selected_embeddings / norms
+    similarities = np.dot(normalized, normalized.T)
+    
+    # Average off-diagonal similarities (lower = more diverse)
+    n = len(selected_idx)
+    mask = 1 - np.eye(n)
+    avg_similarity = np.sum(similarities * mask) / (n * (n - 1) + 1e-10)
+    
+    # Convert to diversity score
+    diversity = 1.0 - avg_similarity
+    return diversity
+
+
 def compute_margin_aware_confidence(probs: NDArray[np.float64], target_class: int, margin_lambda: float = 0.25) -> float:
     """Compute margin-aware confidence scores.
     
@@ -92,7 +175,7 @@ def compute_margin_aware_confidence(probs: NDArray[np.float64], target_class: in
     return confidence
 
 
-def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margin_scores=None, aem_scores=None):
+def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margin_scores=None, aem_scores=None, uncertainty_scores=None, embeddings=None, diversity_weight=0.1):
     """Solve exact k-of-n assignment problem with optional margin weighting.
     
     Find optimal assignment of instances to positive class such that
@@ -105,6 +188,9 @@ def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margi
         current_assignments: current assignments (optional)
         margin_scores: margin-based scores for weighting (optional)
         aem_scores: AEM scores for weighting (optional)
+        uncertainty_scores: uncertainty scores for weighting (optional)
+        embeddings: instance embeddings for diversity computation (optional)
+        diversity_weight: weight for diversity bonus (optional)
         
     Returns:
         optimal_assignments: binary array of assignments
@@ -130,6 +216,12 @@ def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margi
     # Apply AEM scores if provided
     if aem_scores is not None and len(aem_scores) == len(probs):
         log_odds = log_odds + 0.05 * aem_scores  # Small weight for AEM
+    
+    # Apply uncertainty penalty if provided (prefer certain predictions)
+    if uncertainty_scores is not None and len(uncertainty_scores) == len(probs):
+        # Adaptive uncertainty penalty: start small to avoid early bias
+        uncertainty_weight = 0.05 + 0.15 * min(1.0, len(uncertainty_scores) / 100.0)
+        log_odds = log_odds - uncertainty_weight * uncertainty_scores
     
     # Sort by log-odds in descending order
     sorted_indices = np.argsort(log_odds)[::-1]
@@ -313,20 +405,50 @@ class MilCountBasedMultiClassLearner:
         # Initialize simple parameters
         n_bags = len(bags)
         
-        # Simple exponential temperature decay (from ablation study)
+        # Adaptive temperature decay
         temperature_start = 2.0  # Higher starting temperature for exploration
         temperature_end = 0.1    # Final temperature for precise assignments
+        temperature_current = temperature_start
         
         # Self-paced learning: track bag difficulty scores
         bag_difficulty = np.zeros(n_bags)
+        
+        # Track convergence metrics
+        prev_total_changes = n_bags * 10  # Initialize with high value
+        stagnation_counter = 0
         
         # Simple confidence-based freezing (fixed threshold)
         confidence_threshold = 0.97  # Higher threshold for more selective freezing
         margin_lambda = 0.25  # Standard margin importance
         
         for i_iter in range(max_iter):
-            # Simple exponential temperature decay
-            temperature = temperature_start * (temperature_end / temperature_start) ** (i_iter / max_iter)
+            # Initialize total changes counter for this iteration
+            total_changes = 0
+            
+            # Adaptive temperature decay based on convergence
+            if i_iter > 0 and 'prev_iter_changes' in locals():
+                # Check convergence status
+                change_ratio = prev_iter_changes / (prev_total_changes + 1e-6)
+                
+                if change_ratio > 0.9:  # Many changes, slow down cooling
+                    temperature_decay_rate = 0.95
+                    stagnation_counter = 0
+                elif change_ratio < 0.1:  # Few changes, might be stuck
+                    stagnation_counter += 1
+                    if stagnation_counter >= 2:  # Reheat if stuck
+                        temperature_current = min(temperature_current * 1.2, temperature_start * 0.5)
+                        stagnation_counter = 0
+                    else:
+                        temperature_decay_rate = 0.85  # Faster cooling
+                else:  # Normal convergence
+                    temperature_decay_rate = 0.9
+                    stagnation_counter = 0
+                
+                # Apply decay
+                temperature_current = max(temperature_end, temperature_current * temperature_decay_rate)
+                prev_total_changes = total_changes
+            
+            temperature = temperature_current
             
             # Fit
             flatten_bags = np.vstack(bags)
@@ -341,7 +463,6 @@ class MilCountBasedMultiClassLearner:
 
             # For every bag - use simplified assignments
             has_changed = False
-            total_changes = 0  # Initialize total changes counter
             
             # Self-paced learning: sort bags by difficulty (constraint violations)
             if i_iter > 1:  # Start self-paced learning after initial iterations
@@ -362,30 +483,30 @@ class MilCountBasedMultiClassLearner:
                 changed_indices = set()
                 new_y = y[i_bag].copy()
                 
-                # Simple confidence-based freezing
+                # Uncertainty-aware confidence-based freezing
                 frozen_indices = set()
                 if i_iter >= 3:  # Start freezing after initial exploration
                     max_probs = np.max(probs, axis=1)
                     predicted_classes = np.argmax(probs, axis=1)
+                    uncertainty_scores = compute_instance_uncertainty(probs)
                     
                     for idx in range(n_instances):
-                        # Freeze if high confidence AND consistent with current assignment
-                        if max_probs[idx] > confidence_threshold and y[i_bag][idx] == predicted_classes[idx]:
+                        # Freeze if high confidence AND low uncertainty AND consistent with current assignment
+                        if (max_probs[idx] > confidence_threshold and 
+                            uncertainty_scores[idx] < 0.15 and  # Low uncertainty threshold
+                            y[i_bag][idx] == predicted_classes[idx]):
                             frozen_indices.add(idx)
                 
                 # For binary classification, use exact k-of-n solver
                 if n_classes == 2:
-                    # Apply minimal slack only in first iteration for robustness
-                    effective_lower_0 = lower_threshold[i_bag, 0]
-                    effective_upper_0 = upper_threshold[i_bag, 0]
-                    effective_lower_1 = lower_threshold[i_bag, 1]
-                    effective_upper_1 = upper_threshold[i_bag, 1]
+                    # Progressive constraint tightening (curriculum learning)
+                    constraint_progress = min(1.0, i_iter / 5.0)  # Full constraints by iter 5
+                    slack_factor = 1.0 + 0.05 * (1.0 - constraint_progress)  # 5% to 0% slack
                     
-                    if i_iter == 0:  # Only first iteration
-                        effective_lower_0 = effective_lower_0 * 0.98  # 2% slack - more conservative
-                        effective_upper_0 = effective_upper_0 * 1.02  # 2% slack - more conservative
-                        effective_lower_1 = effective_lower_1 * 0.98  # 2% slack - more conservative
-                        effective_upper_1 = effective_upper_1 * 1.02  # 2% slack - more conservative
+                    effective_lower_0 = lower_threshold[i_bag, 0] * (2.0 - slack_factor)
+                    effective_upper_0 = upper_threshold[i_bag, 0] * slack_factor
+                    effective_lower_1 = lower_threshold[i_bag, 1] * (2.0 - slack_factor)
+                    effective_upper_1 = upper_threshold[i_bag, 1] * slack_factor
                     
                     # For binary case, we optimize for class 1
                     # The constraint is: effective_lower_1 <= k <= effective_upper_1
@@ -424,20 +545,39 @@ class MilCountBasedMultiClassLearner:
                         # Compute AEM scores for the bag (only after initial iterations)
                         aem_scores_active = None
                         if i_iter >= 2:  # Start using AEM after warm-up
-                            # Adaptive lambda_entropy based on initialization type
-                            if initial_y is None:  # Auto initialization
-                                lambda_entropy = 0.06 * (1 - i_iter / max_iter)  # Decay over time
-                            else:  # External initialization
-                                lambda_entropy = 0.03 * (1 - i_iter / max_iter)  # Smaller weight
+                            # Adaptive lambda_entropy based on multiple factors
+                            base_lambda = 0.08 if initial_y is None else 0.04  # Slightly higher base
+                            
+                            # Factor 1: Constraint violations (higher violations = more entropy needed)
+                            constraint_penalty = bag_difficulty[i_bag] / (n_instances + 1e-6)
+                            constraint_factor = 1.0 + 0.5 * min(constraint_penalty, 1.0)
+                            
+                            # Factor 2: Convergence status (stagnation = more entropy)
+                            convergence_factor = 1.0
+                            if stagnation_counter > 0:
+                                convergence_factor = 1.2  # Boost entropy when stuck
+                            
+                            # Factor 3: Bag size (larger bags need more entropy)
+                            size_factor = 1.0 + 0.2 * np.log(max(1, n_instances / 20))
+                            
+                            # Combine factors with time decay
+                            time_decay = 0.5 + 0.5 * (1 - i_iter / max_iter)  # Slower decay
+                            lambda_entropy = base_lambda * constraint_factor * convergence_factor * size_factor * time_decay
                             
                             # Compute AEM scores for all instances in the bag
                             bag_aem_scores = compute_attention_entropy_maximization(probs, lambda_entropy)
                             aem_scores_active = bag_aem_scores[active_indices]
                         
-                        # Solve exact assignment for active instances with margin and AEM scores
+                        # Compute uncertainty scores for active instances
+                        uncertainty_scores = compute_instance_uncertainty(probs)
+                        uncertainty_scores_active = uncertainty_scores[active_indices]
+                        
+                        # Solve exact assignment for active instances with all scores
                         optimal_assignment_active = exact_k_of_n_assignment(
                             active_probs, k_min_active, k_max_active, 
-                            margin_scores=margin_scores, aem_scores=aem_scores_active
+                            margin_scores=margin_scores, 
+                            aem_scores=aem_scores_active,
+                            uncertainty_scores=uncertainty_scores_active
                         )
                         
                         # Map back to full assignment
@@ -477,12 +617,10 @@ class MilCountBasedMultiClassLearner:
                     for i_class in target_classes:
                         class_count = class_count_dict.get(i_class, 0)
                         
-                        # Apply constraint slack for first iteration only
-                        if i_iter == 0:
-                            # 2% slack in first iteration - more conservative
-                            effective_lower = lower_threshold[i_bag, i_class] * 0.98
-                        else:
-                            effective_lower = lower_threshold[i_bag, i_class]
+                        # Progressive constraint tightening
+                        constraint_progress = min(1.0, i_iter / 5.0)
+                        slack_factor = 1.0 + 0.05 * (1.0 - constraint_progress)
+                        effective_lower = lower_threshold[i_bag, i_class] * (2.0 - slack_factor)
                         
                         if class_count < effective_lower:
                             # Need more instances of this class
@@ -490,13 +628,28 @@ class MilCountBasedMultiClassLearner:
                             
                             # Find best candidates: high probability for this class, not already changed, not frozen
                             candidates = []
+                            uncertainty_scores = compute_instance_uncertainty(probs)
+                            
                             for idx in range(n_instances):
                                 if idx not in changed_indices and idx not in frozen_indices and new_y[idx] != i_class:
                                     # Base score from probability
                                     base_score = probs[idx, i_class]
                                     # Add margin-aware confidence
                                     margin_conf = compute_margin_aware_confidence(probs[idx], i_class, margin_lambda=margin_lambda)
-                                    score = base_score + 0.1 * (margin_conf - base_score)
+                                    # Incorporate uncertainty (prefer certain predictions)
+                                    uncertainty_penalty = uncertainty_scores[idx] * 0.2
+                                    
+                                    # Add diversity bonus if this instance is different from already selected ones
+                                    diversity_bonus = 0.0
+                                    if len(changed_indices) > 0 and i_iter >= 3:
+                                        # Simple diversity: average distance to changed instances
+                                        changed_probs = [probs[changed_idx] for changed_idx in changed_indices if changed_idx < n_instances]
+                                        if changed_probs:
+                                            avg_similarity = np.mean([np.dot(probs[idx], cp) / (np.linalg.norm(probs[idx]) * np.linalg.norm(cp) + 1e-10) 
+                                                                    for cp in changed_probs])
+                                            diversity_bonus = 0.1 * (1.0 - avg_similarity)
+                                    
+                                    score = base_score + 0.1 * (margin_conf - base_score) - uncertainty_penalty + diversity_bonus
                                     
                                     # Strong boost/penalty based on constraint satisfaction
                                     current_class = new_y[idx]
@@ -528,11 +681,8 @@ class MilCountBasedMultiClassLearner:
                     for i_class in target_classes:
                         class_count = class_count_dict.get(i_class, 0)
                         
-                        # Apply adaptive constraint slack for upper threshold
-                        if i_iter == 0:
-                            effective_upper = upper_threshold[i_bag, i_class] * 1.02  # 2% slack - more conservative
-                        else:
-                            effective_upper = upper_threshold[i_bag, i_class]
+                        # Progressive constraint tightening for upper threshold
+                        effective_upper = upper_threshold[i_bag, i_class] * slack_factor
                         
                         if class_count > effective_upper:
                             # Too many instances of this class
@@ -636,6 +786,9 @@ class MilCountBasedMultiClassLearner:
                     print(np.mean(np.hstack(y) == np.hstack(debug_true_y)))
                 print("-----")
 
+            # Track changes for adaptive temperature
+            prev_iter_changes = total_changes
+            
             # Continue to iteration 9 for evaluation, even if converged
             min_iterations = 9
             if not has_changed and i_iter >= 4:
