@@ -33,6 +33,35 @@ def compute_instance_confidence_scores(bag_probs: NDArray[np.float64]) -> NDArra
     return max_probs
 
 
+def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambda_entropy: float = 0.05) -> NDArray[np.float64]:
+    """Compute AEM (Attention Entropy Maximization) regularized scores.
+    
+    Based on AEM research: adds entropy regularizer to prevent over-concentrated attention.
+    
+    Args:
+        bag_probs: Instance probability matrix of shape (n_instances, n_classes).
+        lambda_entropy: Entropy regularization strength.
+        
+    Returns:
+        AEM-regularized scores for each instance.
+    """
+    if len(bag_probs.shape) != 2 or bag_probs.shape[0] == 0:
+        return np.ones(bag_probs.shape[0])
+    
+    # Calculate instance-wise attention weights (softmax over max probabilities)
+    max_probs = np.max(bag_probs, axis=1)
+    attention_weights = np.exp(max_probs) / (np.sum(np.exp(max_probs)) + 1e-10)
+    
+    # Calculate attention entropy: H(α) = -Σ αᵢ log(αᵢ)
+    attention_entropy = -np.sum(attention_weights * np.log(attention_weights + 1e-10))
+    
+    # AEM regularization: encourage higher entropy
+    entropy_bonus = lambda_entropy * attention_entropy
+    
+    # Return scores with entropy bonus
+    return max_probs + entropy_bonus
+
+
 def compute_margin_aware_confidence(probs: NDArray[np.float64], target_class: int, margin_lambda: float = 0.25) -> float:
     """Compute margin-aware confidence scores.
     
@@ -63,7 +92,7 @@ def compute_margin_aware_confidence(probs: NDArray[np.float64], target_class: in
     return confidence
 
 
-def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margin_scores=None):
+def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margin_scores=None, aem_scores=None):
     """Solve exact k-of-n assignment problem with optional margin weighting.
     
     Find optimal assignment of instances to positive class such that
@@ -75,6 +104,7 @@ def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margi
         k_max: maximum number of positive instances
         current_assignments: current assignments (optional)
         margin_scores: margin-based scores for weighting (optional)
+        aem_scores: AEM scores for weighting (optional)
         
     Returns:
         optimal_assignments: binary array of assignments
@@ -96,6 +126,10 @@ def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margi
     # Apply margin weighting if provided
     if margin_scores is not None and len(margin_scores) == len(probs):
         log_odds = log_odds + 0.1 * margin_scores  # Moderate weight for margins
+    
+    # Apply AEM scores if provided
+    if aem_scores is not None and len(aem_scores) == len(probs):
+        log_odds = log_odds + 0.05 * aem_scores  # Small weight for AEM
     
     # Sort by log-odds in descending order
     sorted_indices = np.argsort(log_odds)[::-1]
@@ -387,9 +421,23 @@ class MilCountBasedMultiClassLearner:
                             for idx in active_indices
                         ])
                         
-                        # Solve exact assignment for active instances with margin scores
+                        # Compute AEM scores for the bag (only after initial iterations)
+                        aem_scores_active = None
+                        if i_iter >= 2:  # Start using AEM after warm-up
+                            # Adaptive lambda_entropy based on initialization type
+                            if initial_y is None:  # Auto initialization
+                                lambda_entropy = 0.06 * (1 - i_iter / max_iter)  # Decay over time
+                            else:  # External initialization
+                                lambda_entropy = 0.03 * (1 - i_iter / max_iter)  # Smaller weight
+                            
+                            # Compute AEM scores for all instances in the bag
+                            bag_aem_scores = compute_attention_entropy_maximization(probs, lambda_entropy)
+                            aem_scores_active = bag_aem_scores[active_indices]
+                        
+                        # Solve exact assignment for active instances with margin and AEM scores
                         optimal_assignment_active = exact_k_of_n_assignment(
-                            active_probs, k_min_active, k_max_active, margin_scores=margin_scores
+                            active_probs, k_min_active, k_max_active, 
+                            margin_scores=margin_scores, aem_scores=aem_scores_active
                         )
                         
                         # Map back to full assignment
