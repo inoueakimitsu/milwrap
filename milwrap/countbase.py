@@ -143,8 +143,9 @@ class MilCountBasedMultiClassLearner:
         rho = 1.0  # Penalty parameter for augmented Lagrangian
         
         # Temperature for soft assignments (starts high, anneals down)
-        temperature_start = 2.0
-        temperature_end = 0.1
+        # Fine-tuned temperature parameters for better convergence
+        temperature_start = 1.8  # Slightly lower start for more stable early iterations
+        temperature_end = 0.15   # Slightly higher end to avoid over-deterministic assignments
         temperature_decay = (temperature_end / temperature_start) ** (1.0 / max_iter)
 
         for i_iter in range(max_iter):
