@@ -140,38 +140,33 @@ class MilCountBasedMultiClassLearner:
         n_bags = len(bags)
         lambda_lower = np.zeros((n_bags, n_classes))
         lambda_upper = np.zeros((n_bags, n_classes))
-        rho = 1.0  # Penalty parameter for augmented Lagrangian
+        rho = 1.2  # Penalty parameter for augmented Lagrangian (slightly increased)
         
         # Temperature for soft assignments (starts high, anneals down)
-        # Fine-tuned values based on empirical testing
-        temperature_start = 1.5  # Lower starting temperature for more decisive early assignments
-        temperature_end = 0.05  # Lower end temperature for sharper final decisions
+        temperature_start = 2.0
+        temperature_end = 0.1
+        temperature_decay = (temperature_end / temperature_start) ** (1.0 / max_iter)
+        
+        # Entropy regularization parameters
+        beta_start = 0.1  # Initial entropy weight
+        beta_end = 0.001  # Final entropy weight
+        beta_decay_patience = 3  # Iterations to wait before decaying beta
+        no_improvement_count = 0
+        best_accuracy = 0.0
         
         # Improved temperature schedule using warm restart cosine annealing
         # This provides better exploration in early iterations and smoother convergence
         
         for i_iter in range(max_iter):
-            # Cosine annealing with warm restarts
-            progress = i_iter / max(1, max_iter - 1)
+            # Simple exponential temperature decay
+            temperature = temperature_start * (temperature_decay ** i_iter)
             
-            # Option 1: Simple cosine annealing
-            # temperature = temperature_end + 0.5 * (temperature_start - temperature_end) * (1 + np.cos(np.pi * progress))
-            
-            # Option 2: Cosine annealing with warm restart (T_i = 3 iterations)
-            # Shorter cycles for faster convergence
-            cycle_length = 3
-            cycle_progress = (i_iter % cycle_length) / cycle_length
-            cycle_num = i_iter // cycle_length
-            
-            # Decrease the max temperature of each cycle more aggressively
-            cycle_temp_start = temperature_start * (0.7 ** cycle_num)
-            cycle_temp_end = max(temperature_end, cycle_temp_start * 0.4)
-            
-            # Apply cosine annealing within the cycle
-            temperature = cycle_temp_end + 0.5 * (cycle_temp_start - cycle_temp_end) * (1 + np.cos(np.pi * cycle_progress))
-            
-            # Ensure we don't go below minimum temperature
-            temperature = max(temperature_end, temperature)
+            # Update beta (entropy regularization weight) - cosine annealing to 0
+            # First 2 cycles (6 iterations), then stay at 0
+            if i_iter < 6:
+                beta_current = beta_start * 0.5 * (1 + np.cos(np.pi * i_iter / 6))
+            else:
+                beta_current = beta_end
             
             # Fit
             flatten_bags = np.vstack(bags)
@@ -306,6 +301,7 @@ class MilCountBasedMultiClassLearner:
                                     scores[c] += 0.5
                                 else:
                                     scores[c] -= 1.0
+                                
                             
                             # Apply temperature-controlled softmax
                             exp_scores = np.exp(scores / temperature)
@@ -326,9 +322,11 @@ class MilCountBasedMultiClassLearner:
                 if not np.array_equal(y[i_bag], new_y):
                     has_changed = True
                     y[i_bag] = new_y
+                
 
             if debug:
                 print("iter:", i_iter)
+                print(f"rho: {rho:.3f}, beta: {beta_current:.4f}, temperature: {temperature:.4f}")
                 predicted_count = np.nan_to_num(
                     pd.DataFrame([pd.Series(b).value_counts().to_dict() for b in y])[list(range(n_classes))].values,
                 )
@@ -343,16 +341,36 @@ class MilCountBasedMultiClassLearner:
                 print(num_changes_instance)
                 if debug_true_y is not None:
                     print("instance unit accuracy")
-                    print(
-                        np.mean(
-                            np.hstack([self.classifier.predict(bag) for bag in bags]) == np.hstack(debug_true_y),
-                        ),
+                    current_accuracy = np.mean(
+                        np.hstack([self.classifier.predict(bag) for bag in bags]) == np.hstack(debug_true_y),
                     )
+                    print(current_accuracy)
                     print("instance unit accuracy (label adjusted)")
                     print(np.mean(np.hstack(y) == np.hstack(debug_true_y)))
+                    
+                    # Track improvement for beta decay
+                    if current_accuracy > best_accuracy + 0.001:  # Small threshold for improvement
+                        best_accuracy = current_accuracy
+                        no_improvement_count = 0
+                    else:
+                        no_improvement_count += 1
                 print("-----")
 
-            if not has_changed:
+            # Continue to iteration 9 for evaluation, even if converged
+            min_iterations = 9
+            if not has_changed and i_iter >= 4:
+                # Labels have converged, but continue training classifier
+                if debug:
+                    print(f"Labels converged at iteration {i_iter}, continuing to refine classifier...")
+                # Train with additional inner iterations when labels are stable
+                for inner_iter in range(10):  # 10 inner epochs after convergence
+                    self.classifier.fit(flatten_bags, flatten_y)
+            elif not has_changed and i_iter < 4:
+                if debug:
+                    print(f"Early convergence at iteration {i_iter}, continuing exploration...")
+            
+            # Only break after minimum iterations
+            if i_iter >= min_iterations - 1:
                 break
 
         return self.classifier, y
