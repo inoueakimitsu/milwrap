@@ -134,6 +134,7 @@ def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambd
     """Compute AEM (Attention Entropy Maximization) regularized scores.
     
     Based on AEM research: adds entropy regularizer to prevent over-concentrated attention.
+    Uses simpler global entropy bonus for more stable gradients.
     
     Args:
         bag_probs: Instance probability matrix of shape (n_instances, n_classes).
@@ -154,11 +155,14 @@ def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambd
     # Calculate attention entropy: H(α) = -Σ αᵢ log(αᵢ)
     attention_entropy = -np.sum(attention_weights * np.log(attention_weights + 1e-10))
     
-    # AEM regularization: encourage higher entropy with weighted scores
-    # Apply entropy bonus directly to each instance based on its attention weight
-    aem_scores = max_probs + lambda_entropy * attention_entropy * attention_weights
+    # Normalize entropy by bag size for consistent regularization strength
+    normalized_entropy = attention_entropy / np.log(n_instances + 1e-10)
     
-    return aem_scores
+    # AEM regularization: simple global entropy bonus (more stable than per-instance weighting)
+    entropy_bonus = lambda_entropy * normalized_entropy
+    
+    # Return scores with uniform entropy bonus for all instances
+    return max_probs + entropy_bonus
 
 
 def smooth_topk(scores: NDArray[np.float64], k: float, temperature: float = 1.0) -> NDArray[np.float64]:
@@ -792,13 +796,13 @@ class MilCountBasedMultiClassLearner:
         
         # Adaptive temperature schedule based on initialization type
         if is_external_init:
-            # For external init: 2x auto-init temperature (based on o3 MCP recommendation)
-            # This provides better exploration without excessive randomness
-            smooth_temp_start = 2.0   # 2x auto-init temperature
-            smooth_temp_end = 0.15    # Lower final temperature for precision
-            gumbel_temp = 2.0         # Consistent with smooth temperature
-            # Use exponential decay with moderate rate
-            temp_decay_rate = 0.9     # Moderate decay to balance exploration/exploitation
+            # For external init: conservative exploration (1.3x auto-init temperature)
+            # External init already provides good starting point, so less exploration needed
+            smooth_temp_start = 1.3   # Conservative increase for stability
+            smooth_temp_end = 0.1     # Lower final temperature for precision
+            gumbel_temp = 1.2         # Slightly reduced for external init
+            # Use cosine schedule for smoother transition
+            temp_decay_rate = None    # Use cosine schedule like auto-init
         else:
             # Original temperature schedule for auto-init
             smooth_temp_start = 1.0
@@ -836,16 +840,10 @@ class MilCountBasedMultiClassLearner:
             confidence_threshold = 0.95  # Original for auto-init
             margin_lambda = 0.4   # Original margin importance
         
-        # Initialize adaptive penalty parameters for constraints (ADMM-inspired)
-        rho_lower = np.ones((n_bags, n_classes)) * 0.5  # Start with moderate penalties
-        rho_upper = np.ones((n_bags, n_classes)) * 0.5
-        
-        # For external init with violations, start with higher penalties
-        if is_external_init:
-            for i_bag in range(n_bags):
-                if bag_init_quality[i_bag] < 0.5:  # Poor quality init
-                    rho_lower[i_bag, :] *= 2.0
-                    rho_upper[i_bag, :] *= 2.0
+        # Fixed penalty parameters for constraints (more stable than adaptive)
+        # Based on staged-AEM approach: consistent pressure throughout training
+        constraint_boost_penalty = 3.0  # Penalty for moving from over-represented class
+        constraint_deficit_bonus = 3.0  # Bonus for moving to under-represented class
         
         # Initialize MIL-Dropout parameters
         mil_dropout_k = 1  # Number of top instances to potentially drop
@@ -862,9 +860,9 @@ class MilCountBasedMultiClassLearner:
             })
         
         for i_iter in range(max_iter):
-            # Extended Gumbel exploration for external init to prevent early convergence
+            # Conservative Gumbel exploration to preserve good initial assignments
             if is_external_init:
-                use_gumbel = (i_iter < 2)  # First 2 iterations for external init
+                use_gumbel = (i_iter == 0)  # Only first iteration for external init
             else:
                 use_gumbel = (i_iter == 0)  # First iteration only for auto-init
             
@@ -889,12 +887,12 @@ class MilCountBasedMultiClassLearner:
             
             # AEM schedule: adapt based on initialization type
             if is_external_init:
-                # For external init: moderate AEM following o3 recommendations
-                # Start with λ = 0.15-0.2 and cosine decay to 0
-                if i_iter < int(max_iter * 0.6):  # First 60% of iterations
-                    # Cosine annealing from 0.2 to 0
-                    aem_progress = i_iter / (max_iter * 0.6)
-                    aem_lambda = 0.2 * 0.5 * (1 + np.cos(np.pi * aem_progress))
+                # For external init: conservative AEM to preserve good initial assignments
+                # Start with λ = 0.1 and gentle cosine decay
+                if i_iter < int(max_iter * 0.7):  # First 70% of iterations
+                    # Gentle cosine annealing from 0.1 to 0
+                    aem_progress = i_iter / (max_iter * 0.7)
+                    aem_lambda = 0.1 * 0.5 * (1 + np.cos(np.pi * aem_progress))
                 else:
                     aem_lambda = 0.0  # No entropy regularization in final iterations
             else:
@@ -1134,15 +1132,15 @@ class MilCountBasedMultiClassLearner:
                                     margin_conf = compute_margin_aware_confidence(probs[idx], i_class, margin_lambda=margin_lambda)
                                     score = base_score + 0.1 * (margin_conf - base_score)
                                     
-                                    # Adaptive boost/penalty based on constraint satisfaction
+                                    # Fixed boost/penalty based on constraint satisfaction
                                     current_class = new_y[idx]
                                     current_class_count = class_count_dict.get(current_class, 0)
                                     if current_class_count > upper_threshold[i_bag, current_class]:
-                                        # Use adaptive penalty for stronger boost
-                                        score *= (2.0 + rho_upper[i_bag, current_class])
+                                        # Fixed boost for moving away from over-represented class
+                                        score *= constraint_boost_penalty
                                     elif current_class_count <= lower_threshold[i_bag, current_class]:
-                                        # Use adaptive penalty for stronger penalty
-                                        score *= (1.0 / (1.0 + rho_lower[i_bag, current_class]))
+                                        # Fixed penalty for moving away from under-represented class
+                                        score *= (1.0 / constraint_boost_penalty)
                                     
                                     candidates.append((idx, score))
                             
@@ -1207,16 +1205,16 @@ class MilCountBasedMultiClassLearner:
                                     margin_conf = compute_margin_aware_confidence(probs[idx], c, margin_lambda=margin_lambda)
                                     scores[c] = base_log_score + 0.1 * np.log(max(margin_conf, 1e-8) + 1e-8)
                                     
-                                    # Adaptive constraint bonus/penalty
+                                    # Fixed constraint bonus/penalty
                                     c_count = class_count_dict.get(c, 0)
                                     if c_count < lower_threshold[i_bag, c]:
-                                        # Use adaptive penalty for incentive
-                                        scores[c] += (2.0 + rho_lower[i_bag, c])
+                                        # Fixed bonus for under-represented class
+                                        scores[c] += constraint_deficit_bonus
                                     elif c_count < upper_threshold[i_bag, c]:
                                         scores[c] += 1.0
                                     else:
-                                        # Use adaptive penalty for penalty
-                                        scores[c] -= (1.0 + rho_upper[i_bag, c])
+                                        # Fixed penalty for over-represented class
+                                        scores[c] -= constraint_boost_penalty
                                 
                                 # Apply temperature
                                 exp_scores = np.exp(scores / temperature)
@@ -1311,37 +1309,6 @@ class MilCountBasedMultiClassLearner:
                 if debug:
                     print(f"Early convergence at iteration {i_iter}, continuing exploration...")
             
-            # Update adaptive penalties based on constraint violations (ADMM-style)
-            if i_iter < max_iter - 1 and is_external_init:
-                predicted_count = np.nan_to_num(
-                    pd.DataFrame([pd.Series(b).value_counts().to_dict() for b in y])[list(range(n_classes))].values,
-                )
-                
-                # Adaptive penalty update for lower constraints
-                lower_violations = np.maximum(lower_threshold - predicted_count, 0)
-                for i_bag in range(n_bags):
-                    for i_class in range(n_classes):
-                        if lower_violations[i_bag, i_class] > 0:
-                            # Increase penalty for violated constraints
-                            # Scale increase by bag init quality (worse init -> faster increase)
-                            increase_rate = 1.1 + 0.2 * (1.0 - bag_init_quality[i_bag])
-                            rho_lower[i_bag, i_class] *= increase_rate
-                        else:
-                            # Decrease penalty for satisfied constraints
-                            rho_lower[i_bag, i_class] *= 0.95
-                        # Clamp to reasonable range
-                        rho_lower[i_bag, i_class] = np.clip(rho_lower[i_bag, i_class], 0.1, 5.0)
-                
-                # Adaptive penalty update for upper constraints
-                upper_violations = np.maximum(predicted_count - upper_threshold, 0)
-                for i_bag in range(n_bags):
-                    for i_class in range(n_classes):
-                        if upper_violations[i_bag, i_class] > 0:
-                            increase_rate = 1.1 + 0.2 * (1.0 - bag_init_quality[i_bag])
-                            rho_upper[i_bag, i_class] *= increase_rate
-                        else:
-                            rho_upper[i_bag, i_class] *= 0.95
-                        rho_upper[i_bag, i_class] = np.clip(rho_upper[i_bag, i_class], 0.1, 5.0)
             
             # Only break after minimum iterations
             if i_iter >= min_iterations - 1:
