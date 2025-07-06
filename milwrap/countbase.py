@@ -299,24 +299,55 @@ class MilCountBasedMultiClassLearner:
         lambda_upper = np.zeros((n_bags, n_classes))
         rho = 1.0  # Penalty parameter for augmented Lagrangian
         
-        # Temperature for soft assignments (starts moderate, anneals down)
-        temperature_start = 1.0  # Lower initial temperature for more decisive assignments
-        temperature_end = 0.05   # Lower final temperature for more precise assignments
-        temperature_decay = (temperature_end / temperature_start) ** (1.0 / max_iter)
-        
-        # Adaptive temperature scheduling based on convergence speed
-        current_temperature = temperature_start
-        label_change_rate = 1.0  # Track label change rate for adaptive annealing
-        
         # Detect initialization type (external vs auto)
         is_external_init = initial_y is not None
         
-        # AEM parameters with different values for auto vs external initialization
+        # Temperature for soft assignments (starts moderate, anneals down)
+        # Adaptive temperature based on initialization type and convergence behavior
         if is_external_init:
-            lambda_entropy_base = 0.02  # Much lower for external init (already peaked)
-            aem_weight = 0.05  # Much lower weight to preserve good initialization
+            # Conservative temperature for external init to preserve good initialization
+            temperature_start = 1.0  # Same as auto-init
+            temperature_end = 0.05   # Same as auto-init
+        else:
+            temperature_start = 1.0  # Keep standard for auto-init
+            temperature_end = 0.05   # Lower final temperature for precision
+        
+        # Non-linear temperature decay for better convergence
+        # Use cosine annealing instead of exponential
+        current_temperature = temperature_start
+        label_change_rate = 1.0  # Track label change rate for adaptive annealing
+        previous_change_rates = []  # Track history for adaptive scheduling
+        
+        # AEM parameters with adaptive tuning based on initialization quality
+        violation_ratio = 0.0  # Default for auto-init
+        if is_external_init:
+            # Analyze initial assignment quality for adaptive parameter tuning
+            initial_violations = 0
+            for i_bag in range(n_bags):
+                class_counts = pd.Series(y[i_bag]).value_counts().to_dict()
+                for i_class in range(n_classes):
+                    count = class_counts.get(i_class, 0)
+                    if count < lower_threshold[i_bag, i_class]:
+                        initial_violations += lower_threshold[i_bag, i_class] - count
+                    elif count > upper_threshold[i_bag, i_class]:
+                        initial_violations += count - upper_threshold[i_bag, i_class]
+            
+            # Adaptive parameters based on initialization quality
+            violation_ratio = initial_violations / sum(len(bag) for bag in bags)
+            if violation_ratio < 0.05:  # Very good initialization
+                lambda_entropy_base = 0.005  # Minimal entropy regularization (reduced from 0.01)
+                aem_weight = 0.02  # Very low weight (reduced from 0.03)
+                decay_strength = 5.0  # Faster decay (increased from 4.0)
+            elif violation_ratio < 0.15:  # Good initialization
+                lambda_entropy_base = 0.01  # Low entropy regularization (reduced from 0.02)
+                aem_weight = 0.03  # Low weight (reduced from 0.05)
+                decay_strength = 4.0  # Faster decay (increased from 3.0)
+            else:  # Poor initialization
+                lambda_entropy_base = 0.02  # Higher entropy for exploration (reduced from 0.04)
+                aem_weight = 0.05  # Higher weight (reduced from 0.08)
+                decay_strength = 3.0  # Moderate decay (increased from 2.0)
+                
             warmup_fraction = 0.0  # No warmup for external init
-            decay_strength = 3.0  # Faster decay
             margin_lambda = 0.2  # Higher margin lambda for external init
             margin_weight = 0.2  # Higher margin contribution
         else:
@@ -338,11 +369,43 @@ class MilCountBasedMultiClassLearner:
         for i_iter in range(max_iter):
             # Adaptive temperature annealing based on convergence speed
             if i_iter > 0:
-                # Adjust temperature based on label change rate
-                if label_change_rate > 0.02:  # More than 2% changes - slow down annealing
-                    current_temperature = max(temperature_end, current_temperature * 0.97)
-                else:  # Less than 2% changes - standard annealing
-                    current_temperature = max(temperature_end, current_temperature * 0.9)
+                # Track change rate history for better adaptation
+                previous_change_rates.append(label_change_rate)
+                
+                # Cosine annealing with restarts for better exploration
+                progress = i_iter / max_iter
+                base_temp = temperature_end + 0.5 * (temperature_start - temperature_end) * (1 + np.cos(np.pi * progress))
+                
+                # Adaptive adjustment based on convergence behavior
+                if is_external_init:
+                    # More conservative temperature adjustment for external init
+                    if label_change_rate > 0.05:  # High change rate
+                        temp_multiplier = 1.05  # Reduced from 1.1
+                    elif label_change_rate > 0.02:  # Moderate changes
+                        temp_multiplier = 0.98
+                    elif label_change_rate > 0.005:  # Low changes
+                        temp_multiplier = 0.93
+                    else:  # Very low changes - mild reheat
+                        if len(previous_change_rates) >= 2 and all(r < 0.005 for r in previous_change_rates[-2:]):
+                            temp_multiplier = 1.05  # Reduced from 1.2
+                        else:
+                            temp_multiplier = 0.9
+                else:
+                    # Original settings for auto-init
+                    if label_change_rate > 0.05:  # High change rate - maintain exploration
+                        temp_multiplier = 1.1
+                    elif label_change_rate > 0.02:  # Moderate changes
+                        temp_multiplier = 1.0
+                    elif label_change_rate > 0.005:  # Low changes
+                        temp_multiplier = 0.95
+                    else:  # Very low changes - check if stuck
+                        # If stuck at low change rate for multiple iterations, reheat
+                        if len(previous_change_rates) >= 2 and all(r < 0.005 for r in previous_change_rates[-2:]):
+                            temp_multiplier = 1.2  # Reheat to escape local minima
+                        else:
+                            temp_multiplier = 0.9
+                
+                current_temperature = max(temperature_end, base_temp * temp_multiplier)
             temperature = current_temperature
             
             # Fit
@@ -392,19 +455,38 @@ class MilCountBasedMultiClassLearner:
                         if max_probs[idx] > confidence_threshold and y[i_bag][idx] == predicted_classes[idx]:
                             frozen_indices.add(idx)
                 
-                # Adaptive AEM scheduling: warm-up then decay
+                # Adaptive AEM scheduling based on convergence and bag difficulty
                 warmup_iters = int(warmup_fraction * max_iter)
+                
+                # Base entropy calculation with warm-up and decay
                 if warmup_iters > 0 and i_iter < warmup_iters:
                     # Warm-up phase
-                    lambda_entropy = lambda_entropy_base * (i_iter + 1) / warmup_iters
-                elif warmup_iters == 0:
-                    # No warmup, go straight to decay
-                    decay_progress = i_iter / max_iter
-                    lambda_entropy = lambda_entropy_base * np.exp(-decay_strength * decay_progress)
+                    base_lambda = lambda_entropy_base * (i_iter + 1) / warmup_iters
                 else:
-                    # Decay phase after warmup
-                    decay_progress = (i_iter - warmup_iters) / (max_iter - warmup_iters)
-                    lambda_entropy = lambda_entropy_base * np.exp(-decay_strength * decay_progress)
+                    # Adaptive decay based on convergence speed
+                    if warmup_iters == 0:
+                        decay_progress = i_iter / max_iter
+                    else:
+                        decay_progress = (i_iter - warmup_iters) / (max_iter - warmup_iters)
+                    
+                    # Adjust decay rate based on convergence behavior
+                    if label_change_rate > 0.02:
+                        # High change rate - slower decay to maintain exploration
+                        effective_decay = decay_strength * 0.7
+                    elif label_change_rate < 0.005 and i_iter > 3:
+                        # Low change rate after initial iterations - faster decay
+                        effective_decay = decay_strength * 1.3
+                    else:
+                        effective_decay = decay_strength
+                    
+                    base_lambda = lambda_entropy_base * np.exp(-effective_decay * decay_progress)
+                
+                # Bag-specific adjustment based on difficulty
+                bag_difficulty_normalized = bag_difficulty[i_bag] / (n_instances + 1e-8)
+                if bag_difficulty_normalized > 0.1:  # High difficulty bag
+                    lambda_entropy = base_lambda * 1.2  # More entropy for difficult bags
+                else:
+                    lambda_entropy = base_lambda
                 
                 # Compute AEM scores for this bag
                 aem_scores = compute_attention_entropy_maximization(probs, lambda_entropy=lambda_entropy)
@@ -674,6 +756,51 @@ class MilCountBasedMultiClassLearner:
                 # Train with additional inner iterations when labels are stable
                 for inner_iter in range(5):
                     self.classifier.fit(flatten_bags, flatten_y)
+                    
+                # For external init with good quality, apply fine-tuning
+                if is_external_init and violation_ratio < 0.05:
+                    # Small perturbation to escape potential local optima
+                    perturbation_rate = 0.001 * (9 - i_iter) / 5  # Decreasing perturbation
+                    n_perturb = max(1, int(total_instances * perturbation_rate))
+                    
+                    # Select instances with medium confidence for perturbation
+                    all_probs = []
+                    all_indices = []
+                    for bag_idx, bag in enumerate(bags):
+                        bag_probs = fs[bag_idx]
+                        max_probs = np.max(bag_probs, axis=1)
+                        for inst_idx, prob in enumerate(max_probs):
+                            if 0.6 < prob < 0.9:  # Medium confidence
+                                all_probs.append(prob)
+                                all_indices.append((bag_idx, inst_idx))
+                    
+                    if len(all_indices) > n_perturb:
+                        # Randomly select instances to perturb
+                        selected_indices = random.sample(range(len(all_indices)), n_perturb)
+                        for idx in selected_indices:
+                            bag_idx, inst_idx = all_indices[idx]
+                            # Flip to second-best class
+                            probs = fs[bag_idx][inst_idx]
+                            current_class = y[bag_idx][inst_idx]
+                            probs[current_class] = -1  # Temporarily mask current class
+                            new_class = np.argmax(probs)
+                            
+                            # Check if flip maintains constraints
+                            test_y = y[bag_idx].copy()
+                            test_y[inst_idx] = new_class
+                            test_counts = pd.Series(test_y).value_counts().to_dict()
+                            
+                            valid = True
+                            for c in range(n_classes):
+                                count = test_counts.get(c, 0)
+                                if count < lower_threshold[bag_idx, c] or count > upper_threshold[bag_idx, c]:
+                                    valid = False
+                                    break
+                            
+                            if valid:
+                                y[bag_idx][inst_idx] = new_class
+                                has_changed = True
+                                
             elif not has_changed and i_iter < 4:
                 if debug:
                     print(f"Early convergence at iteration {i_iter}, continuing exploration...")
