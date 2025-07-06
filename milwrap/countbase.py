@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import scipy.stats
 from numpy.typing import NDArray
+from sklearn.cluster import KMeans
 
 
 def compute_instance_confidence_scores(bag_probs: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -446,7 +447,7 @@ def compute_differentiable_count_loss(probs, k_target, weight=0.1):
     return weight * count_deviation
 
 
-def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=None, aem_scores=None, interaction_weights=None, global_context=None, attribute_scores=None, iteration=0):
+def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=None, aem_scores=None, interaction_weights=None, global_context=None, attribute_scores=None, prototype_scores=None, aggregated_global_context=None, iteration=0):
     """Enhanced soft k-of-n assignment using smooth top-k operator with attribute scoring.
     
     Find soft assignment weights such that sum approximates the optimal k
@@ -488,7 +489,7 @@ def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=N
     
     # Combine with attribute scores (primary signal after warmup)
     if attribute_scores is not None and len(attribute_scores) == len(probs):
-        attr_weight = (0.15 if is_external else 0.18) * attr_warmup  # Less for external init
+        attr_weight = (0.17 if is_external else 0.18) * attr_warmup  # Increased for external init
         log_odds = log_odds * (1 - attr_weight) + attribute_scores * attr_weight
     
     # Combine with margin scores
@@ -506,14 +507,31 @@ def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=N
         interaction_weight = (0.14 if is_external else 0.12) * (1 + 0.2 * attr_warmup)
         log_odds = log_odds + interaction_weight * interaction_weights
     
+    # Combine with prototype similarity scores (PAMIL-inspired)
+    if prototype_scores is not None and len(prototype_scores) == len(probs):
+        prototype_weight = (0.18 if is_external else 0.14) * attr_warmup  # Stronger for external init
+        log_odds = log_odds + prototype_weight * prototype_scores
+    
     # Apply global context if available (ProMIL-inspired)
-    if global_context is not None:
-        # global_context contains optimal proportion learned from data
-        optimal_k = int(np.round(global_context * n))
+    if global_context is not None or aggregated_global_context is not None:
+        # Combine bag-specific and aggregated global contexts
+        if global_context is not None and aggregated_global_context is not None:
+            # Weighted combination favoring aggregated context as iterations progress
+            aggregation_weight = min(0.7, 0.3 + 0.1 * iteration)  # Gradually increase weight
+            effective_proportion = ((1 - aggregation_weight) * global_context + 
+                                   aggregation_weight * aggregated_global_context)
+        elif global_context is not None:
+            effective_proportion = global_context
+        else:
+            effective_proportion = aggregated_global_context
+            
+        optimal_k = int(np.round(effective_proportion * n))
         optimal_k = max(k_min, min(k_max, optimal_k))
-        # Bias towards the learned optimal k
-        k_min = max(k_min, optimal_k - 1)
-        k_max = min(k_max, optimal_k + 1)
+        
+        # Adaptive biasing based on iteration (more flexible early, more strict later)
+        flexibility = max(1, 3 - iteration // 3)  # Decreases from 3 to 1
+        k_min = max(k_min, optimal_k - flexibility)
+        k_max = min(k_max, optimal_k + flexibility)
     
     # Enhanced k selection with diversity consideration
     best_k = k_min
@@ -719,10 +737,10 @@ class MilCountBasedMultiClassLearner:
         
         # Enhanced temperature schedule with cyclical components
         if is_external_init:
-            temperature_start = 0.92   # Higher for external init
-            temperature_end = 0.25     # Higher final temperature
-            temperature_half_life = 0.25  # Faster decay for external init
-            temperature_cycle_amplitude = 0.01  # Less cyclical for external init
+            temperature_start = 0.94   # Higher for better exploration with external init
+            temperature_end = 0.22     # Lower final temperature for better convergence
+            temperature_half_life = 0.30  # Slower decay to maintain exploration
+            temperature_cycle_amplitude = 0.008  # Minimal cyclical for stability
         else:
             temperature_start = 0.88   # Slightly higher for better exploration
             temperature_end = 0.23     # Moderate final temperature
@@ -747,6 +765,34 @@ class MilCountBasedMultiClassLearner:
         global_proportions = np.zeros((n_bags, n_classes))
         proportion_momentum = 0.92  # Higher momentum for stability
         
+        # Enhanced global context: track aggregated proportions across all bags
+        aggregated_global_proportions = np.zeros(n_classes)
+        aggregated_proportion_weights = np.zeros(n_bags)  # Weight by bag reliability
+        global_aggregation_momentum = 0.95  # Higher momentum for global patterns
+        
+        # Initialize prototypes using k-means clustering on all instances
+        # This provides global instance patterns for better scoring
+        all_instances = np.vstack(bags)
+        n_prototypes = min(50, max(10, len(all_instances) // 50))  # Adaptive number of prototypes
+        if n_prototypes > 5 and len(all_instances) > 50:
+            # Use k-means to find representative prototypes
+            kmeans = KMeans(n_clusters=n_prototypes, random_state=seed, n_init=3)
+            kmeans.fit(all_instances)
+            prototypes = kmeans.cluster_centers_
+            prototype_temperature = 0.08 if is_external_init else 0.15  # Lower temperature for sharper prototype matching
+        else:
+            # Fall back to using subset of instances as prototypes
+            prototype_indices = np.random.RandomState(seed).choice(len(all_instances), 
+                                                                  size=min(10, len(all_instances)), 
+                                                                  replace=False)
+            prototypes = all_instances[prototype_indices]
+            prototype_temperature = 0.2
+        
+        # Adaptive prototype update parameters
+        prototype_update_interval = 5  # Update prototypes every N iterations
+        prototype_update_momentum = 0.7  # Momentum for prototype updates
+        instance_prototype_assignments = np.zeros(len(all_instances), dtype=int)  # Track assignments
+        
         # Enhanced STKIM parameters with curriculum
         stkim_start_iter = 3  # Earlier start with gentler masking
         stkim_mask_ratio_start = 0.03  # Start with less aggressive masking
@@ -754,8 +800,8 @@ class MilCountBasedMultiClassLearner:
         stkim_top_k_ratio = 0.25  # Consider top 25% as high-attention
         
         # Enhanced count loss weight schedule
-        count_loss_weight_start = 0.015  # Lower starting weight
-        count_loss_weight_end = 0.12  # Moderate ending weight
+        count_loss_weight_start = 0.012  # Lower starting weight for stability
+        count_loss_weight_end = 0.15  # Higher ending weight for better constraint satisfaction
         count_loss_schedule = "cosine"  # Cosine schedule for smoother transition
         count_loss_warmup = 2  # Warmup iterations before count loss
         
@@ -938,10 +984,20 @@ class MilCountBasedMultiClassLearner:
                         # Compute attribute scores for active instances
                         attribute_scores_active = compute_attribute_scores(probs[active_indices])
                         
+                        # Compute prototype similarity scores for active instances
+                        prototype_scores_active = None
+                        if n_active > 0:
+                            active_features = bags[i_bag][active_indices]
+                            prototype_scores_active = compute_prototype_similarity_scores(
+                                active_features, prototypes, temperature=prototype_temperature
+                            )
+                        
                         # Get global context for this bag (if available after first iteration)
                         global_context = None
+                        aggregated_context = None
                         if i_iter > 0:
                             global_context = global_proportions[i_bag, 1]  # For binary, use class 1 proportion
+                            aggregated_context = aggregated_global_proportions[1]  # Aggregated class 1 proportion
                         
                         # Always use soft assignment with ST_k for differentiability
                         soft_weights = soft_k_of_n_assignment(
@@ -949,7 +1005,9 @@ class MilCountBasedMultiClassLearner:
                             temperature=temperature,  # Use the independent temperature schedule
                             margin_scores=margin_scores, aem_scores=aem_scores,
                             interaction_weights=interaction_weights, global_context=global_context,
-                            attribute_scores=attribute_scores_active, iteration=i_iter
+                            attribute_scores=attribute_scores_active, prototype_scores=prototype_scores_active,
+                            aggregated_global_context=aggregated_context,
+                            iteration=i_iter
                         )
                         
                         # Straight-through estimator: hard assignment for forward, soft for backward
@@ -1157,6 +1215,25 @@ class MilCountBasedMultiClassLearner:
                 else:
                     global_proportions[i_bag] = (proportion_momentum * global_proportions[i_bag] + 
                                                  (1 - proportion_momentum) * current_proportions)
+                
+                # Enhanced global context: update aggregated proportions with bag difficulty weighting
+                if i_iter > 0:
+                    # Weight by inverse difficulty (easier bags are more reliable)
+                    bag_weight = np.exp(-bag_difficulty[i_bag] / (np.mean(bag_difficulty) + 1e-8))
+                    aggregated_proportion_weights[i_bag] = bag_weight
+                    
+                    # Compute weighted average across all bags
+                    weighted_proportions = np.zeros(n_classes)
+                    total_weight = 0
+                    for bag_idx in range(n_bags):
+                        if aggregated_proportion_weights[bag_idx] > 0:
+                            weighted_proportions += global_proportions[bag_idx] * aggregated_proportion_weights[bag_idx]
+                            total_weight += aggregated_proportion_weights[bag_idx]
+                    
+                    if total_weight > 0:
+                        weighted_proportions /= total_weight
+                        aggregated_global_proportions = (global_aggregation_momentum * aggregated_global_proportions + 
+                                                        (1 - global_aggregation_momentum) * weighted_proportions)
 
             if debug:
                 print(f"iter: {i_iter}, temperature: {temperature:.3f}, aem_lambda: {aem_lambda:.3f}, count_loss_weight: {count_loss_weight:.3f}")
@@ -1182,6 +1259,35 @@ class MilCountBasedMultiClassLearner:
                     print("instance unit accuracy (label adjusted)")
                     print(np.mean(np.hstack(y) == np.hstack(debug_true_y)))
                 print("-----")
+            
+            # Adaptive prototype update: refine prototypes based on current assignments
+            if i_iter > 0 and (i_iter + 1) % prototype_update_interval == 0:
+                # Collect all instances with their current predicted labels
+                all_instances_flat = np.vstack(bags)
+                all_labels_flat = np.hstack(y)
+                
+                # For each prototype, find assigned instances and update
+                new_prototypes = prototypes.copy()
+                for proto_idx in range(len(prototypes)):
+                    # Find instances closest to this prototype
+                    distances = np.sum((all_instances_flat - prototypes[proto_idx])**2, axis=1)
+                    
+                    # Get top 20% closest instances that are predicted positive
+                    n_closest = max(5, int(0.2 * len(all_instances_flat)))
+                    closest_indices = np.argsort(distances)[:n_closest]
+                    positive_closest = closest_indices[all_labels_flat[closest_indices] == 1]
+                    
+                    if len(positive_closest) > 3:
+                        # Update prototype with momentum
+                        new_center = np.mean(all_instances_flat[positive_closest], axis=0)
+                        new_prototypes[proto_idx] = (prototype_update_momentum * prototypes[proto_idx] + 
+                                                    (1 - prototype_update_momentum) * new_center)
+                
+                prototypes = new_prototypes
+                
+                # Adjust prototype temperature based on convergence
+                if not has_changed:
+                    prototype_temperature *= 0.95  # Reduce temperature when stable
 
             # Continue to iteration 9 for evaluation, even if converged
             min_iterations = 9
