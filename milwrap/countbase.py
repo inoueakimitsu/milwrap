@@ -217,6 +217,50 @@ def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambd
     return max_probs + entropy_bonus
 
 
+def apply_stochastic_instance_masking(probs: NDArray[np.float64], mask_ratio: float = 0.1, top_k_ratio: float = 0.3, adaptive_mask_ratio: float = None) -> NDArray[np.float64]:
+    """Apply Stochastic Top-K Instance Masking (STKIM).
+    
+    Based on ACMIL paper: randomly masks high-attention instances to force
+    the model to discover alternative discriminative patterns.
+    
+    Args:
+        probs: Instance probability matrix of shape (n_instances, n_classes).
+        mask_ratio: Fraction of top instances to potentially mask.
+        top_k_ratio: Fraction of instances considered as "top".
+        adaptive_mask_ratio: Optional adaptive mask ratio based on external initialization.
+        
+    Returns:
+        Masked probability matrix.
+    """
+    if len(probs.shape) != 2 or probs.shape[0] == 0:
+        return probs
+    
+    n_instances = probs.shape[0]
+    
+    # Get max probabilities for each instance
+    max_probs = np.max(probs, axis=1)
+    
+    # Identify top-k instances
+    k_top = max(1, int(n_instances * top_k_ratio))
+    top_indices = np.argsort(max_probs)[-k_top:]
+    
+    # Use adaptive mask ratio if provided
+    effective_mask_ratio = adaptive_mask_ratio if adaptive_mask_ratio is not None else mask_ratio
+    
+    # Randomly select instances to mask from top-k
+    n_mask = max(1, int(k_top * effective_mask_ratio))
+    mask_indices = np.random.choice(top_indices, size=n_mask, replace=False)
+    
+    # Create masked probabilities
+    masked_probs = probs.copy()
+    
+    # For masked instances, reduce their influence (but don't zero out completely)
+    # This maintains differentiability while encouraging exploration
+    masked_probs[mask_indices] *= 0.5  # Reduce but don't eliminate
+    
+    return masked_probs
+
+
 
 
 class PseudoBagMemoryPool:
@@ -1049,6 +1093,26 @@ class MilCountBasedMultiClassLearner:
         aem_lambda_max = 0.6  # Cap for λ
         constraint_history = []  # Track constraint violations
         
+        # STKIM parameters with adaptive tuning
+        if is_external_init and is_truly_external:
+            # For true external init, use more aggressive masking to encourage exploration
+            stkim_start_iter = 2  # Start earlier
+            stkim_mask_ratio_base = 0.08  # Higher base mask ratio
+            stkim_mask_ratio_decay = 0.9  # Slower decay
+            stkim_top_k_ratio = 0.25  # Consider top 25%
+        elif is_external_init:
+            # For pseudo-external init
+            stkim_start_iter = 3
+            stkim_mask_ratio_base = 0.06
+            stkim_mask_ratio_decay = 0.92
+            stkim_top_k_ratio = 0.2
+        else:
+            # For auto-init, use gentler masking
+            stkim_start_iter = 4
+            stkim_mask_ratio_base = 0.05
+            stkim_mask_ratio_decay = 0.95
+            stkim_top_k_ratio = 0.15
+        
         for i_iter in range(max_iter):
             # Compute temperature based on phase schedule
             if is_external_init:
@@ -1146,6 +1210,27 @@ class MilCountBasedMultiClassLearner:
 
             # Compute outputs
             fs = [self.classifier.predict_proba(bag) for bag in bags]
+            
+            # Apply STKIM if enabled with adaptive parameters
+            if i_iter >= stkim_start_iter:
+                # Compute adaptive mask ratio with decay
+                adaptive_mask_ratio = stkim_mask_ratio_base * (stkim_mask_ratio_decay ** (i_iter - stkim_start_iter))
+                
+                # Apply with external init weight schedule if available
+                if is_external_init and is_truly_external:
+                    external_decay = external_init_weight_schedule(i_iter)
+                    adaptive_mask_ratio *= (0.5 + 0.5 * external_decay)  # Reduce masking as external init influence decays
+                
+                fs_masked = []
+                for bag_probs in fs:
+                    masked_probs = apply_stochastic_instance_masking(
+                        bag_probs, 
+                        mask_ratio=stkim_mask_ratio_base,
+                        top_k_ratio=stkim_top_k_ratio,
+                        adaptive_mask_ratio=adaptive_mask_ratio
+                    )
+                    fs_masked.append(masked_probs)
+                fs = fs_masked
             
             y_pred = [self.classifier.predict(bag) for bag in bags]
             flatten_original_y = np.hstack(list(y))
@@ -1488,7 +1573,10 @@ class MilCountBasedMultiClassLearner:
                                                         (1 - global_aggregation_momentum) * weighted_proportions)
 
             if debug:
-                print(f"iter: {i_iter}, temperature: {temperature:.3f}, aem_lambda: {aem_lambda:.3f}, count_loss_weight: {count_loss_weight:.3f}")
+                stkim_info = ""
+                if i_iter >= stkim_start_iter:
+                    stkim_info = f", stkim_mask_ratio: {adaptive_mask_ratio:.3f}"
+                print(f"iter: {i_iter}, temperature: {temperature:.3f}, aem_lambda: {aem_lambda:.3f}, count_loss_weight: {count_loss_weight:.3f}{stkim_info}")
                 predicted_count = np.nan_to_num(
                     pd.DataFrame([pd.Series(b).value_counts().to_dict() for b in y])[list(range(n_classes))].values,
                 )
