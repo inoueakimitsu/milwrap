@@ -5,7 +5,7 @@ that use count-based constraints to learn from bags of instances.
 """
 
 import random
-from typing import List, Sequence
+from typing import List, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -224,6 +224,124 @@ def apply_stochastic_instance_masking(probs: NDArray[np.float64], mask_ratio: fl
     masked_probs[mask_indices] *= 0.5  # Reduce but don't eliminate (less aggressive)
     
     return masked_probs
+
+
+class PseudoBagMemoryPool:
+    """Pseudo-Bag Memory Pool (PMP) for continual MIL.
+    
+    Based on CVPR 2025: builds tiny pseudo-bags that store only the most
+    informative instances discovered so far, with attention knowledge distillation.
+    """
+    
+    def __init__(self, pool_size: int = 100, n_classes: int = 2):
+        """Initialize memory pool.
+        
+        Args:
+            pool_size: Maximum number of instances to store per class
+            n_classes: Number of classes
+        """
+        self.pool_size = pool_size
+        self.n_classes = n_classes
+        self.memory = {i: [] for i in range(n_classes)}
+        self.importance_scores = {i: [] for i in range(n_classes)}
+    
+    def update(self, instances: NDArray[np.float64], labels: NDArray[np.int_], 
+               scores: NDArray[np.float64]) -> None:
+        """Update memory pool with new important instances.
+        
+        Args:
+            instances: Instance features
+            labels: Instance labels
+            scores: Importance scores (e.g., attention weights)
+        """
+        for i, (instance, label, score) in enumerate(zip(instances, labels, scores)):
+            if label < self.n_classes:
+                self.memory[label].append(instance)
+                self.importance_scores[label].append(score)
+                
+                # Maintain pool size by keeping most important instances
+                if len(self.memory[label]) > self.pool_size:
+                    # Sort by importance and keep top instances
+                    sorted_indices = np.argsort(self.importance_scores[label])[-self.pool_size:]
+                    self.memory[label] = [self.memory[label][idx] for idx in sorted_indices]
+                    self.importance_scores[label] = [self.importance_scores[label][idx] for idx in sorted_indices]
+    
+    def get_pseudo_bag(self, size: int = 10) -> Tuple[NDArray[np.float64], NDArray[np.int_]]:
+        """Generate a pseudo-bag by sampling from memory.
+        
+        Args:
+            size: Number of instances to sample per class
+            
+        Returns:
+            Tuple of (instances, labels)
+        """
+        instances = []
+        labels = []
+        
+        for class_id in range(self.n_classes):
+            if len(self.memory[class_id]) > 0:
+                # Sample with replacement based on importance scores
+                pool = np.array(self.memory[class_id])
+                scores = np.array(self.importance_scores[class_id])
+                probs = scores / (np.sum(scores) + 1e-8)
+                
+                n_sample = min(size, len(pool))
+                indices = np.random.choice(len(pool), size=n_sample, p=probs, replace=True)
+                
+                instances.extend(pool[indices])
+                labels.extend([class_id] * n_sample)
+        
+        if instances:
+            return np.array(instances), np.array(labels)
+        else:
+            return np.array([]), np.array([])
+
+
+def compute_instance_early_stopping_mask(
+    probs_history: List[NDArray[np.float64]], 
+    y_history: List[NDArray[np.int_]], 
+    confidence_threshold: float = 0.01,
+    min_history: int = 3
+) -> NDArray[np.bool_]:
+    """Compute Instance-dependent Early Stopping (IES) mask.
+    
+    Based on arxiv.org/abs/2502.07547: stops updating instances whose predictions
+    have stabilized, freeing capacity to learn harder instances.
+    
+    Args:
+        probs_history: History of probability predictions for each instance
+        y_history: History of label assignments for each instance
+        confidence_threshold: Threshold for considering an instance as converged
+        min_history: Minimum history length required to compute convergence
+        
+    Returns:
+        Boolean mask where True means the instance should be frozen (stop updating)
+    """
+    if len(probs_history) < min_history:
+        # Not enough history, don't freeze any instances
+        n_instances = len(probs_history[0]) if probs_history else 0
+        return np.zeros(n_instances, dtype=bool)
+    
+    n_instances = len(probs_history[0])
+    freeze_mask = np.zeros(n_instances, dtype=bool)
+    
+    # Check convergence for each instance
+    for i in range(n_instances):
+        # Check if predictions have been stable
+        recent_probs = [probs[i] for probs in probs_history[-min_history:]]
+        recent_labels = [y[i] for y in y_history[-min_history:]]
+        
+        # Check label stability
+        if len(set(recent_labels)) == 1:  # Same label for recent history
+            # Check probability stability (low variance)
+            prob_std = np.std([np.max(p) for p in recent_probs])
+            if prob_std < confidence_threshold:
+                # Also check if confidence is high
+                avg_confidence = np.mean([np.max(p) for p in recent_probs])
+                if avg_confidence > 0.9:  # High confidence threshold
+                    freeze_mask[i] = True
+    
+    return freeze_mask
 
 
 def sparse_differentiable_topk(scores: NDArray[np.float64], k: float, temperature: float = 1.0, sparsity_threshold: float = 0.01, adaptive_sparsity: bool = True) -> NDArray[np.float64]:
@@ -747,30 +865,42 @@ class MilCountBasedMultiClassLearner:
             init_variance = np.var(flatten_init_y)
             init_entropy = -np.sum([np.mean(flatten_init_y == c) * np.log(np.mean(flatten_init_y == c) + 1e-8) 
                                     for c in range(n_classes)])
-            # External init typically has lower variance and higher entropy
-            # Relaxed conditions for better detection
+            
+            # Enhanced detection: check constraint satisfaction as additional signal
+            init_constraint_violations = 0
+            for i_bag in range(n_bags):
+                bag_counts = pd.Series(initial_y[i_bag]).value_counts().to_dict()
+                for i_class in range(n_classes):
+                    count = bag_counts.get(i_class, 0)
+                    if count < lower_threshold[i_bag, i_class]:
+                        init_constraint_violations += lower_threshold[i_bag, i_class] - count
+                    elif count > upper_threshold[i_bag, i_class]:
+                        init_constraint_violations += count - upper_threshold[i_bag, i_class]
+            
+            # External init typically has lower variance, higher entropy, and some violations
             if debug:
-                print(f"External init detection - variance: {init_variance:.4f}, entropy: {init_entropy:.4f}, n_classes: {n_classes}")
-            # Adjust thresholds based on number of classes
+                print(f"External init detection - variance: {init_variance:.4f}, entropy: {init_entropy:.4f}, violations: {init_constraint_violations}, n_classes: {n_classes}")
+            
+            # Refined detection thresholds
             if n_classes == 2:
-                # Binary case: max entropy is log(2) ≈ 0.693
-                is_truly_external = init_variance < 0.3 and init_entropy > 0.3
+                # Binary case: more lenient for external detection
+                is_truly_external = (init_variance < 0.35 and init_entropy > 0.25) or init_constraint_violations > 0
             else:
                 # Multi-class: normalize by max possible entropy
                 max_entropy = np.log(n_classes)
                 normalized_entropy = init_entropy / max_entropy
                 # Use class-count normalized variance
                 normalized_variance = init_variance / (n_classes - 1)
-                is_truly_external = normalized_variance < 10.0 and normalized_entropy > 0.7
+                is_truly_external = (normalized_variance < 12.0 and normalized_entropy > 0.65) or init_constraint_violations > 0
         else:
             is_truly_external = False
         
         # Enhanced temperature schedule with cyclical components
         if is_external_init and is_truly_external:
-            temperature_start = 0.85   # Reduced from 0.94 for faster convergence
-            temperature_end = 0.18     # Lower final temperature for precision
-            temperature_half_life = 0.35  # Slightly slower decay
-            temperature_cycle_amplitude = 0.005  # Very minimal cyclical
+            temperature_start = 0.92   # Higher for better exploration with memory pool
+            temperature_end = 0.15     # Lower final temperature for precision
+            temperature_half_life = 0.38  # Slower decay for extended exploration
+            temperature_cycle_amplitude = 0.008  # Small cyclical component
         elif is_external_init:
             temperature_start = 0.90   # Moderate start for pseudo-external
             temperature_end = 0.20     # Lower final temperature
@@ -835,13 +965,13 @@ class MilCountBasedMultiClassLearner:
         
         # Adjust prototype parameters based on initialization type
         if is_external_init and is_truly_external:
-            prototype_temperature = 0.06  # Much sharper for external init
+            prototype_temperature = 0.08  # Slightly higher for better flexibility with memory pool
             prototype_update_interval = 3  # More frequent updates
-            prototype_update_momentum = 0.8  # Higher momentum
+            prototype_update_momentum = 0.85  # Higher momentum for stability
         
         # Adaptive prototype update parameters
         prototype_update_interval = 5 if not (is_external_init and is_truly_external) else 3
-        prototype_update_momentum = 0.7 if not (is_external_init and is_truly_external) else 0.8
+        prototype_update_momentum = 0.7 if not (is_external_init and is_truly_external) else 0.85
         instance_prototype_assignments = np.zeros(len(all_instances), dtype=int)  # Track assignments
         
         # Enhanced STKIM parameters with curriculum
@@ -855,6 +985,18 @@ class MilCountBasedMultiClassLearner:
         count_loss_weight_end = 0.15  # Higher ending weight for better constraint satisfaction
         count_loss_schedule = "cosine"  # Cosine schedule for smoother transition
         count_loss_warmup = 2  # Warmup iterations before count loss
+        
+        # Initialize IES (Instance-dependent Early Stopping) tracking
+        ies_history = []  # Track probability and label history per bag
+        for _ in range(n_bags):
+            ies_history.append({
+                'probs': [],
+                'labels': []
+            })
+        
+        # Initialize Pseudo-Bag Memory Pool
+        memory_pool = PseudoBagMemoryPool(pool_size=200, n_classes=n_classes)
+        use_memory_pool = is_external_init and is_truly_external  # Enable for true external init
         
         for i_iter in range(max_iter):
             # Enhanced temperature schedule with cyclical component
@@ -957,12 +1099,24 @@ class MilCountBasedMultiClassLearner:
                 n_instances = len(bags[i_bag])
                 probs = fs[i_bag]  # Shape: (n_instances, n_classes)
                 
+                # Update IES history
+                ies_history[i_bag]['probs'].append(probs.copy())
+                ies_history[i_bag]['labels'].append(y[i_bag].copy())
+                
                 # Get current class counts
                 class_count_dict = pd.Series(y[i_bag]).value_counts().to_dict()
                 
                 # Track which instances have been reassigned in this iteration
                 changed_indices = set()
                 new_y = y[i_bag].copy()
+                
+                # Compute IES mask (instances that have converged)
+                ies_mask = compute_instance_early_stopping_mask(
+                    ies_history[i_bag]['probs'],
+                    ies_history[i_bag]['labels'],
+                    confidence_threshold=0.01,
+                    min_history=3
+                )
                 
                 # Adaptive confidence-based freezing
                 frozen_indices = set()
@@ -980,10 +1134,11 @@ class MilCountBasedMultiClassLearner:
                     attr_threshold = np.percentile(attr_scores, 80)  # Top 20% by attributes
                     
                     for idx in range(n_instances):
-                        # Enhanced freezing: high confidence AND consistent AND high attribute score
-                        if (max_probs[idx] > confidence_threshold and 
-                            y[i_bag][idx] == predicted_classes[idx] and
-                            attr_scores[idx] > attr_threshold):
+                        # Enhanced freezing: high confidence AND consistent AND high attribute score OR IES converged
+                        if ((max_probs[idx] > confidence_threshold and 
+                             y[i_bag][idx] == predicted_classes[idx] and
+                             attr_scores[idx] > attr_threshold) or 
+                            ies_mask[idx]):
                             frozen_indices.add(idx)
                 
                 # For binary classification, use exact k-of-n solver
@@ -1355,6 +1510,37 @@ class MilCountBasedMultiClassLearner:
                 if not has_changed:
                     prototype_temperature *= 0.95  # Reduce temperature when stable
 
+            # Update memory pool with high-confidence instances
+            if use_memory_pool and i_iter > 1:
+                # Collect high-confidence instances
+                all_probs = np.vstack(fs)
+                all_labels = np.hstack(y)
+                all_features = np.vstack(bags)
+                
+                # Compute importance scores (max probability * attribute score)
+                max_probs = np.max(all_probs, axis=1)
+                attr_scores = compute_attribute_scores(all_probs)
+                importance_scores = max_probs * attr_scores
+                
+                # Update memory pool with top instances
+                high_conf_mask = max_probs > 0.85
+                if np.any(high_conf_mask):
+                    memory_pool.update(
+                        all_features[high_conf_mask],
+                        all_labels[high_conf_mask],
+                        importance_scores[high_conf_mask]
+                    )
+                
+                # Train on pseudo-bags for better generalization
+                if i_iter > 3 and len(memory_pool.memory[0]) > 10:
+                    for _ in range(3):  # Multiple pseudo-bag iterations
+                        pseudo_features, pseudo_labels = memory_pool.get_pseudo_bag(size=20)
+                        if len(pseudo_features) > 0:
+                            # Augment training data with pseudo-bag
+                            aug_features = np.vstack([flatten_bags, pseudo_features])
+                            aug_labels = np.hstack([flatten_y, pseudo_labels])
+                            self.classifier.fit(aug_features, aug_labels)
+            
             # Continue to iteration 9 for evaluation, even if converged
             min_iterations = 9
             if not has_changed and i_iter >= 4:
