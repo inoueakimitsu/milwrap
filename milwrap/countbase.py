@@ -109,6 +109,49 @@ def smooth_topk(scores: NDArray[np.float64], k: float, temperature: float = 1.0)
     return smooth_scores
 
 
+def gumbel_topk(scores: NDArray[np.float64], k: int, temperature: float = 1.0) -> NDArray[np.float64]:
+    """Gumbel-Top-k operator for stochastic differentiable top-k selection.
+    
+    Based on Kool et al. 2019 "Stochastic Beams": adds Gumbel noise to enable
+    stochastic sampling while maintaining differentiability.
+    
+    Args:
+        scores: Input scores to select from.
+        k: Number of elements to select.
+        temperature: Temperature parameter for Gumbel-Softmax.
+        
+    Returns:
+        Soft selection weights (probabilistic k-hot vector).
+    """
+    n = len(scores)
+    if n == 0 or k <= 0:
+        return np.zeros(n)
+    if k >= n:
+        return np.ones(n)
+    
+    # Generate Gumbel noise
+    eps = 1e-8
+    uniform = np.random.uniform(0, 1, size=n)
+    gumbel_noise = -np.log(-np.log(uniform + eps) + eps)
+    
+    # Add Gumbel noise to scores and apply temperature
+    perturbed_scores = (scores + gumbel_noise) / temperature
+    
+    # Get top-k indices
+    top_k_indices = np.argpartition(perturbed_scores, -k)[-k:]
+    
+    # Compute softmax over the top-k elements only
+    top_k_scores = perturbed_scores[top_k_indices]
+    exp_scores = np.exp(top_k_scores - np.max(top_k_scores))  # Numerical stability
+    softmax_probs = exp_scores / (np.sum(exp_scores) + eps)
+    
+    # Create sparse mask
+    mask = np.zeros(n)
+    mask[top_k_indices] = softmax_probs
+    
+    return mask
+
+
 def compute_margin_aware_confidence(probs: NDArray[np.float64], target_class: int, margin_lambda: float = 0.25) -> float:
     """Compute margin-aware confidence scores.
     
@@ -204,19 +247,20 @@ def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margi
     return assignments
 
 
-def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=None, aem_scores=None):
-    """Solve soft k-of-n assignment using smooth top-k operator.
+def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=None, aem_scores=None, use_gumbel=False):
+    """Solve soft k-of-n assignment using smooth top-k or Gumbel-Top-k operator.
     
     Find soft assignment weights such that sum approximates the optimal k
-    within [k_min, k_max] range, using differentiable ST_k operator.
+    within [k_min, k_max] range, using differentiable operators.
     
     Args:
         probs: probabilities for positive class (n_instances,)
         k_min: minimum number of positive instances
         k_max: maximum number of positive instances  
-        temperature: temperature for ST_k operator
+        temperature: temperature for ST_k/GT_k operator
         margin_scores: margin-based scores for weighting (optional)
         aem_scores: AEM-based scores for weighting (optional)
+        use_gumbel: whether to use Gumbel-Top-k (True) or Smooth Top-k (False)
         
     Returns:
         soft_assignments: continuous weights in [0, 1]
@@ -246,8 +290,13 @@ def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=N
     best_score = -np.inf
     
     for k in range(max(0, k_min), min(n, k_max) + 1):
-        # Use ST_k to get soft assignments
-        soft_weights = smooth_topk(log_odds, k, temperature)
+        # Choose operator based on phase
+        if use_gumbel:
+            # Use Gumbel-Top-k for exploration phase
+            soft_weights = gumbel_topk(log_odds, k, temperature)
+        else:
+            # Use Smooth Top-k for exploitation phase
+            soft_weights = smooth_topk(log_odds, k, temperature)
         
         # Score is expected log probability
         score = np.sum(soft_weights * np.log(probs + eps))
@@ -256,8 +305,11 @@ def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=N
             best_score = score
             best_k = k
     
-    # Return soft assignments for best k
-    return smooth_topk(log_odds, best_k, temperature)
+    # Return soft assignments for best k using appropriate operator
+    if use_gumbel:
+        return gumbel_topk(log_odds, best_k, temperature)
+    else:
+        return smooth_topk(log_odds, best_k, temperature)
 
 
 def get_order_based_initial_bag_labels(
@@ -411,9 +463,15 @@ class MilCountBasedMultiClassLearner:
         # Initialize simple parameters
         n_bags = len(bags)
         
-        # Independent temperature schedule for ST_k
-        temperature_start = 0.9   # Lower starting temperature (detached from AEM)
-        temperature_end = 0.25    # Higher final temperature to maintain gradient flow
+        # Independent temperature schedules for GT-k and ST-k
+        # Gumbel-Top-k needs higher temperature for proper exploration
+        gumbel_temp_start = 1.5   # Higher starting temperature for Gumbel
+        gumbel_temp_end = 0.5     # Higher end temperature for Gumbel
+        
+        # Smooth Top-k temperature schedule
+        smooth_temp_start = 0.9   # Lower starting temperature
+        smooth_temp_end = 0.25    # Lower final temperature
+        
         temperature_half_life = 0.25  # Temperature half-life as fraction of total iterations
         
         # Self-paced learning: track bag difficulty scores
@@ -424,17 +482,31 @@ class MilCountBasedMultiClassLearner:
         margin_lambda = 0.3   # Slightly increased margin importance
         
         for i_iter in range(max_iter):
-            # Independent exponential temperature decay with half-life
-            temperature = max(temperature_end, 
-                            temperature_start * 0.5 ** (i_iter / (temperature_half_life * max_iter)))
-            
             # Staged AEM schedule: cosine annealing for first 60% of iterations
-            exploration_phase_end = int(np.ceil(max_iter * 0.6))  # Use ceiling to ensure proper duration
+            exploration_phase_end = int(np.ceil(max_iter * 0.6))
+            
+            # Limit Gumbel exploration to first 2 iterations only
+            gumbel_iterations = 2  # Hard limit on stochastic exploration
+            
+            # Phase-dependent temperature schedule
             if i_iter < exploration_phase_end:
+                # Use Gumbel only in very early iterations
+                if i_iter < gumbel_iterations:
+                    # Rapid temperature decay for Gumbel
+                    temperature = gumbel_temp_start * (0.5 ** i_iter)  # 1.5 -> 0.75 -> 0.375
+                else:
+                    # Switch to deterministic Smooth Top-k early
+                    temperature = max(smooth_temp_end, 
+                                    smooth_temp_start * 0.5 ** ((i_iter - gumbel_iterations) / (temperature_half_life * max_iter)))
+                
                 # Cosine annealing from 0 to max during exploration
                 aem_lambda_max = 0.5  # Increased from 0.3
                 aem_lambda = aem_lambda_max * 0.5 * (1 - np.cos(np.pi * i_iter / exploration_phase_end))
             else:
+                # Smooth Top-k temperature for exploitation phase
+                phase_progress = (i_iter - exploration_phase_end) / (max_iter - exploration_phase_end)
+                temperature = max(smooth_temp_end, 
+                                smooth_temp_start * 0.5 ** (phase_progress / temperature_half_life))
                 # Keep small AEM value during exploitation phase
                 aem_lambda = 0.05  # Small constant instead of 0
             
@@ -536,11 +608,15 @@ class MilCountBasedMultiClassLearner:
                         if aem_lambda > 0:
                             aem_scores = compute_attention_entropy_maximization(probs[active_indices], aem_lambda)
                         
-                        # Always use soft assignment with ST_k for differentiability
+                        # Use Gumbel-Top-k only during first 2 iterations
+                        use_gumbel = i_iter < 2
+                        
+                        # Always use soft assignment for differentiability
                         soft_weights = soft_k_of_n_assignment(
                             active_probs, k_min_active, k_max_active, 
                             temperature=temperature,  # Use the independent temperature schedule
-                            margin_scores=margin_scores, aem_scores=aem_scores
+                            margin_scores=margin_scores, aem_scores=aem_scores,
+                            use_gumbel=use_gumbel
                         )
                         
                         # Straight-through estimator: hard assignment for forward, soft for backward
@@ -736,7 +812,12 @@ class MilCountBasedMultiClassLearner:
                 bag_difficulty[i_bag] = constraint_violation + count_loss
 
             if debug:
-                print(f"iter: {i_iter}, temperature: {temperature:.3f}, aem_lambda: {aem_lambda:.3f}")
+                # Check which operator is being used
+                if i_iter < gumbel_iterations:
+                    operator = "Gumbel-Top-k"
+                else:
+                    operator = "Smooth-Top-k"
+                print(f"iter: {i_iter}, operator: {operator}, temperature: {temperature:.3f}, aem_lambda: {aem_lambda:.3f}")
                 predicted_count = np.nan_to_num(
                     pd.DataFrame([pd.Series(b).value_counts().to_dict() for b in y])[list(range(n_classes))].values,
                 )
