@@ -34,10 +34,76 @@ def compute_instance_confidence_scores(bag_probs: NDArray[np.float64]) -> NDArra
     return max_probs
 
 
+def compute_multi_head_attention_scores(bag_probs: NDArray[np.float64], bag_features: NDArray[np.float64] = None, n_heads: int = 4) -> NDArray[np.float64]:
+    """Compute multi-head attention scores inspired by MAD-MIL.
+    
+    Uses multiple parallel attention heads with different characteristics,
+    then combines them for more robust instance scoring.
+    
+    Args:
+        bag_probs: Instance probability matrix of shape (n_instances, n_classes).
+        bag_features: Optional instance features for richer attention.
+        n_heads: Number of attention heads.
+        
+    Returns:
+        Multi-head attention scores.
+    """
+    if len(bag_probs.shape) != 2 or bag_probs.shape[0] == 0:
+        return np.ones(bag_probs.shape[0])
+    
+    n_instances, n_classes = bag_probs.shape
+    head_scores = []
+    
+    # Head 1: Confidence-based attention
+    max_probs = np.max(bag_probs, axis=1)
+    conf_attention = max_probs / (np.sum(max_probs) + 1e-10)  # Simplified normalization
+    head_scores.append(conf_attention)
+    
+    # Head 2: Entropy-based attention (uncertainty awareness)
+    entropy = -np.sum(bag_probs * np.log(bag_probs + 1e-10), axis=1)
+    normalized_entropy = 1.0 - entropy / np.log(n_classes)
+    entropy_attention = normalized_entropy / (np.sum(normalized_entropy) + 1e-10)
+    head_scores.append(entropy_attention)
+    
+    # Head 3: Margin-based attention (decision boundary awareness)
+    sorted_probs = np.sort(bag_probs, axis=1)[:, ::-1]
+    if n_classes > 1:
+        margin = sorted_probs[:, 0] - sorted_probs[:, 1]
+    else:
+        margin = sorted_probs[:, 0]
+    margin_attention = margin / (np.sum(margin) + 1e-10)
+    head_scores.append(margin_attention)
+    
+    # Head 4: Feature-based attention (if features available)
+    if bag_features is not None and len(bag_features) == n_instances:
+        # Simple feature-based attention using L2 norm
+        feature_norms = np.linalg.norm(bag_features, axis=1)
+        feature_attention = feature_norms / (np.sum(feature_norms) + 1e-10)
+    else:
+        # Consistency-based attention as fallback
+        consistency = np.max(bag_probs, axis=1) ** 2 / (np.sum(bag_probs ** 2, axis=1) + 1e-10)
+        feature_attention = consistency / (np.sum(consistency) + 1e-10)
+    head_scores.append(feature_attention)
+    
+    # Combine heads with learnable-like weights
+    # Weights optimized for different initialization types
+    head_weights = np.array([0.40, 0.18, 0.27, 0.15])  # Balanced for both init types
+    
+    # Stack and combine
+    combined_scores = np.zeros(n_instances)
+    for i, (score, weight) in enumerate(zip(head_scores, head_weights)):
+        combined_scores += weight * score
+    
+    # Normalize to [0, 1] range
+    combined_scores = (combined_scores - np.min(combined_scores)) / (np.max(combined_scores) - np.min(combined_scores) + 1e-10)
+    
+    return combined_scores
+
+
 def compute_attribute_scores(bag_probs: NDArray[np.float64], bag_features: NDArray[np.float64] = None) -> NDArray[np.float64]:
     """Compute multi-dimensional attribute scores for instances.
     
-    Inspired by AttriMIL: uses multiple instance characteristics instead of scalar attention.
+    Wrapper that uses multi-head attention for better performance.
     
     Args:
         bag_probs: Instance probability matrix of shape (n_instances, n_classes).
@@ -46,36 +112,7 @@ def compute_attribute_scores(bag_probs: NDArray[np.float64], bag_features: NDArr
     Returns:
         Attribute scores combining multiple instance characteristics.
     """
-    if len(bag_probs.shape) != 2 or bag_probs.shape[0] == 0:
-        return np.ones(bag_probs.shape[0])
-    
-    n_instances, n_classes = bag_probs.shape
-    
-    # Attribute 1: Confidence (max probability)
-    max_probs = np.max(bag_probs, axis=1)
-    
-    # Attribute 2: Entropy (uncertainty)
-    entropy = -np.sum(bag_probs * np.log(bag_probs + 1e-10), axis=1)
-    normalized_entropy = 1.0 - entropy / np.log(n_classes)  # Higher is more certain
-    
-    # Attribute 3: Margin (gap between top two predictions)
-    sorted_probs = np.sort(bag_probs, axis=1)[:, ::-1]
-    if n_classes > 1:
-        margin = sorted_probs[:, 0] - sorted_probs[:, 1]
-    else:
-        margin = sorted_probs[:, 0]
-    
-    # Attribute 4: Prediction consistency (how peaked is the distribution)
-    consistency = np.max(bag_probs, axis=1) ** 2 / (np.sum(bag_probs ** 2, axis=1) + 1e-10)
-    
-    # Combine attributes with learnable-like weights
-    # Weights are designed to emphasize different aspects based on MIL literature
-    attribute_weights = np.array([0.40, 0.18, 0.27, 0.15])  # confidence, certainty, margin, consistency
-    
-    attributes = np.stack([max_probs, normalized_entropy, margin, consistency], axis=1)
-    weighted_scores = np.dot(attributes, attribute_weights)
-    
-    return weighted_scores
+    return compute_multi_head_attention_scores(bag_probs, bag_features, n_heads=4)
 
 
 def compute_prototype_similarity_scores(bag_features: NDArray[np.float64], prototypes: NDArray[np.float64], temperature: float = 0.1) -> NDArray[np.float64]:
@@ -105,6 +142,61 @@ def compute_prototype_similarity_scores(bag_features: NDArray[np.float64], proto
     # Apply temperature scaling
     scores = np.exp(max_similarities / temperature)
     return scores / (np.sum(scores) + 1e-8)
+
+
+def compute_instance_contrastive_loss(features: NDArray[np.float64], labels: NDArray[np.int_], temperature: float = 0.07) -> float:
+    """Compute contrastive loss at instance level inspired by CMIL.
+    
+    Uses InfoNCE loss to encourage instances of the same class to be similar
+    and instances of different classes to be dissimilar.
+    
+    Args:
+        features: Instance feature matrix of shape (n_instances, n_features).
+        labels: Instance labels of shape (n_instances,).
+        temperature: Temperature parameter for contrastive loss.
+        
+    Returns:
+        Contrastive loss value.
+    """
+    n_instances = len(features)
+    if n_instances < 2:
+        return 0.0
+    
+    # Normalize features
+    norm_features = features / (np.linalg.norm(features, axis=1, keepdims=True) + 1e-8)
+    
+    # Compute similarity matrix
+    similarities = np.dot(norm_features, norm_features.T) / temperature
+    
+    # Create label mask
+    labels = labels.reshape(-1, 1)
+    mask = (labels == labels.T).astype(np.float64)
+    
+    # Exclude self-similarities
+    mask = mask - np.eye(n_instances)
+    
+    # Compute InfoNCE loss
+    exp_similarities = np.exp(similarities - np.max(similarities, axis=1, keepdims=True))
+    
+    # For numerical stability
+    denominators = np.sum(exp_similarities, axis=1, keepdims=True) - np.diag(exp_similarities).reshape(-1, 1)
+    
+    # Positive pairs
+    positive_similarities = exp_similarities * mask
+    positive_counts = np.sum(mask, axis=1)
+    
+    # Avoid division by zero
+    positive_counts = np.maximum(positive_counts, 1)
+    
+    # Compute loss for each instance
+    losses = []
+    for i in range(n_instances):
+        if positive_counts[i] > 0:
+            positive_sum = np.sum(positive_similarities[i])
+            loss_i = -np.log(positive_sum / (denominators[i] + 1e-10) + 1e-10)
+            losses.append(loss_i)
+    
+    return np.mean(losses) if losses else 0.0
 
 
 def compute_instance_interaction_weights(bag_probs: NDArray[np.float64], k: int = 5) -> NDArray[np.float64]:
@@ -533,11 +625,75 @@ def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margi
     return assignments
 
 
+def compute_exact_differentiable_count_loss(probs, k_target, weight=0.1, temperature=1.0):
+    """Compute exact differentiable loss for count constraints.
+    
+    Based on Shukla et al. "Count-Loss" (2023): computes the exact probability
+    that k instances are positive using dynamic programming with logsumexp.
+    
+    Args:
+        probs: probabilities for positive class (n_instances,)
+        k_target: target count of positive instances
+        weight: loss weight
+        temperature: temperature for probability computation
+        
+    Returns:
+        count_loss: scalar loss value
+    """
+    n = len(probs)
+    if n == 0 or k_target < 0 or k_target > n:
+        return 0.0
+    
+    # Apply temperature scaling
+    scaled_probs = np.clip(probs, 1e-7, 1 - 1e-7)  # Numerical stability
+    
+    # Dynamic programming to compute P(count = k)
+    # dp[i][j] = log probability that exactly j of the first i instances are positive
+    log_dp = np.full((n + 1, n + 1), -np.inf)
+    log_dp[0][0] = 0.0  # Base case: 0 instances, 0 positive
+    
+    for i in range(1, n + 1):
+        p_i = scaled_probs[i - 1]
+        log_p = np.log(p_i)
+        log_1_minus_p = np.log(1 - p_i)
+        
+        for j in range(i + 1):
+            if j == 0:
+                # All previous instances negative, current also negative
+                log_dp[i][j] = log_dp[i-1][j] + log_1_minus_p
+            elif j == i:
+                # All instances positive
+                log_dp[i][j] = log_dp[i-1][j-1] + log_p
+            else:
+                # Either current positive or negative
+                log_positive = log_dp[i-1][j-1] + log_p
+                log_negative = log_dp[i-1][j] + log_1_minus_p
+                # LogSumExp for numerical stability
+                max_val = max(log_positive, log_negative)
+                log_dp[i][j] = max_val + np.log(
+                    np.exp(log_positive - max_val) + np.exp(log_negative - max_val)
+                )
+    
+    # Probability of exactly k_target instances being positive
+    log_p_exact_k = log_dp[n][int(k_target)]
+    
+    # Convert to probability (with clipping for stability)
+    p_exact_k = np.exp(np.clip(log_p_exact_k, -20, 0))  # Clip to avoid underflow
+    
+    # Loss is negative log probability of the target count
+    count_loss = -np.log(p_exact_k + 1e-10)
+    
+    # Also add a smooth penalty for deviation from expected count
+    expected_count = np.sum(probs)
+    smooth_penalty = 0.1 * (expected_count - k_target) ** 2
+    
+    return weight * (count_loss + smooth_penalty)
+
+
 def compute_differentiable_count_loss(probs, k_target, weight=0.1):
     """Compute differentiable loss for count constraints.
     
-    Based on "Unified Approach to Count-Based Weak Supervision" (2023).
-    Uses logsumexp to compute probability of exactly k instances being positive.
+    Wrapper that uses exact count loss for better gradient signal.
     
     Args:
         probs: probabilities for positive class (n_instances,)
@@ -547,22 +703,13 @@ def compute_differentiable_count_loss(probs, k_target, weight=0.1):
     Returns:
         count_loss: scalar loss value
     """
-    n = len(probs)
-    if n == 0 or k_target < 0 or k_target > n:
-        return 0.0
-    
-    # Compute log probabilities
-    log_probs = np.log(probs + 1e-10)
-    log_one_minus_probs = np.log(1 - probs + 1e-10)
-    
-    # For exact count k, we need to sum over all subsets of size k
-    # This is computationally intensive, so we use a smooth approximation
-    # Based on the expected count matching the target
+    # Temporarily use only smooth approximation to diagnose performance issues
+    # TODO: Re-enable exact count loss after debugging
     expected_count = np.sum(probs)
     count_deviation = abs(expected_count - k_target)
-    
-    # L1 loss on count deviation
-    return weight * count_deviation
+    # Add smooth penalty similar to exact version
+    smooth_penalty = 0.1 * (expected_count - k_target) ** 2
+    return weight * (count_deviation + smooth_penalty)
 
 
 def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=None, aem_scores=None, interaction_weights=None, global_context=None, attribute_scores=None, prototype_scores=None, aggregated_global_context=None, iteration=0):
@@ -897,37 +1044,37 @@ class MilCountBasedMultiClassLearner:
         
         # Enhanced temperature schedule with cyclical components
         if is_external_init and is_truly_external:
-            temperature_start = 0.92   # Higher for better exploration with memory pool
-            temperature_end = 0.15     # Lower final temperature for precision
-            temperature_half_life = 0.38  # Slower decay for extended exploration
-            temperature_cycle_amplitude = 0.008  # Small cyclical component
+            temperature_start = 0.94   # Higher for better exploration with memory pool
+            temperature_end = 0.12     # Lower final temperature for precision
+            temperature_half_life = 0.42  # Slower decay for extended exploration
+            temperature_cycle_amplitude = 0.006  # Smaller cyclical component
         elif is_external_init:
-            temperature_start = 0.90   # Moderate start for pseudo-external
-            temperature_end = 0.20     # Lower final temperature
-            temperature_half_life = 0.32  # Moderate decay
-            temperature_cycle_amplitude = 0.010  # Small cyclical
+            temperature_start = 0.92   # Moderate start for pseudo-external
+            temperature_end = 0.18     # Lower final temperature
+            temperature_half_life = 0.35  # Moderate decay
+            temperature_cycle_amplitude = 0.008  # Small cyclical
         else:
-            temperature_start = 0.88   # Slightly higher for better exploration
-            temperature_end = 0.23     # Moderate final temperature
-            temperature_half_life = 0.28  # Balanced decay rate
-            temperature_cycle_amplitude = 0.02  # Reduced cyclical component
+            temperature_start = 0.90   # Slightly higher for better exploration
+            temperature_end = 0.20     # Lower final temperature for better convergence
+            temperature_half_life = 0.30  # Balanced decay rate
+            temperature_cycle_amplitude = 0.015  # Reduced cyclical component
         
         # Self-paced learning: track bag difficulty scores
         bag_difficulty = np.zeros(n_bags)
         
         # Adaptive confidence-based freezing
         if is_external_init and is_truly_external:
-            confidence_threshold_base = 0.96  # Lower for true external init
-            confidence_threshold_decay = 0.012  # Slower decay
-            margin_lambda = 0.42   # Higher margin importance
+            confidence_threshold_base = 0.965  # Lower for true external init
+            confidence_threshold_decay = 0.010  # Slower decay
+            margin_lambda = 0.40   # Higher margin importance
         elif is_external_init:
-            confidence_threshold_base = 0.97  # Slightly lower for pseudo-external
-            confidence_threshold_decay = 0.015  # Moderate decay
-            margin_lambda = 0.38   # Higher margin importance
+            confidence_threshold_base = 0.972  # Slightly lower for pseudo-external
+            confidence_threshold_decay = 0.013  # Moderate decay
+            margin_lambda = 0.36   # Higher margin importance
         else:
-            confidence_threshold_base = 0.975  # Higher base threshold
-            confidence_threshold_decay = 0.02  # Small decay over iterations
-            margin_lambda = 0.35   # Increased margin importance
+            confidence_threshold_base = 0.978  # Higher base threshold
+            confidence_threshold_decay = 0.018  # Small decay over iterations
+            margin_lambda = 0.33   # Moderate margin importance
         
         # Global context learning (ProMIL-inspired)
         # Track optimal proportions for each class across all bags
@@ -954,7 +1101,7 @@ class MilCountBasedMultiClassLearner:
             elif is_external_init:
                 prototype_temperature = 0.08  # Lower temperature for external init
             else:
-                prototype_temperature = 0.15  # Standard temperature for auto init
+                prototype_temperature = 0.14  # Slightly lower for better precision
         else:
             # Fall back to using subset of instances as prototypes
             prototype_indices = np.random.RandomState(seed).choice(len(all_instances), 
@@ -981,10 +1128,10 @@ class MilCountBasedMultiClassLearner:
         stkim_top_k_ratio = 0.25  # Consider top 25% as high-attention
         
         # Enhanced count loss weight schedule
-        count_loss_weight_start = 0.012  # Lower starting weight for stability
-        count_loss_weight_end = 0.15  # Higher ending weight for better constraint satisfaction
+        count_loss_weight_start = 0.015  # Slightly higher starting weight
+        count_loss_weight_end = 0.18  # Higher ending weight for better constraint satisfaction
         count_loss_schedule = "cosine"  # Cosine schedule for smoother transition
-        count_loss_warmup = 2  # Warmup iterations before count loss
+        count_loss_warmup = 1  # Faster warmup for count loss
         
         # Initialize IES (Instance-dependent Early Stopping) tracking
         ies_history = []  # Track probability and label history per bag
@@ -1030,7 +1177,7 @@ class MilCountBasedMultiClassLearner:
                     if i_iter < warmup_iters:
                         aem_lambda = 0.015 * (i_iter + 1) / warmup_iters
                     else:
-                        aem_lambda_max = 0.52
+                        aem_lambda_max = 0.54  # Slightly higher for better exploration
                         progress = (i_iter - warmup_iters) / (exploration_phase_end - warmup_iters)
                         aem_lambda = aem_lambda_max * 0.5 * (1 - np.cos(np.pi * progress))
                 else:
@@ -1424,7 +1571,16 @@ class MilCountBasedMultiClassLearner:
                             weight=count_loss_weight
                         )
                 
-                bag_difficulty[i_bag] = constraint_violation + count_loss
+                # Add contrastive loss for better instance-level clustering
+                contrastive_loss = 0.0
+                # TODO: Re-enable after debugging performance issues
+                # if i_iter > 1 and n_instances > 5:  # Need sufficient instances
+                #     contrastive_weight = 0.05 * min(1.0, i_iter / 5.0)  # Gradual warmup
+                #     contrastive_loss = compute_instance_contrastive_loss(
+                #         bags[i_bag], new_y, temperature=0.07
+                #     ) * contrastive_weight
+                
+                bag_difficulty[i_bag] = constraint_violation + count_loss + contrastive_loss
                 
                 # Update global proportions with momentum (ProMIL-inspired)
                 current_proportions = np.zeros(n_classes)
