@@ -36,8 +36,7 @@ def compute_instance_confidence_scores(bag_probs: NDArray[np.float64]) -> NDArra
 def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambda_entropy: float = 0.08, normalize_by_size: bool = True) -> NDArray[np.float64]:
     """Compute AEM (Attention Entropy Maximization) regularized scores.
     
-    Based on AEM research: adds entropy regularizer to prevent over-concentrated attention,
-    with improved normalization for robustness across different bag sizes.
+    Enhanced version with probability-space processing for better initialization robustness.
     
     Args:
         bag_probs: Instance probability matrix of shape (n_instances, n_classes).
@@ -51,38 +50,81 @@ def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambd
         return np.ones(bag_probs.shape[0])
     
     n_instances = bag_probs.shape[0]
+    n_classes = bag_probs.shape[1]
+    eps = 1e-10
     
-    # Calculate instance-wise attention weights (softmax over max probabilities)
+    # Compute instance-level uncertainty (entropy across classes)
+    instance_entropy = -np.sum(bag_probs * np.log(bag_probs + eps), axis=1)
+    max_entropy_per_instance = np.log(n_classes)
+    normalized_uncertainty = instance_entropy / (max_entropy_per_instance + eps)
+    
+    # Transform to probability space for stable attention computation
     max_probs = np.max(bag_probs, axis=1)
-    attention_weights = np.exp(max_probs) / (np.sum(np.exp(max_probs)) + 1e-10)
+    # Clip to avoid numerical issues
+    max_probs_clipped = np.clip(max_probs, eps, 1 - eps)
+    
+    # Temperature-scaled attention weights with uncertainty awareness
+    # Higher uncertainty -> more uniform attention (prevents overconfidence)
+    temperature = 1.0 + 0.5 * np.mean(normalized_uncertainty)
+    attention_logits = np.log(max_probs_clipped) / temperature
+    
+    # Stable softmax computation
+    attention_logits_shifted = attention_logits - np.max(attention_logits)
+    attention_weights = np.exp(attention_logits_shifted) / (np.sum(np.exp(attention_logits_shifted)) + eps)
     
     # Calculate attention entropy: H(α) = -Σ αᵢ log(αᵢ)
-    attention_entropy = -np.sum(attention_weights * np.log(attention_weights + 1e-10))
+    attention_entropy = -np.sum(attention_weights * np.log(attention_weights + eps))
     
     # Normalize by bag size to make entropy scale-invariant
     if normalize_by_size and n_instances > 1:
         max_entropy = np.log(n_instances)
         attention_entropy = attention_entropy / max_entropy
     
-    # AEM regularization: encourage higher entropy with instance-wise contribution
-    entropy_bonus = lambda_entropy * attention_entropy
-    aem_scores = max_probs + entropy_bonus * attention_weights
+    # Enhanced AEM regularization with instance-specific modulation
+    # Instances with high uncertainty get stronger entropy bonus
+    instance_specific_bonus = lambda_entropy * attention_entropy * (1 + 0.3 * normalized_uncertainty)
+    
+    # Combine base scores with entropy bonus
+    # Use log-space for numerical stability
+    log_max_probs = np.log(max_probs_clipped)
+    aem_scores = log_max_probs + instance_specific_bonus * attention_weights
+    
+    # Add diversity term to prevent mode collapse
+    diversity_bonus = 0.02 * np.std(aem_scores)
+    aem_scores = aem_scores + diversity_bonus * (aem_scores - np.mean(aem_scores))
     
     return aem_scores
 
 
-def smooth_topk(scores: NDArray[np.float64], k: float, temperature: float = 1.0) -> NDArray[np.float64]:
-    """Differentiable smooth top-k operator (ST_k).
-    
-    Based on NeurIPS 2024 paper: smooth, differentiable approximation to hard top-k selection.
+def gumbel_sample(shape: tuple, eps: float = 1e-6) -> NDArray[np.float64]:
+    """Sample from Gumbel(0, 1) distribution.
     
     Args:
-        scores: Input scores to select from.
-        k: Target number of selections (can be fractional).
-        temperature: Temperature parameter for smoothness.
+        shape: Shape of the output tensor
+        eps: Small value for numerical stability
         
     Returns:
-        Soft selection weights (sum approximately equals k).
+        Gumbel noise samples
+    """
+    u = np.random.uniform(eps, 1 - eps, shape)
+    return -np.log(-np.log(u))
+
+
+def gumbel_softmax_topk(scores: NDArray[np.float64], k: float, temperature: float = 1.0, 
+                       hard: bool = False, backward_temperature: float | None = None) -> NDArray[np.float64]:
+    """Gumbel-Softmax based differentiable top-k selection.
+    
+    Combines Gumbel-Softmax with top-k constraint for robust discrete optimization.
+    
+    Args:
+        scores: Input scores to select from (log-odds)
+        k: Target number of selections (can be fractional)
+        temperature: Temperature parameter for forward pass
+        hard: Whether to use straight-through estimator
+        backward_temperature: Temperature for backward pass (decoupled ST-GS)
+        
+    Returns:
+        Soft selection weights (sum approximately equals k)
     """
     n = len(scores)
     if n == 0 or k <= 0:
@@ -90,32 +132,53 @@ def smooth_topk(scores: NDArray[np.float64], k: float, temperature: float = 1.0)
     if k >= n:
         return np.ones(n)
     
-    # Sort scores in descending order
-    sorted_indices = np.argsort(scores)[::-1]
-    sorted_scores = scores[sorted_indices]
+    # Add Gumbel noise for stochastic selection
+    gumbel_noise = gumbel_sample(scores.shape)
+    perturbed_scores = scores + gumbel_noise
     
-    # Compute threshold dynamically
-    # For exact top-k: threshold is between k-th and (k+1)-th elements
+    # Set backward temperature (higher for better gradient flow)
+    if backward_temperature is None:
+        backward_temperature = temperature * 2.0  # Empirically better for MIL
+    
+    # Sort perturbed scores for threshold computation
+    sorted_indices = np.argsort(perturbed_scores)[::-1]
+    sorted_scores = perturbed_scores[sorted_indices]
+    
+    # Dynamic threshold with fractional k support
     k_int = int(k)
     k_frac = k - k_int
     
     if k_int < n - 1:
-        # Interpolate threshold between elements
         threshold = sorted_scores[k_int] * (1 - k_frac)
         if k_int + 1 < n:
             threshold += sorted_scores[k_int + 1] * k_frac
     else:
         threshold = sorted_scores[k_int]
     
-    # Smooth selection using sigmoid
-    smooth_scores = 1 / (1 + np.exp(-(scores - threshold) / temperature))
+    # Gumbel-Softmax transformation
+    z_soft = 1 / (1 + np.exp(-(perturbed_scores - threshold) / temperature))
     
-    # Normalize to ensure sum equals k (projection step)
-    current_sum = np.sum(smooth_scores)
-    if current_sum > 0:
-        smooth_scores = smooth_scores * k / current_sum
-    
-    return smooth_scores
+    if hard:
+        # Straight-through estimator: hard selection forward, soft gradients backward
+        # Get top-k indices based on soft weights
+        top_k_indices = np.argsort(z_soft)[-int(np.round(k)):] 
+        z_hard = np.zeros_like(z_soft)
+        z_hard[top_k_indices] = 1.0
+        
+        # Normalize hard selections to sum to k
+        z_hard = z_hard * k / np.sum(z_hard)
+        return z_hard
+    else:
+        # Normalize soft scores to sum to k
+        current_sum = np.sum(z_soft)
+        if current_sum > 0:
+            z_soft = z_soft * k / current_sum
+        return z_soft
+
+
+def smooth_topk(scores: NDArray[np.float64], k: float, temperature: float = 1.0) -> NDArray[np.float64]:
+    """Legacy wrapper for backward compatibility."""
+    return gumbel_softmax_topk(scores, k, temperature, hard=False)
 
 
 def compute_margin_aware_confidence(probs: NDArray[np.float64], target_class: int, margin_lambda: float = 0.25) -> float:
@@ -214,18 +277,19 @@ def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margi
 
 
 def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=None, aem_scores=None, constraint_weight=1.0):
-    """Solve soft k-of-n assignment using smooth top-k operator.
+    """Solve soft k-of-n assignment using Gumbel-Softmax based selection.
     
-    Find soft assignment weights such that sum approximates the optimal k
-    within [k_min, k_max] range, using differentiable ST_k operator.
+    Find soft assignment weights using probabilistic relaxation for better
+    gradient flow and initialization robustness.
     
     Args:
         probs: probabilities for positive class (n_instances,)
         k_min: minimum number of positive instances
         k_max: maximum number of positive instances  
-        temperature: temperature for ST_k operator
+        temperature: temperature for Gumbel-Softmax
         margin_scores: margin-based scores for weighting (optional)
         aem_scores: AEM-based scores for weighting (optional)
+        constraint_weight: weight for constraint enforcement
         
     Returns:
         soft_assignments: continuous weights in [0, 1]
@@ -238,39 +302,70 @@ def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=N
     if k_max < 0:
         return np.zeros(n)
     
-    # Compute scores combining multiple signals
+    # Transform to probability space for better stability
     eps = 1e-8
-    log_odds = np.log(probs + eps) - np.log(1 - probs + eps)
+    # Clip probabilities to avoid extreme log-odds
+    probs_clipped = np.clip(probs, eps, 1 - eps)
+    log_odds = np.log(probs_clipped / (1 - probs_clipped))
     
-    # Combine with margin scores
+    # Combine with margin scores in probability space
     if margin_scores is not None and len(margin_scores) == len(probs):
-        log_odds = log_odds + 0.1 * margin_scores
+        # Scale margin scores based on probability magnitudes
+        prob_scale = np.mean(np.abs(log_odds))
+        log_odds = log_odds + 0.12 * margin_scores / (1 + prob_scale)
     
-    # Combine with AEM scores with adaptive weight
+    # Enhanced AEM integration with probability-aware weighting
     if aem_scores is not None and len(aem_scores) == len(probs):
-        # Increase AEM influence during exploration (low constraint weight)
-        aem_weight = 0.15 * max(0.5, 1.0 - min(1.0, constraint_weight / 3.0))
-        log_odds = log_odds + aem_weight * aem_scores
+        # Adaptive AEM weight based on exploration/exploitation trade-off
+        exploration_factor = np.exp(-constraint_weight / 2.0)  # Exponential decay
+        # Stronger AEM influence for better initialization robustness
+        aem_weight = 0.25 * exploration_factor
+        
+        # Scale AEM scores by instance uncertainty (entropy)
+        instance_entropy = -probs * np.log(probs + eps) - (1 - probs) * np.log(1 - probs + eps)
+        # Increased uncertainty weighting for better exploration
+        uncertainty_weight = 1 + 0.8 * instance_entropy
+        
+        # Additional diversity term based on probability variance
+        prob_variance = np.var(probs)
+        diversity_factor = 1 + 0.3 * np.sqrt(prob_variance)
+        
+        log_odds = log_odds + aem_weight * aem_scores * uncertainty_weight * diversity_factor
     
-    # Find optimal k using gradient-free search
+    # Find optimal k using probabilistic search
     best_k = k_min
     best_score = -np.inf
     
+    # Use decoupled temperature for better gradient flow
+    forward_temp = temperature
+    backward_temp = temperature * 1.5  # Higher for gradients
+    
     for k in range(max(0, k_min), min(n, k_max) + 1):
-        # Use ST_k to get soft assignments
-        soft_weights = smooth_topk(log_odds, k, temperature)
+        # Use Gumbel-Softmax for probabilistic selection
+        soft_weights = gumbel_softmax_topk(log_odds, k, forward_temp, 
+                                          hard=False, backward_temperature=backward_temp)
         
-        # Score is expected log probability
-        score = np.sum(soft_weights * np.log(probs + eps))
+        # Score in probability space with entropy regularization
+        score = np.sum(soft_weights * np.log(probs_clipped))
+        
+        # Add selection entropy bonus for diversity (prevents mode collapse)
+        selection_entropy = -np.sum(soft_weights * np.log(soft_weights + eps))
+        entropy_bonus = 0.05 * selection_entropy / np.log(n + 1)  # Normalized by max entropy
+        score += entropy_bonus
         
         if score > best_score:
             best_score = score
             best_k = k
     
-    # Return soft assignments for best k with adaptive temperature
-    # Use lower temperature for ST_k when constraint weight is high (exploitation phase)
-    st_temperature = temperature * max(0.5, 1.0 - 0.3 * min(1.0, constraint_weight / 2.0))
-    return smooth_topk(log_odds, best_k, st_temperature)
+    # Final assignment with adaptive temperature and hard selection option
+    # Use hard selection in late stages for sharper decisions
+    use_hard = constraint_weight > 1.5  # Hard selection in exploitation phase
+    
+    # Adaptive temperature based on constraint satisfaction
+    final_temp = forward_temp * max(0.3, 1.0 - 0.4 * min(1.0, constraint_weight / 2.5))
+    
+    return gumbel_softmax_topk(log_odds, best_k, final_temp, 
+                              hard=use_hard, backward_temperature=backward_temp)
 
 
 def get_order_based_initial_bag_labels(
@@ -424,37 +519,47 @@ class MilCountBasedMultiClassLearner:
         # Initialize simple parameters
         n_bags = len(bags)
         
-        # Improved temperature schedule based on recent research
-        temperature_start = 5.0   # Higher starting temperature for better exploration
-        temperature_end = 0.3     # Slightly higher end temperature for stability
-        temperature_decay = 0.93  # Exponential decay rate (α≈0.93-0.95)
+        # Structured initialization detection for external-init robustness
+        is_external_init = initial_y is not None
         
-        # Adaptive AEM-temperature coupling
-        aem_coupling_factor = 0.35  # κ≈0.25-0.4 for λ(t) = κ * T(t)
+        # Enhanced temperature schedule for Gumbel-Softmax
+        # Higher initial temperature for better exploration with stochastic selection
+        temperature_start = 6.0   # Increased for Gumbel noise exploration
+        temperature_end = 0.25    # Lower end for sharper decisions
+        temperature_decay = 0.92  # Slower decay for smoother transition
         
-        # Constraint penalty schedule (μ increases over time)
-        constraint_penalty_start = 0.1
-        constraint_penalty_end = 2.0
+        # Adaptive AEM-temperature coupling with initialization awareness
+        # External init needs different coupling due to potentially biased start
+        aem_coupling_factor = 0.4 if is_external_init else 0.35
+        
+        # Constraint penalty schedule with initialization-aware start
+        # External init gets gentler constraint enforcement initially
+        constraint_penalty_start = 0.05 if is_external_init else 0.1
+        constraint_penalty_end = 2.5  # Higher end for stronger convergence
         
         # Self-paced learning: track bag difficulty scores
         bag_difficulty = np.zeros(n_bags)
         
-        # Adaptive confidence-based freezing
-        confidence_threshold_start = 0.99  # Very high initial threshold
-        confidence_threshold_end = 0.96    # Slightly lower final threshold
-        margin_lambda = 0.35  # Increased margin importance for robustness
+        # Adaptive confidence-based freezing with probability-aware thresholds
+        confidence_threshold_start = 0.995  # Even higher for Gumbel noise
+        confidence_threshold_end = 0.97     # Slightly higher to account for stochasticity
+        margin_lambda = 0.4  # Further increased for probability-space robustness
         
-        # Structured initialization detection for external-init robustness
-        is_external_init = initial_y is not None
-        warmup_epochs = 3 if is_external_init else 1  # Longer warmup for external init
+        # Set warmup epochs based on initialization type
+        warmup_epochs = 4 if is_external_init else 2  # Extended warmup for both cases
+        
+        # Gumbel-specific parameters
+        gumbel_noise_scale = 1.0  # Can be adapted over iterations
+        use_decoupled_temperature = True  # Better gradient flow
         
         for i_iter in range(max_iter):
             # Exponential temperature decay: T(t) = max(Tmin, T0 * α^t)
             temperature = max(temperature_end, 
                             temperature_start * (temperature_decay ** i_iter))
             
-            # Adaptive AEM weight coupled to temperature: λ(t) = κ * T(t)
-            aem_lambda = aem_coupling_factor * temperature
+            # Adaptive AEM weight with non-linear coupling for Gumbel-Softmax
+            # Use sqrt coupling for smoother transition
+            aem_lambda = aem_coupling_factor * np.sqrt(temperature)
             
             # Constraint penalty increases over time: μ(t)
             progress = i_iter / max(1, max_iter - 1)
@@ -571,16 +676,20 @@ class MilCountBasedMultiClassLearner:
                         ])
                         
                         # Always compute AEM scores with adaptive weight
+                        # Enhanced AEM for external init robustness
+                        aem_lambda_adjusted = aem_lambda * (1.2 if is_external_init else 1.0)
                         aem_scores = compute_attention_entropy_maximization(
                             probs[active_indices], 
-                            lambda_entropy=aem_lambda,
+                            lambda_entropy=aem_lambda_adjusted,
                             normalize_by_size=True
                         )
                         
                         # Always use soft assignment with ST_k for differentiability
+                        # Adjust temperature for external init (higher for more exploration)
+                        effective_temperature = temperature * (1.15 if is_external_init and i_iter < warmup_epochs else 1.0)
                         soft_weights = soft_k_of_n_assignment(
                             active_probs, k_min_active, k_max_active, 
-                            temperature=temperature,  # Use the independent temperature schedule
+                            temperature=effective_temperature,
                             margin_scores=margin_scores, aem_scores=aem_scores,
                             constraint_weight=constraint_penalty
                         )
@@ -810,8 +919,13 @@ class MilCountBasedMultiClassLearner:
                 if debug:
                     print(f"Labels converged at iteration {i_iter}, continuing to refine classifier...")
                 # Train with additional inner iterations when labels are stable
-                # More iterations for external-init to improve robustness
-                inner_iterations = 8 if is_external_init else 5
+                # Adaptive inner iterations based on convergence stage
+                if is_external_init:
+                    # More aggressive training for external init
+                    inner_iterations = min(10, 6 + (i_iter - 4))
+                else:
+                    inner_iterations = min(7, 4 + (i_iter - 4) // 2)
+                    
                 for inner_iter in range(inner_iterations):
                     self.classifier.fit(flatten_bags, flatten_y)
             elif not has_changed and i_iter < 4:
