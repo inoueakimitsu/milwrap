@@ -130,23 +130,21 @@ def compute_bag_embedding_loss(bag_features: List[NDArray[np.float64]], bag_labe
     return np.mean(losses) if losses else 0.0
 
 
-def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambda_entropy: float = 0.1) -> NDArray[np.float64]:
+def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambda_entropy: float = 0.05) -> NDArray[np.float64]:
     """Compute AEM (Attention Entropy Maximization) regularized scores.
     
     Based on AEM research: adds entropy regularizer to prevent over-concentrated attention.
-    Uses simpler global entropy bonus for more stable gradients.
+    This minimal implementation follows the best-performing approach from commit 28646e7.
     
     Args:
         bag_probs: Instance probability matrix of shape (n_instances, n_classes).
-        lambda_entropy: Entropy regularization strength.
+        lambda_entropy: Entropy regularization strength (default: 0.05 for conservative integration).
         
     Returns:
         AEM-regularized scores for each instance.
     """
     if len(bag_probs.shape) != 2 or bag_probs.shape[0] == 0:
         return np.ones(bag_probs.shape[0])
-    
-    n_instances, n_classes = bag_probs.shape
     
     # Calculate instance-wise attention weights (softmax over max probabilities)
     max_probs = np.max(bag_probs, axis=1)
@@ -155,13 +153,13 @@ def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambd
     # Calculate attention entropy: H(α) = -Σ αᵢ log(αᵢ)
     attention_entropy = -np.sum(attention_weights * np.log(attention_weights + 1e-10))
     
-    # Normalize entropy by bag size for consistent regularization strength
-    normalized_entropy = attention_entropy / np.log(n_instances + 1e-10)
+    # Simple entropy bonus - no normalization for minimal approach
+    # This encourages exploration of multiple instances rather than focusing on one
+    entropy_bonus = lambda_entropy * attention_entropy
     
-    # AEM regularization: simple global entropy bonus (more stable than per-instance weighting)
-    entropy_bonus = lambda_entropy * normalized_entropy
-    
-    # Return scores with uniform entropy bonus for all instances
+    # Return base scores plus entropy bonus
+    # Note: Following the best-performing approach from commit 28646e7,
+    # we use additive (not multiplicative) entropy bonus
     return max_probs + entropy_bonus
 
 
@@ -398,7 +396,7 @@ def compute_margin_aware_confidence(probs: NDArray[np.float64], target_class: in
     return confidence
 
 
-def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margin_scores=None):
+def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margin_scores=None, aem_scores=None):
     """Solve exact k-of-n assignment problem with optional margin weighting.
     
     Find optimal assignment of instances to positive class such that
@@ -410,6 +408,7 @@ def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margi
         k_max: maximum number of positive instances
         current_assignments: current assignments (optional)
         margin_scores: margin-based scores for weighting (optional)
+        aem_scores: AEM-based scores for weighting (optional)
         
     Returns:
         optimal_assignments: binary array of assignments
@@ -430,7 +429,11 @@ def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margi
     
     # Apply margin weighting if provided
     if margin_scores is not None and len(margin_scores) == len(probs):
-        log_odds = log_odds + 0.1 * margin_scores  # Moderate weight for margins
+        log_odds = log_odds + 0.05 * margin_scores  # Conservative weight for margins
+    
+    # Apply AEM scores if provided
+    if aem_scores is not None and len(aem_scores) == len(probs):
+        log_odds = log_odds + 0.05 * aem_scores  # Conservative weight for AEM
     
     # Sort by log-odds in descending order
     sorted_indices = np.argsort(log_odds)[::-1]
@@ -495,11 +498,11 @@ def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=N
     
     # Combine with margin scores
     if margin_scores is not None and len(margin_scores) == len(probs):
-        log_odds = log_odds + 0.1 * margin_scores
+        log_odds = log_odds + 0.05 * margin_scores  # Conservative weight
     
-    # Combine with AEM scores (when active)
+    # Combine with AEM scores (when active) - use conservative weight
     if aem_scores is not None and len(aem_scores) == len(probs):
-        log_odds = log_odds + 0.1 * aem_scores  # Moderate weight for AEM
+        log_odds = log_odds + 0.05 * aem_scores  # Conservative weight following best-performing approach
     
     # Find optimal k using gradient-free search
     best_k = k_min
@@ -794,24 +797,22 @@ class MilCountBasedMultiClassLearner:
         # Check if using external initialization
         is_external_init = initial_y is not None
         
-        # Adaptive temperature schedule based on initialization type
+        # Minimal temperature schedule based on best-performing approach
         if is_external_init:
-            # For external init: conservative exploration (1.3x auto-init temperature)
-            # External init already provides good starting point, so less exploration needed
-            smooth_temp_start = 1.3   # Conservative increase for stability
+            # For external init: balanced exploration/exploitation
+            # External init provides good starting point but needs some exploration
+            smooth_temp_start = 1.0   # Moderate start temperature for balanced exploration
             smooth_temp_end = 0.1     # Lower final temperature for precision
-            gumbel_temp = 1.2         # Slightly reduced for external init
-            # Use cosine schedule for smoother transition
-            temp_decay_rate = None    # Use cosine schedule like auto-init
+            gumbel_temp = 1.0         # Same as auto-init for first iteration
+            # Simple linear decay
+            temp_decay_rate = 0.9     # Exponential decay rate
         else:
             # Original temperature schedule for auto-init
             smooth_temp_start = 1.0
-            smooth_temp_end = 0.2
+            smooth_temp_end = 0.1     # Lower final temperature
             gumbel_temp = 1.0
-            temp_decay_rate = None    # Use cosine schedule
+            temp_decay_rate = 0.9     # Exponential decay rate
         
-        # Temperature scheduling parameters
-        temperature_cosine_period = 0.6  # Cosine annealing for first 60% of iterations
         
         # Instance-specific temperature scaling based on init confidence
         if is_external_init:
@@ -835,10 +836,10 @@ class MilCountBasedMultiClassLearner:
         # Adaptive confidence-based freezing
         if is_external_init:
             confidence_threshold = 0.97  # Higher threshold for external init to allow more changes
-            margin_lambda = 0.5   # Higher margin importance for external init
+            margin_lambda = 0.25  # Conservative margin importance
         else:
             confidence_threshold = 0.95  # Original for auto-init
-            margin_lambda = 0.4   # Original margin importance
+            margin_lambda = 0.25  # Conservative margin importance
         
         # Fixed penalty parameters for constraints (more stable than adaptive)
         # Based on staged-AEM approach: consistent pressure throughout training
@@ -866,46 +867,25 @@ class MilCountBasedMultiClassLearner:
             else:
                 use_gumbel = (i_iter == 0)  # First iteration only for auto-init
             
-            # Temperature schedule based on initialization type
-            if is_external_init and temp_decay_rate is not None:
-                # Exponential decay for external init: τₜ = max(τ_min, τ₀ * γ^t)
-                temperature = max(smooth_temp_end, smooth_temp_start * (temp_decay_rate ** i_iter))
-            else:
-                # Original cosine annealing for auto-init
-                if i_iter < int(max_iter * temperature_cosine_period):
-                    # Cosine annealing for exploration phase
-                    cosine_progress = i_iter / (max_iter * temperature_cosine_period)
-                    temperature = smooth_temp_end + 0.5 * (smooth_temp_start - smooth_temp_end) * (1 + np.cos(np.pi * cosine_progress))
-                else:
-                    # Linear decay for exploitation phase
-                    linear_progress = (i_iter - int(max_iter * temperature_cosine_period)) / (max_iter - int(max_iter * temperature_cosine_period))
-                    temperature = smooth_temp_end + (smooth_temp_start * 0.3 - smooth_temp_end) * (1 - linear_progress)
+            # Simple exponential temperature decay for both init types
+            # τₜ = max(τ_min, τ₀ * γ^t)
+            temperature = max(smooth_temp_end, smooth_temp_start * (temp_decay_rate ** i_iter))
             
             # Override temperature for Gumbel case
             if use_gumbel:
                 temperature = gumbel_temp
             
-            # AEM schedule: adapt based on initialization type
-            if is_external_init:
-                # For external init: conservative AEM to preserve good initial assignments
-                # Start with λ = 0.1 and gentle cosine decay
-                if i_iter < int(max_iter * 0.7):  # First 70% of iterations
-                    # Gentle cosine annealing from 0.1 to 0
-                    aem_progress = i_iter / (max_iter * 0.7)
-                    aem_lambda = 0.1 * 0.5 * (1 + np.cos(np.pi * aem_progress))
-                else:
-                    aem_lambda = 0.0  # No entropy regularization in final iterations
+            # AEM schedule: minimal approach based on best-performing variant
+            # Apply AEM only after warm-up period (iter >= 2) with simple linear decay
+            if i_iter < 2:
+                aem_lambda = 0.0  # No AEM during warm-up
             else:
-                # Original AEM schedule for auto-init
-                if i_iter == 0:
-                    aem_lambda = 0.05  # Low at start to establish baseline
-                elif i_iter < int(max_iter * 0.7):
-                    # Cosine schedule peaking at iteration 3-4
-                    aem_progress = min(1.0, i_iter / 4.0)
-                    aem_lambda = 0.4 * 0.5 * (1 - np.cos(np.pi * aem_progress))
+                if is_external_init:
+                    # For external init: conservative AEM (0.03 start) - matching commit 28646e7
+                    aem_lambda = 0.03 * (1 - i_iter / max_iter)  # Linear decay
                 else:
-                    # Gradual reduction in final iterations
-                    aem_lambda = 0.1 * (1 - (i_iter - int(max_iter * 0.7)) / (max_iter - int(max_iter * 0.7)))
+                    # For auto init: slightly higher AEM (0.06 start)
+                    aem_lambda = 0.06 * (1 - i_iter / max_iter)  # Linear decay
             
             # Fit
             flatten_bags = np.vstack(bags)
@@ -1031,7 +1011,9 @@ class MilCountBasedMultiClassLearner:
                         # Compute AEM scores if in exploration phase
                         aem_scores = None
                         if aem_lambda > 0:
-                            aem_scores = compute_attention_entropy_maximization(probs[active_indices], aem_lambda)
+                            # Compute AEM scores for all instances in the bag (not just active)
+                            bag_aem_scores = compute_attention_entropy_maximization(probs, aem_lambda)
+                            aem_scores = bag_aem_scores[active_indices]
                         
                         # Use Gumbel-Top-k only during first iteration
                         # use_gumbel already set above
@@ -1128,9 +1110,9 @@ class MilCountBasedMultiClassLearner:
                                 if idx not in changed_indices and idx not in frozen_indices and new_y[idx] != i_class:
                                     # Base score from probability
                                     base_score = probs[idx, i_class]
-                                    # Add margin-aware confidence
+                                    # Add margin-aware confidence with conservative weight
                                     margin_conf = compute_margin_aware_confidence(probs[idx], i_class, margin_lambda=margin_lambda)
-                                    score = base_score + 0.1 * (margin_conf - base_score)
+                                    score = base_score + 0.05 * (margin_conf - base_score)  # Conservative weight
                                     
                                     # Fixed boost/penalty based on constraint satisfaction
                                     current_class = new_y[idx]
@@ -1201,9 +1183,9 @@ class MilCountBasedMultiClassLearner:
                                     
                                     # Base score from log probability
                                     base_log_score = np.log(probs[idx, c] + 1e-8)
-                                    # Add margin confidence
+                                    # Add margin confidence with conservative weight
                                     margin_conf = compute_margin_aware_confidence(probs[idx], c, margin_lambda=margin_lambda)
-                                    scores[c] = base_log_score + 0.1 * np.log(max(margin_conf, 1e-8) + 1e-8)
+                                    scores[c] = base_log_score + 0.05 * np.log(max(margin_conf, 1e-8) + 1e-8)  # Conservative weight
                                     
                                     # Fixed constraint bonus/penalty
                                     c_count = class_count_dict.get(c, 0)
