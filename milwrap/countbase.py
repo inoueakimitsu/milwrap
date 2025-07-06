@@ -62,186 +62,16 @@ def compute_prototype_similarity_scores(bag_features: NDArray[np.float64], proto
     return scores / (np.sum(scores) + 1e-8)
 
 
-def compute_instance_interaction_weights(bag_probs: NDArray[np.float64], k: int = 5) -> NDArray[np.float64]:
-    """Compute instance interaction weights based on neighborhood consistency.
-    
-    Inspired by ViT-IWRS: instances that agree with their neighbors get higher weights.
-    
-    Args:
-        bag_probs: Instance probability matrix of shape (n_instances, n_classes).
-        k: Number of nearest neighbors to consider.
-        
-    Returns:
-        Interaction-based weights for each instance.
-    """
-    if len(bag_probs.shape) != 2 or bag_probs.shape[0] == 0:
-        return np.ones(bag_probs.shape[0])
-    
-    n_instances = bag_probs.shape[0]
-    
-    # Faster distance computation using L2 distance on probability vectors
-    # Compute pairwise distances efficiently
-    prob_squared = np.sum(bag_probs ** 2, axis=1, keepdims=True)
-    distances = prob_squared + prob_squared.T - 2 * np.dot(bag_probs, bag_probs.T)
-    distances = np.maximum(distances, 0)  # Numerical stability
-    
-    # Get predicted classes
-    pred_classes = np.argmax(bag_probs, axis=1)
-    
-    # For each instance, compute consistency with k nearest neighbors
-    consistency_scores = np.zeros(n_instances)
-    for i in range(n_instances):
-        # Find k nearest neighbors (excluding self)
-        neighbor_indices = np.argsort(distances[i])[1:min(k+1, n_instances)]
-        
-        if len(neighbor_indices) > 0:
-            # Count how many neighbors agree
-            agreement = np.mean(pred_classes[neighbor_indices] == pred_classes[i])
-            
-            # Also consider probability similarity
-            prob_similarity = np.mean([
-                bag_probs[i, pred_classes[i]] * bag_probs[j, pred_classes[i]]
-                for j in neighbor_indices
-            ])
-            
-            # Combine agreement and probability similarity
-            consistency_scores[i] = 0.7 * agreement + 0.3 * prob_similarity
-        else:
-            consistency_scores[i] = 1.0
-    
-    return consistency_scores
+# Removed compute_instance_interaction_weights - adds complexity without clear benefit
 
 
-def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambda_entropy: float = 0.05) -> NDArray[np.float64]:
-    """Compute AEM (Attention Entropy Maximization) regularized scores.
-    
-    Based on AEM research: adds entropy regularizer to prevent over-concentrated attention.
-    
-    Args:
-        bag_probs: Instance probability matrix of shape (n_instances, n_classes).
-        lambda_entropy: Entropy regularization strength.
-        
-    Returns:
-        AEM-regularized scores for each instance.
-    """
-    if len(bag_probs.shape) != 2 or bag_probs.shape[0] == 0:
-        return np.ones(bag_probs.shape[0])
-    
-    # Calculate instance-wise attention weights (softmax over max probabilities)
-    max_probs = np.max(bag_probs, axis=1)
-    attention_weights = np.exp(max_probs) / (np.sum(np.exp(max_probs)) + 1e-10)
-    
-    # Calculate attention entropy: H(α) = -Σ αᵢ log(αᵢ)
-    attention_entropy = -np.sum(attention_weights * np.log(attention_weights + 1e-10))
-    
-    # AEM regularization: encourage higher entropy
-    entropy_bonus = lambda_entropy * attention_entropy
-    
-    # Return scores with entropy bonus
-    return max_probs + entropy_bonus
+# Removed compute_attention_entropy_maximization - not needed in minimal implementation
 
 
-def apply_stochastic_instance_masking(probs: NDArray[np.float64], mask_ratio: float = 0.1, top_k_ratio: float = 0.3) -> NDArray[np.float64]:
-    """Apply Stochastic Top-K Instance Masking (STKIM).
-    
-    Based on ACMIL paper: randomly masks high-attention instances to force
-    the model to discover alternative discriminative patterns.
-    
-    Args:
-        probs: Instance probability matrix of shape (n_instances, n_classes).
-        mask_ratio: Fraction of top instances to potentially mask.
-        top_k_ratio: Fraction of instances considered as "top".
-        
-    Returns:
-        Masked probability matrix.
-    """
-    if len(probs.shape) != 2 or probs.shape[0] == 0:
-        return probs
-    
-    n_instances = probs.shape[0]
-    
-    # Get max probabilities for each instance
-    max_probs = np.max(probs, axis=1)
-    
-    # Identify top-k instances
-    k_top = max(1, int(n_instances * top_k_ratio))
-    top_indices = np.argsort(max_probs)[-k_top:]
-    
-    # Randomly select instances to mask from top-k
-    n_mask = max(1, int(k_top * mask_ratio))
-    mask_indices = np.random.choice(top_indices, size=n_mask, replace=False)
-    
-    # Create masked probabilities
-    masked_probs = probs.copy()
-    
-    # For masked instances, reduce their influence (but don't zero out completely)
-    # This maintains differentiability while encouraging exploration
-    masked_probs[mask_indices] *= 0.5  # Reduce but don't eliminate (less aggressive)
-    
-    return masked_probs
+# Removed apply_stochastic_instance_masking - STKIM adds unnecessary complexity
 
 
-def sparse_differentiable_topk(scores: NDArray[np.float64], k: float, temperature: float = 1.0, sparsity_threshold: float = 0.01) -> NDArray[np.float64]:
-    """Sparse differentiable top-k operator.
-    
-    Based on "Fast, Differentiable & Sparse Top-k" (2023): uses isotonic projection
-    on the permutahedron for efficient, sparse gradient computation.
-    
-    Args:
-        scores: Input scores to select from.
-        k: Target number of selections (can be fractional).
-        temperature: Temperature parameter for smoothness.
-        sparsity_threshold: Threshold below which weights are set to zero.
-        
-    Returns:
-        Sparse soft selection weights (sum approximately equals k).
-    """
-    n = len(scores)
-    if n == 0 or k <= 0:
-        return np.zeros(n)
-    if k >= n:
-        return np.ones(n)
-    
-    # Apply temperature scaling to scores
-    scaled_scores = scores / temperature
-    
-    # Sort scores in descending order
-    sorted_indices = np.argsort(scaled_scores)[::-1]
-    sorted_scores = scaled_scores[sorted_indices]
-    
-    # Isotonic projection algorithm for sparse top-k
-    # Find optimal threshold using cumulative sums
-    cumsum = np.cumsum(sorted_scores)
-    indices = np.arange(1, n + 1)
-    
-    # Compute potential thresholds
-    thresholds = (cumsum - k) / indices
-    
-    # Find the valid threshold (where all constraints are satisfied)
-    valid_mask = sorted_scores >= thresholds
-    if np.any(valid_mask):
-        # Last valid position
-        pivot = np.where(valid_mask)[0][-1]
-        threshold = thresholds[pivot]
-    else:
-        threshold = thresholds[-1]
-    
-    # Compute sparse weights
-    weights = np.maximum(0, scaled_scores - threshold)
-    
-    # Apply sparsity threshold
-    weights[weights < sparsity_threshold] = 0
-    
-    # Normalize to ensure sum equals k
-    current_sum = np.sum(weights)
-    if current_sum > 0:
-        weights = weights * k / current_sum
-    
-    # Map back to original order
-    result = np.zeros(n)
-    result[sorted_indices] = weights
-    
-    return result
+# Removed sparse_differentiable_topk - using only smooth_topk for simplicity
 
 
 def smooth_topk(scores: NDArray[np.float64], k: float, temperature: float = 1.0) -> NDArray[np.float64]:
@@ -258,6 +88,9 @@ def smooth_topk(scores: NDArray[np.float64], k: float, temperature: float = 1.0)
         Soft selection weights (sum approximately equals k).
     """
     return sparse_differentiable_topk(scores, k, temperature, sparsity_threshold=0.005)  # Reduced threshold for less sparsity
+
+
+# Removed compute_count_consistency_bonus - not beneficial in practice
 
 
 def compute_margin_aware_confidence(probs: NDArray[np.float64], target_class: int, margin_lambda: float = 0.25) -> float:
@@ -355,39 +188,10 @@ def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margi
     return assignments
 
 
-def compute_differentiable_count_loss(probs, k_target, weight=0.1):
-    """Compute differentiable loss for count constraints.
-    
-    Based on "Unified Approach to Count-Based Weak Supervision" (2023).
-    Uses logsumexp to compute probability of exactly k instances being positive.
-    
-    Args:
-        probs: probabilities for positive class (n_instances,)
-        k_target: target count of positive instances
-        weight: loss weight
-        
-    Returns:
-        count_loss: scalar loss value
-    """
-    n = len(probs)
-    if n == 0 or k_target < 0 or k_target > n:
-        return 0.0
-    
-    # Compute log probabilities
-    log_probs = np.log(probs + 1e-10)
-    log_one_minus_probs = np.log(1 - probs + 1e-10)
-    
-    # For exact count k, we need to sum over all subsets of size k
-    # This is computationally intensive, so we use a smooth approximation
-    # Based on the expected count matching the target
-    expected_count = np.sum(probs)
-    count_deviation = abs(expected_count - k_target)
-    
-    # L1 loss on count deviation
-    return weight * count_deviation
+# Removed compute_differentiable_count_loss - not used in simplified approach
 
 
-def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=None, aem_scores=None, interaction_weights=None, global_context=None):
+def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=None, aem_scores=None, interaction_weights=None, global_context=None, count_bonus=None):
     """Solve soft k-of-n assignment using smooth top-k operator.
     
     Find soft assignment weights such that sum approximates the optimal k
@@ -402,6 +206,7 @@ def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=N
         aem_scores: AEM-based scores for weighting (optional)
         interaction_weights: instance interaction weights (optional)
         global_context: global optimization context (optional)
+        count_bonus: count consistency bonus scores (optional)
         
     Returns:
         soft_assignments: continuous weights in [0, 1]
@@ -422,22 +227,7 @@ def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=N
     if margin_scores is not None and len(margin_scores) == len(probs):
         log_odds = log_odds + 0.1 * margin_scores
     
-    # Combine with AEM scores (when active)
-    if aem_scores is not None and len(aem_scores) == len(probs):
-        log_odds = log_odds + 0.1 * aem_scores  # Moderate weight for AEM
-    
-    # Combine with instance interaction weights
-    if interaction_weights is not None and len(interaction_weights) == len(probs):
-        log_odds = log_odds + 0.15 * interaction_weights  # Weight for interaction
-    
-    # Apply global context if available (ProMIL-inspired)
-    if global_context is not None:
-        # global_context contains optimal proportion learned from data
-        optimal_k = int(np.round(global_context * n))
-        optimal_k = max(k_min, min(k_max, optimal_k))
-        # Bias towards the learned optimal k
-        k_min = max(k_min, optimal_k - 1)
-        k_max = min(k_max, optimal_k + 1)
+    # Removed all complex score combinations - not needed in simplified version
     
     # Find optimal k using gradient-free search
     best_k = k_min
@@ -627,56 +417,31 @@ class MilCountBasedMultiClassLearner:
         # Initialize simple parameters
         n_bags = len(bags)
         
-        # Independent temperature schedule for ST_k
-        temperature_start = 0.9   # Lower starting temperature (detached from AEM)
-        temperature_end = 0.25    # Higher final temperature to maintain gradient flow
-        temperature_half_life = 0.25  # Temperature half-life as fraction of total iterations
+        # Simplified temperature schedule (from best performing version)
+        temperature_start = 2.0   # Lower starting temperature
+        temperature_end = 0.1     # Lower ending temperature
         
         # Self-paced learning: track bag difficulty scores
         bag_difficulty = np.zeros(n_bags)
         
-        # Simple confidence-based freezing (fixed threshold)
+        # Simple confidence-based freezing from best version
         confidence_threshold = 0.97  # Higher threshold for more selective freezing
-        margin_lambda = 0.3   # Slightly increased margin importance
+        margin_lambda = 0.2  # Slightly lower margin importance
         
-        # Global context learning (ProMIL-inspired)
-        # Track optimal proportions for each class across all bags
-        global_proportions = np.zeros((n_bags, n_classes))
-        proportion_momentum = 0.9  # Momentum for proportion updates
+        # Removed global context learning - adds complexity without significant benefit
         
-        # STKIM parameters
-        stkim_start_iter = 4  # Start masking after more initial iterations
-        stkim_mask_ratio = 0.06  # Mask 6% of top instances (further reduced)
-        stkim_top_k_ratio = 0.2  # Consider top 20% as high-attention
+        # Removed STKIM parameters - not needed for simplified approach
         
-        # Count loss weight schedule
-        count_loss_weight_start = 0.02  # Lower starting weight
-        count_loss_weight_end = 0.15  # Lower ending weight
-        count_loss_schedule = "cosine"  # Cosine schedule for smoother transition
+        # Removed count loss weight schedule - not needed in simplified approach
         
         for i_iter in range(max_iter):
-            # Independent exponential temperature decay with half-life
-            temperature = max(temperature_end, 
-                            temperature_start * 0.5 ** (i_iter / (temperature_half_life * max_iter)))
+            # Simple exponential temperature decay from best performing version
+            progress = i_iter / max_iter
+            temperature = temperature_start * ((temperature_end / temperature_start) ** progress)
             
-            # Staged AEM schedule: cosine annealing for first 60% of iterations
-            exploration_phase_end = int(np.ceil(max_iter * 0.6))  # Use ceiling to ensure proper duration
-            if i_iter < exploration_phase_end:
-                # Cosine annealing from 0 to max during exploration
-                aem_lambda_max = 0.55  # Slightly increased
-                aem_lambda = aem_lambda_max * 0.5 * (1 - np.cos(np.pi * i_iter / exploration_phase_end))
-            else:
-                # Keep small AEM value during exploitation phase
-                aem_lambda = 0.06  # Slightly increased
+            # No AEM in simplified version - completely removed
             
-            # Count loss weight schedule
-            if count_loss_schedule == "linear":
-                count_loss_weight = count_loss_weight_start + (count_loss_weight_end - count_loss_weight_start) * i_iter / max_iter
-            elif count_loss_schedule == "cosine":
-                # Cosine annealing for smoother transition
-                count_loss_weight = count_loss_weight_start + (count_loss_weight_end - count_loss_weight_start) * 0.5 * (1 - np.cos(np.pi * i_iter / max_iter))
-            else:
-                count_loss_weight = count_loss_weight_start
+            # Removed count loss weight computation - not used in simplified approach
             
             # Fit
             flatten_bags = np.vstack(bags)
@@ -686,17 +451,7 @@ class MilCountBasedMultiClassLearner:
             # Compute outputs
             fs = [self.classifier.predict_proba(bag) for bag in bags]
             
-            # Apply STKIM if enabled
-            if i_iter >= stkim_start_iter:
-                fs_masked = []
-                for bag_probs in fs:
-                    masked_probs = apply_stochastic_instance_masking(
-                        bag_probs, 
-                        mask_ratio=stkim_mask_ratio,
-                        top_k_ratio=stkim_top_k_ratio
-                    )
-                    fs_masked.append(masked_probs)
-                fs = fs_masked
+            # Removed STKIM application - not beneficial based on ablation
             
             y_pred = [self.classifier.predict(bag) for bag in bags]
             flatten_original_y = np.hstack(list(y))
@@ -784,30 +539,17 @@ class MilCountBasedMultiClassLearner:
                             for idx in active_indices
                         ])
                         
-                        # Compute AEM scores if in exploration phase
-                        aem_scores = None
-                        if aem_lambda > 0:
-                            aem_scores = compute_attention_entropy_maximization(probs[active_indices], aem_lambda)
+                        # No AEM or count bonus in simplified version
                         
-                        # Compute instance interaction weights
-                        interaction_weights = None
-                        if n_active > 1:  # Need at least 2 instances for interaction
-                            k_neighbors = min(5, n_active - 1)  # Adaptive k based on bag size
-                            interaction_weights = compute_instance_interaction_weights(
-                                probs[active_indices], k=k_neighbors
-                            )
+                        # Removed instance interaction weights - not essential based on ablation
                         
-                        # Get global context for this bag (if available after first iteration)
-                        global_context = None
-                        if i_iter > 0:
-                            global_context = global_proportions[i_bag, 1]  # For binary, use class 1 proportion
+                        # Removed global context - not essential
                         
-                        # Always use soft assignment with ST_k for differentiability
+                        # Use soft assignment with ST_k (simplified call)
                         soft_weights = soft_k_of_n_assignment(
                             active_probs, k_min_active, k_max_active, 
-                            temperature=temperature,  # Use the independent temperature schedule
-                            margin_scores=margin_scores, aem_scores=aem_scores,
-                            interaction_weights=interaction_weights, global_context=global_context
+                            temperature=temperature,
+                            margin_scores=margin_scores
                         )
                         
                         # Straight-through estimator: hard assignment for forward, soft for backward
@@ -982,8 +724,6 @@ class MilCountBasedMultiClassLearner:
                 # Update bag difficulty score based on constraint violations
                 final_counts = pd.Series(new_y).value_counts().to_dict()
                 constraint_violation = 0
-                count_loss = 0.0
-                
                 for i_class in range(n_classes):
                     class_count = final_counts.get(i_class, 0)
                     # Lower threshold violations
@@ -992,32 +732,13 @@ class MilCountBasedMultiClassLearner:
                     # Upper threshold violations
                     if class_count > upper_threshold[i_bag, i_class]:
                         constraint_violation += class_count - upper_threshold[i_bag, i_class]
-                    
-                    # Add differentiable count constraint loss
-                    if n_classes == 2 and i_class == 1:
-                        # For binary case, compute soft count loss with adaptive weight
-                        target_k = (lower_threshold[i_bag, 1] + upper_threshold[i_bag, 1]) / 2
-                        count_loss += compute_differentiable_count_loss(
-                            probs[:, 1], 
-                            target_k, 
-                            weight=count_loss_weight
-                        )
                 
-                bag_difficulty[i_bag] = constraint_violation + count_loss
+                bag_difficulty[i_bag] = constraint_violation
                 
-                # Update global proportions with momentum (ProMIL-inspired)
-                current_proportions = np.zeros(n_classes)
-                for i_class in range(n_classes):
-                    current_proportions[i_class] = final_counts.get(i_class, 0) / n_instances
-                
-                if i_iter == 0:
-                    global_proportions[i_bag] = current_proportions
-                else:
-                    global_proportions[i_bag] = (proportion_momentum * global_proportions[i_bag] + 
-                                                 (1 - proportion_momentum) * current_proportions)
+                # Removed global proportions update - not essential
 
             if debug:
-                print(f"iter: {i_iter}, temperature: {temperature:.3f}, aem_lambda: {aem_lambda:.3f}, count_loss_weight: {count_loss_weight:.3f}")
+                print(f"iter: {i_iter}, temperature: {temperature:.3f}")
                 predicted_count = np.nan_to_num(
                     pd.DataFrame([pd.Series(b).value_counts().to_dict() for b in y])[list(range(n_classes))].values,
                 )
