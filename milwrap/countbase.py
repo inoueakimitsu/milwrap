@@ -33,7 +33,7 @@ def compute_instance_confidence_scores(bag_probs: NDArray[np.float64]) -> NDArra
     return max_probs
 
 
-def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambda_entropy: float = 0.05) -> NDArray[np.float64]:
+def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambda_entropy: float = 0.05, noise_std: float = 0.0) -> NDArray[np.float64]:
     """Compute AEM (Attention Entropy Maximization) regularized scores.
     
     Based on AEM research: adds entropy regularizer to prevent over-concentrated attention.
@@ -41,6 +41,7 @@ def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambd
     Args:
         bag_probs: Instance probability matrix of shape (n_instances, n_classes).
         lambda_entropy: Entropy regularization strength.
+        noise_std: Standard deviation for attention noise injection.
         
     Returns:
         AEM-regularized scores for each instance.
@@ -50,6 +51,13 @@ def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambd
     
     # Calculate instance-wise attention weights (softmax over max probabilities)
     max_probs = np.max(bag_probs, axis=1)
+    
+    # Add exploration noise to attention logits (before softmax)
+    if noise_std > 0:
+        logits = np.log(max_probs + 1e-10)
+        logits += np.random.normal(0, noise_std, size=logits.shape)
+        max_probs = np.exp(logits)
+    
     attention_weights = np.exp(max_probs) / (np.sum(np.exp(max_probs)) + 1e-10)
     
     # Calculate attention entropy: H(α) = -Σ αᵢ log(αᵢ)
@@ -411,32 +419,51 @@ class MilCountBasedMultiClassLearner:
         # Initialize simple parameters
         n_bags = len(bags)
         
-        # Independent temperature schedule for ST_k
-        temperature_start = 0.9   # Lower starting temperature (detached from AEM)
-        temperature_end = 0.25    # Higher final temperature to maintain gradient flow
-        temperature_half_life = 0.25  # Temperature half-life as fraction of total iterations
+        # Enhanced temperature schedule based on 2024 research
+        temperature_start = 3.0   # Much higher starting temperature (2-5 recommended)
+        temperature_end = 0.1     # Lower final temperature for precise assignments
+        temperature_half_life = 0.4  # Slower annealing for better exploration
+        
+        # Track convergence for adaptive temperature adjustment
+        previous_y = None
+        convergence_count = 0
+        
+        # Exploration noise parameters (from 2024 research)
+        noise_start = 0.5  # Initial attention noise strength
+        noise_end = 0.0    # No noise in exploitation phase
+        warmup_iterations = 3  # Dedicated warm-up phase
         
         # Self-paced learning: track bag difficulty scores
         bag_difficulty = np.zeros(n_bags)
         
-        # Simple confidence-based freezing (fixed threshold)
-        confidence_threshold = 0.97  # Higher threshold for more selective freezing
-        margin_lambda = 0.3   # Slightly increased margin importance
+        # Adaptive confidence-based freezing
+        confidence_threshold = 0.98  # Very high threshold for selective freezing
+        margin_lambda = 0.35  # Increased margin importance for better discrimination
         
         for i_iter in range(max_iter):
-            # Independent exponential temperature decay with half-life
-            temperature = max(temperature_end, 
-                            temperature_start * 0.5 ** (i_iter / (temperature_half_life * max_iter)))
+            # Adaptive temperature with convergence awareness
+            base_temperature = max(temperature_end, 
+                               temperature_start * 0.5 ** (i_iter / (temperature_half_life * max_iter)))
             
-            # Staged AEM schedule: cosine annealing for first 60% of iterations
-            exploration_phase_end = int(np.ceil(max_iter * 0.6))  # Use ceiling to ensure proper duration
-            if i_iter < exploration_phase_end:
-                # Cosine annealing from 0 to max during exploration
-                aem_lambda_max = 0.5  # Increased from 0.3
-                aem_lambda = aem_lambda_max * 0.5 * (1 - np.cos(np.pi * i_iter / exploration_phase_end))
+            # Adjust temperature based on convergence
+            if convergence_count > 0:
+                # Faster cooling when converging
+                temperature = base_temperature * (0.8 ** convergence_count)
             else:
-                # Keep small AEM value during exploitation phase
-                aem_lambda = 0.05  # Small constant instead of 0
+                # Maintain exploration temperature
+                temperature = base_temperature
+            
+            # Staged approach parameters  
+            exploration_phase_end = int(np.ceil(max_iter * 0.7))  # Extended exploration (70%)
+            
+            # Attention exploration noise (decays over time)
+            if i_iter < warmup_iterations:
+                attention_noise = noise_start
+            elif i_iter < exploration_phase_end:
+                progress = (i_iter - warmup_iterations) / (exploration_phase_end - warmup_iterations)
+                attention_noise = noise_start * (1 - progress)
+            else:
+                attention_noise = noise_end
             
             # Fit
             flatten_bags = np.vstack(bags)
@@ -474,7 +501,7 @@ class MilCountBasedMultiClassLearner:
                 
                 # Simple confidence-based freezing
                 frozen_indices = set()
-                if i_iter >= 3:  # Start freezing after initial exploration
+                if i_iter >= 5:  # Start freezing later to allow more exploration
                     max_probs = np.max(probs, axis=1)
                     predicted_classes = np.argmax(probs, axis=1)
                     
@@ -485,17 +512,26 @@ class MilCountBasedMultiClassLearner:
                 
                 # For binary classification, use exact k-of-n solver
                 if n_classes == 2:
-                    # Apply minimal slack only in first iteration for robustness
+                    # Progressive constraint relaxation during warm-up
                     effective_lower_0 = lower_threshold[i_bag, 0]
                     effective_upper_0 = upper_threshold[i_bag, 0]
                     effective_lower_1 = lower_threshold[i_bag, 1]
                     effective_upper_1 = upper_threshold[i_bag, 1]
                     
-                    if i_iter == 0:  # Only first iteration
-                        effective_lower_0 = effective_lower_0 * 0.98  # 2% slack - more conservative
-                        effective_upper_0 = effective_upper_0 * 1.02  # 2% slack - more conservative
-                        effective_lower_1 = effective_lower_1 * 0.98  # 2% slack - more conservative
-                        effective_upper_1 = effective_upper_1 * 1.02  # 2% slack - more conservative
+                    if i_iter < warmup_iterations:
+                        # Significant relaxation during warm-up for exploration
+                        relax_factor = 0.8 + 0.2 * (i_iter / warmup_iterations)  # 20% to 0% relaxation
+                        effective_lower_0 = effective_lower_0 * relax_factor
+                        effective_upper_0 = effective_upper_0 / relax_factor
+                        effective_lower_1 = effective_lower_1 * relax_factor
+                        effective_upper_1 = effective_upper_1 / relax_factor
+                    elif i_iter < exploration_phase_end:
+                        # Mild relaxation during exploration
+                        relax_factor = 0.98  # 2% slack
+                        effective_lower_0 = effective_lower_0 * relax_factor
+                        effective_upper_0 = effective_upper_0 / relax_factor
+                        effective_lower_1 = effective_lower_1 * relax_factor
+                        effective_upper_1 = effective_upper_1 / relax_factor
                     
                     # For binary case, we optimize for class 1
                     # The constraint is: effective_lower_1 <= k <= effective_upper_1
@@ -531,29 +567,109 @@ class MilCountBasedMultiClassLearner:
                             for idx in active_indices
                         ])
                         
-                        # Compute AEM scores if in exploration phase
+                        # Compute AEM scores with initialization-aware parameters
                         aem_scores = None
-                        if aem_lambda > 0:
-                            aem_scores = compute_attention_entropy_maximization(probs[active_indices], aem_lambda)
+                        if i_iter >= 2:  # Start using AEM after warm-up
+                            # Adaptive lambda based on initialization type (from primal-dual)
+                            if initial_y is None:  # Auto initialization
+                                base_lambda = 0.06
+                            else:  # External initialization
+                                base_lambda = 0.03
+                            
+                            # Combine staged approach with init-aware params
+                            if i_iter < exploration_phase_end:
+                                # Cosine annealing during exploration
+                                aem_lambda = base_lambda * 0.5 * (1 - np.cos(np.pi * i_iter / exploration_phase_end))
+                            else:
+                                # Decay during exploitation
+                                aem_lambda = base_lambda * (1 - i_iter / max_iter) * 0.5
+                            
+                            aem_scores = compute_attention_entropy_maximization(probs[active_indices], aem_lambda, noise_std=attention_noise)
                         
-                        # Always use soft assignment with ST_k for differentiability
-                        soft_weights = soft_k_of_n_assignment(
-                            active_probs, k_min_active, k_max_active, 
-                            temperature=temperature,  # Use the independent temperature schedule
-                            margin_scores=margin_scores, aem_scores=aem_scores
-                        )
-                        
-                        # Straight-through estimator: hard assignment for forward, soft for backward
-                        # Get top-k indices based on soft weights
-                        k_target = int(np.round(np.sum(soft_weights)))
-                        k_target = max(k_min_active, min(k_max_active, k_target))
-                        
-                        if k_target > 0:
-                            top_k_indices = np.argsort(soft_weights)[-k_target:]
-                            optimal_assignment_active = np.zeros_like(soft_weights, dtype=int)
-                            optimal_assignment_active[top_k_indices] = 1
-                        else:
+                        # Unified assignment with smooth transition
+                        # During warm-up phase, use highly stochastic assignments
+                        if i_iter < warmup_iterations:
+                            # Warm-up phase: very stochastic assignment
+                            # Add significant noise to probabilities
+                            noisy_probs = active_probs + np.random.normal(0, 0.2, size=active_probs.shape)
+                            noisy_probs = np.clip(noisy_probs, 0.01, 0.99)
+                            
+                            # Random k within constraints
+                            k_range = k_max_active - k_min_active + 1
+                            if k_range > 1 and np.random.random() < 0.3:  # 30% chance of random k
+                                k_target = np.random.randint(k_min_active, k_max_active + 1)
+                            else:
+                                # Use soft weights with very high temperature
+                                soft_weights = soft_k_of_n_assignment(
+                                    noisy_probs, k_min_active, k_max_active, 
+                                    temperature=temperature * 2.0,
+                                    margin_scores=margin_scores, aem_scores=aem_scores
+                                )
+                                k_target = int(np.round(np.sum(soft_weights)))
+                                k_target = max(k_min_active, min(k_max_active, k_target))
+                            
+                            # Random selection
                             optimal_assignment_active = np.zeros(len(active_probs), dtype=int)
+                            if k_target > 0 and k_target <= len(active_probs):
+                                # Mix of top-k and random selection
+                                if np.random.random() < 0.5:
+                                    # Top-k based on noisy probabilities
+                                    top_indices = np.argsort(noisy_probs)[-k_target:]
+                                    optimal_assignment_active[top_indices] = 1
+                                else:
+                                    # Weighted random selection
+                                    probs = noisy_probs / np.sum(noisy_probs)
+                                    selected = np.random.choice(len(active_probs), size=k_target, replace=False, p=probs)
+                                    optimal_assignment_active[selected] = 1
+                        elif i_iter < exploration_phase_end:
+                            # Exploration phase: soft assignment with moderate stochasticity
+                            soft_weights = soft_k_of_n_assignment(
+                                active_probs, k_min_active, k_max_active, 
+                                temperature=temperature,
+                                margin_scores=margin_scores, aem_scores=aem_scores
+                            )
+                            
+                            # Stochastic rounding for diversity
+                            optimal_assignment_active = np.zeros(len(active_probs), dtype=int)
+                            k_target = int(np.round(np.sum(soft_weights)))
+                            k_target = max(k_min_active, min(k_max_active, k_target))
+                            
+                            if k_target > 0:
+                                # Probabilistic selection based on weights
+                                probs = soft_weights / np.sum(soft_weights)
+                                selected = np.random.choice(len(active_probs), size=k_target, replace=False, p=probs)
+                                optimal_assignment_active[selected] = 1
+                        else:
+                            # Blend soft and hard assignments based on phase
+                            blend_factor = min(1.0, (i_iter - 3) / (exploration_phase_end - 3))
+                            
+                            # Get both assignments
+                            soft_weights = soft_k_of_n_assignment(
+                                active_probs, k_min_active, k_max_active, 
+                                temperature=temperature,
+                                margin_scores=margin_scores, aem_scores=aem_scores
+                            )
+                            
+                            hard_assignment = exact_k_of_n_assignment(
+                                active_probs, k_min_active, k_max_active,
+                                margin_scores=margin_scores, 
+                                aem_scores=aem_scores
+                            )
+                            
+                            # Blend assignments
+                            if np.random.random() < blend_factor:
+                                optimal_assignment_active = hard_assignment
+                            else:
+                                # Use soft assignment with deterministic rounding
+                                k_target = int(np.round(np.sum(soft_weights)))
+                                k_target = max(k_min_active, min(k_max_active, k_target))
+                                
+                                if k_target > 0:
+                                    top_k_indices = np.argsort(soft_weights)[-k_target:]
+                                    optimal_assignment_active = np.zeros_like(soft_weights, dtype=int)
+                                    optimal_assignment_active[top_k_indices] = 1
+                                else:
+                                    optimal_assignment_active = np.zeros(len(active_probs), dtype=int)
                         
                         # Map back to full assignment
                         optimal_assignment = new_y.copy()
@@ -592,9 +708,11 @@ class MilCountBasedMultiClassLearner:
                     for i_class in target_classes:
                         class_count = class_count_dict.get(i_class, 0)
                         
-                        # Apply constraint slack for first iteration only
-                        if i_iter == 0:
-                            # 2% slack in first iteration - more conservative
+                        # Progressive constraint relaxation
+                        if i_iter < warmup_iterations:
+                            relax_factor = 0.8 + 0.2 * (i_iter / warmup_iterations)
+                            effective_lower = lower_threshold[i_bag, i_class] * relax_factor
+                        elif i_iter < exploration_phase_end:
                             effective_lower = lower_threshold[i_bag, i_class] * 0.98
                         else:
                             effective_lower = lower_threshold[i_bag, i_class]
@@ -643,9 +761,12 @@ class MilCountBasedMultiClassLearner:
                     for i_class in target_classes:
                         class_count = class_count_dict.get(i_class, 0)
                         
-                        # Apply adaptive constraint slack for upper threshold
-                        if i_iter == 0:
-                            effective_upper = upper_threshold[i_bag, i_class] * 1.02  # 2% slack - more conservative
+                        # Progressive constraint relaxation for upper threshold
+                        if i_iter < warmup_iterations:
+                            relax_factor = 0.8 + 0.2 * (i_iter / warmup_iterations)
+                            effective_upper = upper_threshold[i_bag, i_class] / relax_factor
+                        elif i_iter < exploration_phase_end:
+                            effective_upper = upper_threshold[i_bag, i_class] * 1.02
                         else:
                             effective_upper = upper_threshold[i_bag, i_class]
                         
@@ -736,7 +857,7 @@ class MilCountBasedMultiClassLearner:
                 bag_difficulty[i_bag] = constraint_violation + count_loss
 
             if debug:
-                print(f"iter: {i_iter}, temperature: {temperature:.3f}, aem_lambda: {aem_lambda:.3f}")
+                print(f"iter: {i_iter}, temperature: {temperature:.3f}, phase: {'exploration' if i_iter < exploration_phase_end else 'exploitation'}")
                 predicted_count = np.nan_to_num(
                     pd.DataFrame([pd.Series(b).value_counts().to_dict() for b in y])[list(range(n_classes))].values,
                 )
@@ -759,6 +880,15 @@ class MilCountBasedMultiClassLearner:
                     print("instance unit accuracy (label adjusted)")
                     print(np.mean(np.hstack(y) == np.hstack(debug_true_y)))
                 print("-----")
+            
+            # Track convergence
+            if previous_y is not None:
+                changes_ratio = num_changes_instance / len(np.hstack(y))
+                if changes_ratio < 0.01:  # Less than 1% changes
+                    convergence_count += 1
+                else:
+                    convergence_count = 0
+            previous_y = [y_bag.copy() for y_bag in y]
 
             # Continue to iteration 9 for evaluation, even if converged
             min_iterations = 9
