@@ -33,16 +33,20 @@ def compute_instance_confidence_scores(bag_probs: NDArray[np.float64]) -> NDArra
     return max_probs
 
 
-def compute_bag_embedding_loss(bag_features: List[NDArray[np.float64]], bag_labels: List[int], temperature: float = 0.1) -> float:
+def compute_bag_embedding_loss(bag_features: List[NDArray[np.float64]], bag_labels: List[int], 
+                               temperature: float = 0.1, use_hard_negative: bool = True, margin: float = 0.2) -> float:
     """Compute Bag-Embedding Loss (BEL) for contrastive learning at bag level.
     
     Based on BEL (2023): contrastive loss in bag-embedding space to ensure
     bags of same class are close while different classes are separated.
+    Enhanced with hard negative mining for better discrimination.
     
     Args:
         bag_features: List of bag feature matrices (each bag's instance features)
         bag_labels: List of bag labels
         temperature: Temperature parameter for contrastive loss
+        use_hard_negative: Whether to use hard negative mining
+        margin: Margin for hard negative mining
         
     Returns:
         BEL loss value
@@ -54,47 +58,74 @@ def compute_bag_embedding_loss(bag_features: List[NDArray[np.float64]], bag_labe
     
     # Compute bag embeddings as mean of instance features
     bag_embeddings = []
-    for features in bag_features:
+    valid_indices = []
+    for i, features in enumerate(bag_features):
         if len(features) > 0:
             bag_embedding = np.mean(features, axis=0)
             # L2 normalize
             bag_embedding = bag_embedding / (np.linalg.norm(bag_embedding) + 1e-8)
             bag_embeddings.append(bag_embedding)
+            valid_indices.append(i)
     
     if len(bag_embeddings) < 2:
         return 0.0
     
     bag_embeddings = np.stack(bag_embeddings)
+    valid_labels = [bag_labels[i] for i in valid_indices]
+    n_valid = len(valid_labels)
     
     # Compute pairwise cosine similarities
     similarities = np.dot(bag_embeddings, bag_embeddings.T)
     
     # Create label mask (1 if same class, 0 otherwise)
-    label_mask = np.array([[1 if bag_labels[i] == bag_labels[j] else 0 
-                           for j in range(n_bags)] for i in range(n_bags)])
+    label_mask = np.array([[1 if valid_labels[i] == valid_labels[j] else 0 
+                           for j in range(n_valid)] for i in range(n_valid)])
     
     # Remove diagonal
-    mask = 1 - np.eye(n_bags)
+    mask = 1 - np.eye(n_valid)
     similarities = similarities * mask
     label_mask = label_mask * mask
     
-    # Compute contrastive loss
-    exp_sim = np.exp(similarities / temperature)
-    
-    # For each bag, compute loss
+    # Compute contrastive loss with optional hard negative mining
     losses = []
-    for i in range(n_bags):
+    for i in range(n_valid):
         # Positive pairs (same class)
         pos_mask = label_mask[i] > 0
         if np.sum(pos_mask) > 0:
-            pos_sim = np.sum(exp_sim[i] * pos_mask) / np.sum(pos_mask)
+            # Average positive similarity
+            pos_sim = similarities[i] * pos_mask
+            avg_pos_sim = np.sum(pos_sim) / np.sum(pos_mask)
             
-            # All pairs (for denominator)
-            all_sim = np.sum(exp_sim[i] * mask[i])
-            
-            if all_sim > 0:
-                loss = -np.log(pos_sim / all_sim + 1e-8)
-                losses.append(loss)
+            if use_hard_negative:
+                # Hard negative mining: find hardest negative (highest similarity)
+                neg_mask = (1 - label_mask[i]) * mask[i]
+                if np.sum(neg_mask) > 0:
+                    neg_sims = similarities[i] * neg_mask - (1 - neg_mask) * 1e6  # Mask out non-negatives
+                    hardest_neg_idx = np.argmax(neg_sims)
+                    hardest_neg_sim = similarities[i, hardest_neg_idx]
+                    
+                    # Apply margin between positive and hard negative
+                    margin_loss = np.maximum(0, hardest_neg_sim - avg_pos_sim + margin)
+                    
+                    # Combine with standard contrastive loss
+                    exp_sim = np.exp(similarities[i] / temperature)
+                    pos_exp = np.sum(exp_sim * pos_mask) / np.sum(pos_mask)
+                    all_exp = np.sum(exp_sim * mask[i])
+                    
+                    if all_exp > 0:
+                        contrastive_loss = -np.log(pos_exp / all_exp + 1e-8)
+                        # Weighted combination
+                        loss = contrastive_loss + 0.5 * margin_loss
+                        losses.append(loss)
+            else:
+                # Standard contrastive loss
+                exp_sim = np.exp(similarities[i] / temperature)
+                pos_exp = np.sum(exp_sim * pos_mask) / np.sum(pos_mask)
+                all_exp = np.sum(exp_sim * mask[i])
+                
+                if all_exp > 0:
+                    loss = -np.log(pos_exp / all_exp + 1e-8)
+                    losses.append(loss)
     
     return np.mean(losses) if losses else 0.0
 
@@ -220,6 +251,119 @@ def gumbel_topk(scores: NDArray[np.float64], k: int, temperature: float = 1.0) -
     return mask
 
 
+def apply_mil_dropout(probs: NDArray[np.float64], dropout_k: int = 1, dropout_rate: float = 0.5) -> NDArray[np.float64]:
+    """Apply MIL-Dropout by stochastically removing top-k scoring instances.
+    
+    Based on arxiv.org/abs/2504.14783: forces the model to find alternative evidence
+    by masking out the current top-scoring instances during training.
+    
+    Args:
+        probs: Instance probability matrix of shape (n_instances, n_classes)
+        dropout_k: Number of top instances to potentially drop
+        dropout_rate: Probability of dropping each top instance
+        
+    Returns:
+        Modified probabilities with dropout applied
+    """
+    if len(probs.shape) != 2 or probs.shape[0] <= dropout_k:
+        return probs
+    
+    # Calculate max probability for each instance
+    max_probs = np.max(probs, axis=1)
+    
+    # Get indices of top-k instances
+    top_k_indices = np.argpartition(max_probs, -dropout_k)[-dropout_k:]
+    
+    # Create dropout mask
+    dropout_mask = np.ones(probs.shape[0], dtype=bool)
+    
+    # Stochastically drop top-k instances
+    for idx in top_k_indices:
+        if np.random.random() < dropout_rate:
+            dropout_mask[idx] = False
+    
+    # Apply mask (set dropped instances to uniform distribution)
+    probs_dropout = probs.copy()
+    n_classes = probs.shape[1]
+    uniform_prob = 1.0 / n_classes
+    
+    for idx in range(probs.shape[0]):
+        if not dropout_mask[idx]:
+            probs_dropout[idx] = uniform_prob
+    
+    return probs_dropout
+
+
+def logsumexp_smooth_cardinality(scores: NDArray[np.float64], kappa: float = 25.0) -> float:
+    """LogSumExp smooth approximation to cardinality (count of positive assignments).
+    
+    Args:
+        scores: Assignment scores or probabilities
+        kappa: Temperature parameter (higher = tighter approximation to max)
+        
+    Returns:
+        Smooth approximation to the count of positive elements
+    """
+    # For binary assignments, use sigmoid-like transformation
+    # LogSumExp approximation: (1/kappa) * log(sum(exp(kappa * scores)))
+    # This approximates sum(scores > 0.5) for appropriate kappa
+    
+    # Numerical stability: subtract max before exp
+    max_score = np.max(scores)
+    exp_scores = np.exp(kappa * (scores - max_score))
+    lse = max_score + (1.0 / kappa) * np.log(np.sum(exp_scores) + 1e-8)
+    
+    # Scale to approximate count
+    return lse * len(scores) / (1.0 + lse)
+
+
+def compute_instance_early_stopping_mask(
+    probs_history: List[NDArray[np.float64]], 
+    y_history: List[NDArray[np.int_]], 
+    convergence_threshold: float = 0.01,
+    min_history: int = 3
+) -> NDArray[np.bool_]:
+    """Compute Instance-dependent Early Stopping (IES) mask.
+    
+    Based on arxiv.org/abs/2502.07547: stops updating instances whose predictions
+    have stabilized, freeing capacity to learn harder instances.
+    
+    Args:
+        probs_history: History of probability predictions for each instance
+        y_history: History of label assignments for each instance
+        convergence_threshold: Threshold for considering an instance as converged
+        min_history: Minimum history length required to compute convergence
+        
+    Returns:
+        Boolean mask where True means the instance should be frozen (stop updating)
+    """
+    if len(probs_history) < min_history:
+        # Not enough history, don't freeze any instances
+        n_instances = len(probs_history[0]) if probs_history else 0
+        return np.zeros(n_instances, dtype=bool)
+    
+    n_instances = len(probs_history[0])
+    freeze_mask = np.zeros(n_instances, dtype=bool)
+    
+    # Check convergence for each instance
+    for i in range(n_instances):
+        # Check if predictions have been stable
+        recent_probs = [probs[i] for probs in probs_history[-min_history:]]
+        recent_labels = [y[i] for y in y_history[-min_history:]]
+        
+        # Check label stability
+        if len(set(recent_labels)) == 1:  # Same label for recent history
+            # Check probability stability (low variance)
+            prob_std = np.std([np.max(p) for p in recent_probs])
+            if prob_std < convergence_threshold:
+                # Also check if confidence is high
+                avg_confidence = np.mean([np.max(p) for p in recent_probs])
+                if avg_confidence > 0.9:  # High confidence threshold
+                    freeze_mask[i] = True
+    
+    return freeze_mask
+
+
 def compute_margin_aware_confidence(probs: NDArray[np.float64], target_class: int, margin_lambda: float = 0.25) -> float:
     """Compute margin-aware confidence scores.
     
@@ -315,7 +459,7 @@ def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margi
     return assignments
 
 
-def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=None, aem_scores=None, use_gumbel=False, features=None, diversity_lambda=0.1):
+def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=None, aem_scores=None, use_gumbel=False):
     """Solve soft k-of-n assignment using smooth top-k or Gumbel-Top-k operator.
     
     Find soft assignment weights such that sum approximates the optimal k
@@ -329,8 +473,6 @@ def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=N
         margin_scores: margin-based scores for weighting (optional)
         aem_scores: AEM-based scores for weighting (optional)
         use_gumbel: whether to use Gumbel-Top-k (True) or Smooth Top-k (False)
-        features: instance features for diversity computation (optional)
-        diversity_lambda: weight for diversity penalty (optional)
         
     Returns:
         soft_assignments: continuous weights in [0, 1]
@@ -354,26 +496,6 @@ def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=N
     # Combine with AEM scores (when active)
     if aem_scores is not None and len(aem_scores) == len(probs):
         log_odds = log_odds + 0.1 * aem_scores  # Moderate weight for AEM
-    
-    # Apply diversity penalty if features provided
-    if features is not None and diversity_lambda > 0 and len(features) > 1:
-        # Compute pairwise similarities
-        # Normalize features
-        norm_features = features / (np.linalg.norm(features, axis=1, keepdims=True) + 1e-8)
-        similarities = np.dot(norm_features, norm_features.T)
-        
-        # For each instance, reduce score if similar instances have high scores
-        diversity_penalty = np.zeros(n)
-        for i in range(n):
-            # Weight similarity by probability of other instances
-            weighted_sim = similarities[i] * probs
-            # Exclude self-similarity
-            weighted_sim[i] = 0
-            # Penalty is sum of weighted similarities
-            diversity_penalty[i] = np.sum(weighted_sim)
-        
-        # Apply diversity penalty to scores
-        log_odds = log_odds - diversity_lambda * diversity_penalty
     
     # Find optimal k using gradient-free search
     best_k = k_min
@@ -514,6 +636,8 @@ class MilCountBasedMultiClassLearner:
 
         # Initialize y
         n_list = [len(bag) for bag in bags]
+        n_bags = len(bags)
+        
         if not initial_y:
             # Improved initialization: consider constraint satisfaction potential
             y = []
@@ -548,53 +672,114 @@ class MilCountBasedMultiClassLearner:
                 best_class = np.argmax(constraint_scores)
                 y.append(np.repeat(best_class, n_instances_in_bag))
         else:
-            # For external initialization, apply soft refinement
+            # For external initialization, apply sophisticated refinement
             y = []
+            bag_init_quality = np.zeros(n_bags)  # Track initialization quality per bag
+            instance_init_confidence = []  # Track per-instance init confidence
+            
             for i_bag, (init_labels, n_instances_in_bag) in enumerate(zip(initial_y, n_list)):
                 # Check if external init satisfies constraints
                 init_class_counts = pd.Series(init_labels).value_counts().to_dict()
                 
-                # Calculate constraint violations
+                # Calculate detailed constraint violations
                 total_violation = 0
+                violation_details = {}
                 for i_class in range(n_classes):
                     count = init_class_counts.get(i_class, 0)
-                    if count < lower_threshold[i_bag, i_class]:
-                        total_violation += lower_threshold[i_bag, i_class] - count
-                    elif count > upper_threshold[i_bag, i_class]:
-                        total_violation += count - upper_threshold[i_bag, i_class]
+                    lower = lower_threshold[i_bag, i_class]
+                    upper = upper_threshold[i_bag, i_class]
+                    
+                    if count < lower:
+                        violation = lower - count
+                        total_violation += violation
+                        violation_details[i_class] = -violation  # Negative means deficit
+                    elif count > upper:
+                        violation = count - upper
+                        total_violation += violation
+                        violation_details[i_class] = violation  # Positive means excess
                 
-                # If violations are severe, apply partial correction
-                if total_violation > n_instances_in_bag * 0.3:  # More than 30% violation
-                    # Mix external init with constraint-based init
-                    constraint_scores = np.zeros(n_classes)
-                    for i_class in range(n_classes):
-                        count = init_class_counts.get(i_class, 0)
-                        lower = lower_threshold[i_bag, i_class]
-                        upper = upper_threshold[i_bag, i_class]
-                        
-                        # Bias towards reducing violations
-                        if count < lower:
-                            constraint_scores[i_class] = (lower - count) / n_instances_in_bag
-                        elif count > upper:
-                            constraint_scores[i_class] = -(count - upper) / n_instances_in_bag
+                # Calculate initialization quality score (0-1, higher is better)
+                violation_ratio = total_violation / (n_instances_in_bag + 1e-8)
+                bag_init_quality[i_bag] = np.exp(-2.0 * violation_ratio)  # Exponential penalty
+                
+                # Instance-level confidence based on class distribution
+                instance_confidence = np.ones(n_instances_in_bag)
+                for idx in range(n_instances_in_bag):
+                    class_label = init_labels[idx]
+                    count = init_class_counts.get(class_label, 0)
+                    lower = lower_threshold[i_bag, class_label]
+                    upper = upper_threshold[i_bag, class_label]
                     
-                    # Apply soft correction: randomly flip some labels
+                    # Lower confidence for instances in violated classes
+                    if count < lower:
+                        # Under-represented class: low confidence for changing away
+                        instance_confidence[idx] = 0.3 + 0.4 * (count / lower)
+                    elif count > upper:
+                        # Over-represented class: low confidence for keeping
+                        excess_ratio = (count - upper) / upper
+                        instance_confidence[idx] = max(0.2, 0.8 - excess_ratio)
+                    else:
+                        # Within bounds: high confidence
+                        instance_confidence[idx] = 0.9
+                
+                instance_init_confidence.append(instance_confidence)
+                
+                # Adaptive correction based on violation severity
+                if violation_ratio > 0.2:  # More than 20% violation (less strict than before)
+                    # Smart correction: prioritize based on violation details
                     corrected_labels = init_labels.copy()
-                    n_corrections = min(int(total_violation * 0.5), n_instances_in_bag // 4)
                     
-                    for _ in range(n_corrections):
-                        # Find instance to change
-                        from_class = np.argmin(constraint_scores)
-                        to_class = np.argmax(constraint_scores)
+                    # Calculate desired changes per class
+                    changes_needed = {}
+                    for i_class, violation in violation_details.items():
+                        changes_needed[i_class] = -violation  # Negative violation means we need more
+                    
+                    # Sort instances by confidence (ascending) for potential changes
+                    change_candidates = []
+                    for idx in range(n_instances_in_bag):
+                        if instance_confidence[idx] < 0.7:  # Low confidence instances
+                            change_candidates.append((idx, instance_confidence[idx]))
+                    
+                    change_candidates.sort(key=lambda x: x[1])
+                    
+                    # Apply targeted corrections
+                    n_corrections = min(len(change_candidates), int(total_violation * 0.4))
+                    
+                    for i in range(n_corrections):
+                        idx, _ = change_candidates[i]
+                        current_class = corrected_labels[idx]
                         
-                        candidates = np.where(corrected_labels == from_class)[0]
-                        if len(candidates) > 0:
-                            idx = np.random.choice(candidates)
-                            corrected_labels[idx] = to_class
+                        # Find best target class based on needs
+                        best_target = None
+                        best_score = -np.inf
+                        
+                        for target_class in range(n_classes):
+                            if target_class == current_class:
+                                continue
                             
-                            # Update scores
-                            constraint_scores[from_class] += 1.0 / n_instances_in_bag
-                            constraint_scores[to_class] -= 1.0 / n_instances_in_bag
+                            # Score based on how much this change helps
+                            score = 0
+                            if current_class in changes_needed:
+                                score += changes_needed[current_class]  # Benefit of removing from current
+                            if target_class in changes_needed:
+                                score -= changes_needed[target_class]  # Benefit of adding to target
+                            
+                            if score > best_score:
+                                best_score = score
+                                best_target = target_class
+                        
+                        if best_target is not None:
+                            corrected_labels[idx] = best_target
+                            # Update needs
+                            if current_class in changes_needed:
+                                changes_needed[current_class] += 1
+                            if best_target in changes_needed:
+                                changes_needed[best_target] -= 1
+                            # Update counts
+                            init_class_counts[current_class] -= 1
+                            if init_class_counts[current_class] == 0:
+                                del init_class_counts[current_class]
+                            init_class_counts[best_target] = init_class_counts.get(best_target, 0) + 1
                     
                     y.append(corrected_labels)
                 else:
@@ -602,55 +787,127 @@ class MilCountBasedMultiClassLearner:
                     y.append(init_labels.copy())
             
         # Initialize simple parameters
-        n_bags = len(bags)
+        # Check if using external initialization
+        is_external_init = initial_y is not None
         
-        # Simplified temperature schedule focusing on Smooth Top-k
-        # Minimal use of Gumbel-Top-k for initial exploration only
-        gumbel_temp = 1.0   # Fixed moderate temperature for Gumbel
-        
-        # Smooth Top-k temperature schedule with cosine annealing
-        smooth_temp_start = 1.0   # Slightly higher starting temperature
-        smooth_temp_end = 0.2     # Lower final temperature for precision
+        # Adaptive temperature schedule based on initialization type
+        if is_external_init:
+            # For external init: 2x auto-init temperature (based on o3 MCP recommendation)
+            # This provides better exploration without excessive randomness
+            smooth_temp_start = 2.0   # 2x auto-init temperature
+            smooth_temp_end = 0.15    # Lower final temperature for precision
+            gumbel_temp = 2.0         # Consistent with smooth temperature
+            # Use exponential decay with moderate rate
+            temp_decay_rate = 0.9     # Moderate decay to balance exploration/exploitation
+        else:
+            # Original temperature schedule for auto-init
+            smooth_temp_start = 1.0
+            smooth_temp_end = 0.2
+            gumbel_temp = 1.0
+            temp_decay_rate = None    # Use cosine schedule
         
         # Temperature scheduling parameters
         temperature_cosine_period = 0.6  # Cosine annealing for first 60% of iterations
+        
+        # Instance-specific temperature scaling based on init confidence
+        if is_external_init:
+            # Use init confidence to scale temperature per instance
+            instance_temp_scale = []
+            for i_bag in range(n_bags):
+                # Scale inversely with confidence: low confidence -> high temperature
+                # Range: [0.8, 2.0] based on confidence [0.9, 0.2]
+                bag_scale = 2.0 - 1.2 * instance_init_confidence[i_bag]
+                # Further scale by bag quality
+                bag_scale = bag_scale * (2.0 - bag_init_quality[i_bag])
+                instance_temp_scale.append(bag_scale)
+        else:
+            # Default scaling for auto-init
+            instance_temp_scale = [np.ones(len(bag)) for bag in bags]
         
         # Self-paced learning: track bag difficulty scores and convergence
         bag_difficulty = np.zeros(n_bags)
         bag_convergence = np.zeros(n_bags)  # Track how stable each bag's assignments are
         
         # Adaptive confidence-based freezing
-        confidence_threshold = 0.95  # Slightly lower for better coverage
-        margin_lambda = 0.4   # Increased margin importance for better discrimination
+        if is_external_init:
+            confidence_threshold = 0.97  # Higher threshold for external init to allow more changes
+            margin_lambda = 0.5   # Higher margin importance for external init
+        else:
+            confidence_threshold = 0.95  # Original for auto-init
+            margin_lambda = 0.4   # Original margin importance
+        
+        # Initialize adaptive penalty parameters for constraints (ADMM-inspired)
+        rho_lower = np.ones((n_bags, n_classes)) * 0.5  # Start with moderate penalties
+        rho_upper = np.ones((n_bags, n_classes)) * 0.5
+        
+        # For external init with violations, start with higher penalties
+        if is_external_init:
+            for i_bag in range(n_bags):
+                if bag_init_quality[i_bag] < 0.5:  # Poor quality init
+                    rho_lower[i_bag, :] *= 2.0
+                    rho_upper[i_bag, :] *= 2.0
+        
+        # Initialize MIL-Dropout parameters
+        mil_dropout_k = 1  # Number of top instances to potentially drop
+        mil_dropout_rate = 0.5  # Probability of dropping
+        # Apply MIL-Dropout longer for external init to prevent early convergence
+        mil_dropout_schedule = 0.4 if is_external_init else 0.2  # 40% for external, 20% for auto
+        
+        # Initialize IES (Instance-dependent Early Stopping) tracking
+        ies_history = []  # Track probability and label history per bag
+        for _ in range(n_bags):
+            ies_history.append({
+                'probs': [],
+                'labels': []
+            })
         
         for i_iter in range(max_iter):
-            # Limit Gumbel exploration to first iteration only for minimal stochasticity
-            use_gumbel = (i_iter == 0)
-            
-            # Smooth temperature schedule with cosine annealing
-            if i_iter < int(max_iter * temperature_cosine_period):
-                # Cosine annealing for exploration phase
-                cosine_progress = i_iter / (max_iter * temperature_cosine_period)
-                temperature = smooth_temp_end + 0.5 * (smooth_temp_start - smooth_temp_end) * (1 + np.cos(np.pi * cosine_progress))
+            # Extended Gumbel exploration for external init to prevent early convergence
+            if is_external_init:
+                use_gumbel = (i_iter < 2)  # First 2 iterations for external init
             else:
-                # Linear decay for exploitation phase
-                linear_progress = (i_iter - int(max_iter * temperature_cosine_period)) / (max_iter - int(max_iter * temperature_cosine_period))
-                temperature = smooth_temp_end + (smooth_temp_start * 0.3 - smooth_temp_end) * (1 - linear_progress)
+                use_gumbel = (i_iter == 0)  # First iteration only for auto-init
+            
+            # Temperature schedule based on initialization type
+            if is_external_init and temp_decay_rate is not None:
+                # Exponential decay for external init: τₜ = max(τ_min, τ₀ * γ^t)
+                temperature = max(smooth_temp_end, smooth_temp_start * (temp_decay_rate ** i_iter))
+            else:
+                # Original cosine annealing for auto-init
+                if i_iter < int(max_iter * temperature_cosine_period):
+                    # Cosine annealing for exploration phase
+                    cosine_progress = i_iter / (max_iter * temperature_cosine_period)
+                    temperature = smooth_temp_end + 0.5 * (smooth_temp_start - smooth_temp_end) * (1 + np.cos(np.pi * cosine_progress))
+                else:
+                    # Linear decay for exploitation phase
+                    linear_progress = (i_iter - int(max_iter * temperature_cosine_period)) / (max_iter - int(max_iter * temperature_cosine_period))
+                    temperature = smooth_temp_end + (smooth_temp_start * 0.3 - smooth_temp_end) * (1 - linear_progress)
             
             # Override temperature for Gumbel case
             if use_gumbel:
                 temperature = gumbel_temp
             
-            # AEM schedule: stronger in middle iterations, reduced at start and end
-            if i_iter == 0:
-                aem_lambda = 0.05  # Low at start to establish baseline
-            elif i_iter < int(max_iter * 0.7):
-                # Cosine schedule peaking at iteration 3-4
-                aem_progress = min(1.0, i_iter / 4.0)
-                aem_lambda = 0.4 * 0.5 * (1 - np.cos(np.pi * aem_progress))
+            # AEM schedule: adapt based on initialization type
+            if is_external_init:
+                # For external init: moderate AEM following o3 recommendations
+                # Start with λ = 0.15-0.2 and cosine decay to 0
+                if i_iter < int(max_iter * 0.6):  # First 60% of iterations
+                    # Cosine annealing from 0.2 to 0
+                    aem_progress = i_iter / (max_iter * 0.6)
+                    aem_lambda = 0.2 * 0.5 * (1 + np.cos(np.pi * aem_progress))
+                else:
+                    aem_lambda = 0.0  # No entropy regularization in final iterations
             else:
-                # Gradual reduction in final iterations
-                aem_lambda = 0.1 * (1 - (i_iter - int(max_iter * 0.7)) / (max_iter - int(max_iter * 0.7)))
+                # Original AEM schedule for auto-init
+                if i_iter == 0:
+                    aem_lambda = 0.05  # Low at start to establish baseline
+                elif i_iter < int(max_iter * 0.7):
+                    # Cosine schedule peaking at iteration 3-4
+                    aem_progress = min(1.0, i_iter / 4.0)
+                    aem_lambda = 0.4 * 0.5 * (1 - np.cos(np.pi * aem_progress))
+                else:
+                    # Gradual reduction in final iterations
+                    aem_lambda = 0.1 * (1 - (i_iter - int(max_iter * 0.7)) / (max_iter - int(max_iter * 0.7)))
             
             # Fit
             flatten_bags = np.vstack(bags)
@@ -679,6 +936,14 @@ class MilCountBasedMultiClassLearner:
                 n_instances = len(bags[i_bag])
                 probs = fs[i_bag]  # Shape: (n_instances, n_classes)
                 
+                # Apply MIL-Dropout during early iterations
+                if i_iter < int(max_iter * mil_dropout_schedule):
+                    probs = apply_mil_dropout(probs, dropout_k=mil_dropout_k, dropout_rate=mil_dropout_rate)
+                
+                # Update IES history
+                ies_history[i_bag]['probs'].append(probs.copy())
+                ies_history[i_bag]['labels'].append(y[i_bag].copy())
+                
                 # Get current class counts
                 class_count_dict = pd.Series(y[i_bag]).value_counts().to_dict()
                 
@@ -686,9 +951,19 @@ class MilCountBasedMultiClassLearner:
                 changed_indices = set()
                 new_y = y[i_bag].copy()
                 
+                # Compute IES mask (instances that have converged)
+                ies_mask = compute_instance_early_stopping_mask(
+                    ies_history[i_bag]['probs'],
+                    ies_history[i_bag]['labels'],
+                    convergence_threshold=0.01,
+                    min_history=3
+                )
+                
                 # Adaptive confidence-based freezing with convergence tracking
                 frozen_indices = set()
-                if i_iter >= 2:  # Start freezing earlier
+                # Delay freezing for external init to allow more exploration
+                freeze_start_iter = 6 if is_external_init else 2  # Delay freezing to iteration 6 for external init
+                if i_iter >= freeze_start_iter:
                     max_probs = np.max(probs, axis=1)
                     predicted_classes = np.argmax(probs, axis=1)
                     
@@ -696,23 +971,30 @@ class MilCountBasedMultiClassLearner:
                     adaptive_threshold = confidence_threshold - 0.02 * min(1.0, bag_convergence[i_bag] / 3.0)
                     
                     for idx in range(n_instances):
-                        # Freeze if high confidence AND consistent with current assignment
-                        if max_probs[idx] > adaptive_threshold and y[i_bag][idx] == predicted_classes[idx]:
+                        # Freeze if high confidence AND consistent with current assignment OR IES converged
+                        if (max_probs[idx] > adaptive_threshold and y[i_bag][idx] == predicted_classes[idx]) or ies_mask[idx]:
                             frozen_indices.add(idx)
                 
                 # For binary classification, use exact k-of-n solver
                 if n_classes == 2:
-                    # Apply minimal slack only in first iteration for robustness
+                    # Apply constraint slack based on initialization type
                     effective_lower_0 = lower_threshold[i_bag, 0]
                     effective_upper_0 = upper_threshold[i_bag, 0]
                     effective_lower_1 = lower_threshold[i_bag, 1]
                     effective_upper_1 = upper_threshold[i_bag, 1]
                     
-                    if i_iter == 0:  # Only first iteration
-                        effective_lower_0 = effective_lower_0 * 0.98  # 2% slack - more conservative
-                        effective_upper_0 = effective_upper_0 * 1.02  # 2% slack - more conservative
-                        effective_lower_1 = effective_lower_1 * 0.98  # 2% slack - more conservative
-                        effective_upper_1 = effective_upper_1 * 1.02  # 2% slack - more conservative
+                    # More slack for external init to allow exploration
+                    if is_external_init and i_iter < 4:
+                        slack_ratio = 0.95 if i_iter < 2 else 0.97  # 5% slack first 2 iters, then 3%
+                        effective_lower_0 = effective_lower_0 * slack_ratio
+                        effective_upper_0 = effective_upper_0 * (2.0 - slack_ratio)
+                        effective_lower_1 = effective_lower_1 * slack_ratio
+                        effective_upper_1 = effective_upper_1 * (2.0 - slack_ratio)
+                    elif i_iter == 0:  # Auto-init: only first iteration
+                        effective_lower_0 = effective_lower_0 * 0.98  # 2% slack
+                        effective_upper_0 = effective_upper_0 * 1.02  # 2% slack
+                        effective_lower_1 = effective_lower_1 * 0.98  # 2% slack
+                        effective_upper_1 = effective_upper_1 * 1.02  # 2% slack
                     
                     # For binary case, we optimize for class 1
                     # The constraint is: effective_lower_1 <= k <= effective_upper_1
@@ -756,17 +1038,26 @@ class MilCountBasedMultiClassLearner:
                         # Use Gumbel-Top-k only during first iteration
                         # use_gumbel already set above
                         
-                        # Get features for diversity if available
-                        active_features = probs[active_indices] if n_active > 1 else None
+                        # Calculate instance-specific temperatures
+                        active_temperatures = []
+                        for idx in active_indices:
+                            inst_temp = temperature * instance_temp_scale[i_bag][idx]
+                            active_temperatures.append(inst_temp)
+                        
+                        # Use mean temperature for soft assignment (weighted by instance confidence)
+                        if is_external_init:
+                            # Weight by init confidence for better adaptation
+                            active_confidences = instance_init_confidence[i_bag][active_indices]
+                            weighted_temp = np.sum(active_temperatures * active_confidences) / (np.sum(active_confidences) + 1e-8)
+                        else:
+                            weighted_temp = np.mean(active_temperatures)
                         
                         # Always use soft assignment for differentiability
                         soft_weights = soft_k_of_n_assignment(
                             active_probs, k_min_active, k_max_active, 
-                            temperature=temperature,  # Use the independent temperature schedule
+                            temperature=weighted_temp,  # Use weighted temperature
                             margin_scores=margin_scores, aem_scores=aem_scores,
-                            use_gumbel=use_gumbel,
-                            features=active_features,
-                            diversity_lambda=0.15 if i_iter > 1 else 0.0  # Enable diversity after initial iterations
+                            use_gumbel=use_gumbel
                         )
                         
                         # Straight-through estimator: hard assignment for forward, soft for backward
@@ -818,9 +1109,13 @@ class MilCountBasedMultiClassLearner:
                     for i_class in target_classes:
                         class_count = class_count_dict.get(i_class, 0)
                         
-                        # Apply constraint slack for first iteration only
-                        if i_iter == 0:
-                            # 2% slack in first iteration - more conservative
+                        # Apply constraint slack based on initialization type
+                        if is_external_init and i_iter < 4:
+                            # More slack for external init
+                            slack_ratio = 0.95 if i_iter < 2 else 0.97
+                            effective_lower = lower_threshold[i_bag, i_class] * slack_ratio
+                        elif i_iter == 0:
+                            # 2% slack in first iteration for auto-init
                             effective_lower = lower_threshold[i_bag, i_class] * 0.98
                         else:
                             effective_lower = lower_threshold[i_bag, i_class]
@@ -839,13 +1134,15 @@ class MilCountBasedMultiClassLearner:
                                     margin_conf = compute_margin_aware_confidence(probs[idx], i_class, margin_lambda=margin_lambda)
                                     score = base_score + 0.1 * (margin_conf - base_score)
                                     
-                                    # Strong boost/penalty based on constraint satisfaction
+                                    # Adaptive boost/penalty based on constraint satisfaction
                                     current_class = new_y[idx]
                                     current_class_count = class_count_dict.get(current_class, 0)
                                     if current_class_count > upper_threshold[i_bag, current_class]:
-                                        score *= 3.0  # Strong boost for moving from over-represented class
+                                        # Use adaptive penalty for stronger boost
+                                        score *= (2.0 + rho_upper[i_bag, current_class])
                                     elif current_class_count <= lower_threshold[i_bag, current_class]:
-                                        score *= 0.3  # Strong penalty for taking from under-represented class
+                                        # Use adaptive penalty for stronger penalty
+                                        score *= (1.0 / (1.0 + rho_lower[i_bag, current_class]))
                                     
                                     candidates.append((idx, score))
                             
@@ -870,8 +1167,12 @@ class MilCountBasedMultiClassLearner:
                         class_count = class_count_dict.get(i_class, 0)
                         
                         # Apply adaptive constraint slack for upper threshold
-                        if i_iter == 0:
-                            effective_upper = upper_threshold[i_bag, i_class] * 1.02  # 2% slack - more conservative
+                        if is_external_init and i_iter < 4:
+                            # More slack for external init
+                            slack_ratio = 0.95 if i_iter < 2 else 0.97
+                            effective_upper = upper_threshold[i_bag, i_class] * (2.0 - slack_ratio)
+                        elif i_iter == 0:
+                            effective_upper = upper_threshold[i_bag, i_class] * 1.02  # 2% slack for auto-init
                         else:
                             effective_upper = upper_threshold[i_bag, i_class]
                         
@@ -906,14 +1207,16 @@ class MilCountBasedMultiClassLearner:
                                     margin_conf = compute_margin_aware_confidence(probs[idx], c, margin_lambda=margin_lambda)
                                     scores[c] = base_log_score + 0.1 * np.log(max(margin_conf, 1e-8) + 1e-8)
                                     
-                                    # Strong constraint bonus/penalty
+                                    # Adaptive constraint bonus/penalty
                                     c_count = class_count_dict.get(c, 0)
                                     if c_count < lower_threshold[i_bag, c]:
-                                        scores[c] += 3.0  # Strong incentive for under-represented classes
+                                        # Use adaptive penalty for incentive
+                                        scores[c] += (2.0 + rho_lower[i_bag, c])
                                     elif c_count < upper_threshold[i_bag, c]:
                                         scores[c] += 1.0
                                     else:
-                                        scores[c] -= 2.0  # Strong penalty for over-represented classes
+                                        # Use adaptive penalty for penalty
+                                        scores[c] -= (1.0 + rho_upper[i_bag, c])
                                 
                                 # Apply temperature
                                 exp_scores = np.exp(scores / temperature)
@@ -955,26 +1258,23 @@ class MilCountBasedMultiClassLearner:
                     if class_count > upper_threshold[i_bag, i_class]:
                         constraint_violation += class_count - upper_threshold[i_bag, i_class]
                     
-                    # Add differentiable count constraint loss (L1)
+                    # Add differentiable count constraint loss using LogSumExp
                     if n_classes == 2 and i_class == 1:
-                        # For binary case, compute soft count loss
+                        # For binary case, compute soft count loss using LogSumExp
                         target_k = (lower_threshold[i_bag, 1] + upper_threshold[i_bag, 1]) / 2
-                        soft_count = np.sum(probs[:, 1])  # Sum of probabilities for positive class
-                        count_loss = 0.2 * abs(soft_count - target_k)  # Weight = 0.2 as recommended
+                        # Use LogSumExp for smoother gradient
+                        lse_count = logsumexp_smooth_cardinality(probs[:, 1], kappa=25.0)
+                        count_loss = 0.3 * abs(lse_count - target_k)  # Slightly higher weight for external init
                 
                 bag_difficulty[i_bag] = constraint_violation + count_loss
 
             if debug:
-                # Compute BEL for monitoring
-                bag_labels = [np.argmax(np.bincount(labels)) for labels in y]
-                bel_loss = compute_bag_embedding_loss(bags, bag_labels, temperature=0.1)
-                
                 # Check which operator is being used
                 if use_gumbel:
                     operator = "Gumbel-Top-k"
                 else:
                     operator = "Smooth-Top-k"
-                print(f"iter: {i_iter}, operator: {operator}, temperature: {temperature:.3f}, aem_lambda: {aem_lambda:.3f}, BEL: {bel_loss:.3f}")
+                print(f"iter: {i_iter}, operator: {operator}, temperature: {temperature:.3f}, aem_lambda: {aem_lambda:.3f}")
                 predicted_count = np.nan_to_num(
                     pd.DataFrame([pd.Series(b).value_counts().to_dict() for b in y])[list(range(n_classes))].values,
                 )
@@ -1010,6 +1310,38 @@ class MilCountBasedMultiClassLearner:
             elif not has_changed and i_iter < 4:
                 if debug:
                     print(f"Early convergence at iteration {i_iter}, continuing exploration...")
+            
+            # Update adaptive penalties based on constraint violations (ADMM-style)
+            if i_iter < max_iter - 1 and is_external_init:
+                predicted_count = np.nan_to_num(
+                    pd.DataFrame([pd.Series(b).value_counts().to_dict() for b in y])[list(range(n_classes))].values,
+                )
+                
+                # Adaptive penalty update for lower constraints
+                lower_violations = np.maximum(lower_threshold - predicted_count, 0)
+                for i_bag in range(n_bags):
+                    for i_class in range(n_classes):
+                        if lower_violations[i_bag, i_class] > 0:
+                            # Increase penalty for violated constraints
+                            # Scale increase by bag init quality (worse init -> faster increase)
+                            increase_rate = 1.1 + 0.2 * (1.0 - bag_init_quality[i_bag])
+                            rho_lower[i_bag, i_class] *= increase_rate
+                        else:
+                            # Decrease penalty for satisfied constraints
+                            rho_lower[i_bag, i_class] *= 0.95
+                        # Clamp to reasonable range
+                        rho_lower[i_bag, i_class] = np.clip(rho_lower[i_bag, i_class], 0.1, 5.0)
+                
+                # Adaptive penalty update for upper constraints
+                upper_violations = np.maximum(predicted_count - upper_threshold, 0)
+                for i_bag in range(n_bags):
+                    for i_class in range(n_classes):
+                        if upper_violations[i_bag, i_class] > 0:
+                            increase_rate = 1.1 + 0.2 * (1.0 - bag_init_quality[i_bag])
+                            rho_upper[i_bag, i_class] *= increase_rate
+                        else:
+                            rho_upper[i_bag, i_class] *= 0.95
+                        rho_upper[i_bag, i_class] = np.clip(rho_upper[i_bag, i_class], 0.1, 5.0)
             
             # Only break after minimum iterations
             if i_iter >= min_iterations - 1:
