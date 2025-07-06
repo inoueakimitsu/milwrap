@@ -33,7 +33,73 @@ def compute_instance_confidence_scores(bag_probs: NDArray[np.float64]) -> NDArra
     return max_probs
 
 
-def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambda_entropy: float = 0.05) -> NDArray[np.float64]:
+def compute_bag_embedding_loss(bag_features: List[NDArray[np.float64]], bag_labels: List[int], temperature: float = 0.1) -> float:
+    """Compute Bag-Embedding Loss (BEL) for contrastive learning at bag level.
+    
+    Based on BEL (2023): contrastive loss in bag-embedding space to ensure
+    bags of same class are close while different classes are separated.
+    
+    Args:
+        bag_features: List of bag feature matrices (each bag's instance features)
+        bag_labels: List of bag labels
+        temperature: Temperature parameter for contrastive loss
+        
+    Returns:
+        BEL loss value
+    """
+    if len(bag_features) < 2:
+        return 0.0
+    
+    n_bags = len(bag_features)
+    
+    # Compute bag embeddings as mean of instance features
+    bag_embeddings = []
+    for features in bag_features:
+        if len(features) > 0:
+            bag_embedding = np.mean(features, axis=0)
+            # L2 normalize
+            bag_embedding = bag_embedding / (np.linalg.norm(bag_embedding) + 1e-8)
+            bag_embeddings.append(bag_embedding)
+    
+    if len(bag_embeddings) < 2:
+        return 0.0
+    
+    bag_embeddings = np.stack(bag_embeddings)
+    
+    # Compute pairwise cosine similarities
+    similarities = np.dot(bag_embeddings, bag_embeddings.T)
+    
+    # Create label mask (1 if same class, 0 otherwise)
+    label_mask = np.array([[1 if bag_labels[i] == bag_labels[j] else 0 
+                           for j in range(n_bags)] for i in range(n_bags)])
+    
+    # Remove diagonal
+    mask = 1 - np.eye(n_bags)
+    similarities = similarities * mask
+    label_mask = label_mask * mask
+    
+    # Compute contrastive loss
+    exp_sim = np.exp(similarities / temperature)
+    
+    # For each bag, compute loss
+    losses = []
+    for i in range(n_bags):
+        # Positive pairs (same class)
+        pos_mask = label_mask[i] > 0
+        if np.sum(pos_mask) > 0:
+            pos_sim = np.sum(exp_sim[i] * pos_mask) / np.sum(pos_mask)
+            
+            # All pairs (for denominator)
+            all_sim = np.sum(exp_sim[i] * mask[i])
+            
+            if all_sim > 0:
+                loss = -np.log(pos_sim / all_sim + 1e-8)
+                losses.append(loss)
+    
+    return np.mean(losses) if losses else 0.0
+
+
+def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambda_entropy: float = 0.1) -> NDArray[np.float64]:
     """Compute AEM (Attention Entropy Maximization) regularized scores.
     
     Based on AEM research: adds entropy regularizer to prevent over-concentrated attention.
@@ -48,6 +114,8 @@ def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambd
     if len(bag_probs.shape) != 2 or bag_probs.shape[0] == 0:
         return np.ones(bag_probs.shape[0])
     
+    n_instances, n_classes = bag_probs.shape
+    
     # Calculate instance-wise attention weights (softmax over max probabilities)
     max_probs = np.max(bag_probs, axis=1)
     attention_weights = np.exp(max_probs) / (np.sum(np.exp(max_probs)) + 1e-10)
@@ -55,11 +123,11 @@ def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambd
     # Calculate attention entropy: H(α) = -Σ αᵢ log(αᵢ)
     attention_entropy = -np.sum(attention_weights * np.log(attention_weights + 1e-10))
     
-    # AEM regularization: encourage higher entropy
-    entropy_bonus = lambda_entropy * attention_entropy
+    # AEM regularization: encourage higher entropy with weighted scores
+    # Apply entropy bonus directly to each instance based on its attention weight
+    aem_scores = max_probs + lambda_entropy * attention_entropy * attention_weights
     
-    # Return scores with entropy bonus
-    return max_probs + entropy_bonus
+    return aem_scores
 
 
 def smooth_topk(scores: NDArray[np.float64], k: float, temperature: float = 1.0) -> NDArray[np.float64]:
@@ -247,7 +315,7 @@ def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margi
     return assignments
 
 
-def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=None, aem_scores=None, use_gumbel=False):
+def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=None, aem_scores=None, use_gumbel=False, features=None, diversity_lambda=0.1):
     """Solve soft k-of-n assignment using smooth top-k or Gumbel-Top-k operator.
     
     Find soft assignment weights such that sum approximates the optimal k
@@ -261,6 +329,8 @@ def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=N
         margin_scores: margin-based scores for weighting (optional)
         aem_scores: AEM-based scores for weighting (optional)
         use_gumbel: whether to use Gumbel-Top-k (True) or Smooth Top-k (False)
+        features: instance features for diversity computation (optional)
+        diversity_lambda: weight for diversity penalty (optional)
         
     Returns:
         soft_assignments: continuous weights in [0, 1]
@@ -284,6 +354,26 @@ def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=N
     # Combine with AEM scores (when active)
     if aem_scores is not None and len(aem_scores) == len(probs):
         log_odds = log_odds + 0.1 * aem_scores  # Moderate weight for AEM
+    
+    # Apply diversity penalty if features provided
+    if features is not None and diversity_lambda > 0 and len(features) > 1:
+        # Compute pairwise similarities
+        # Normalize features
+        norm_features = features / (np.linalg.norm(features, axis=1, keepdims=True) + 1e-8)
+        similarities = np.dot(norm_features, norm_features.T)
+        
+        # For each instance, reduce score if similar instances have high scores
+        diversity_penalty = np.zeros(n)
+        for i in range(n):
+            # Weight similarity by probability of other instances
+            weighted_sim = similarities[i] * probs
+            # Exclude self-similarity
+            weighted_sim[i] = 0
+            # Penalty is sum of weighted similarities
+            diversity_penalty[i] = np.sum(weighted_sim)
+        
+        # Apply diversity penalty to scores
+        log_odds = log_odds - diversity_lambda * diversity_penalty
     
     # Find optimal k using gradient-free search
     best_k = k_min
@@ -458,57 +548,109 @@ class MilCountBasedMultiClassLearner:
                 best_class = np.argmax(constraint_scores)
                 y.append(np.repeat(best_class, n_instances_in_bag))
         else:
-            y = initial_y
+            # For external initialization, apply soft refinement
+            y = []
+            for i_bag, (init_labels, n_instances_in_bag) in enumerate(zip(initial_y, n_list)):
+                # Check if external init satisfies constraints
+                init_class_counts = pd.Series(init_labels).value_counts().to_dict()
+                
+                # Calculate constraint violations
+                total_violation = 0
+                for i_class in range(n_classes):
+                    count = init_class_counts.get(i_class, 0)
+                    if count < lower_threshold[i_bag, i_class]:
+                        total_violation += lower_threshold[i_bag, i_class] - count
+                    elif count > upper_threshold[i_bag, i_class]:
+                        total_violation += count - upper_threshold[i_bag, i_class]
+                
+                # If violations are severe, apply partial correction
+                if total_violation > n_instances_in_bag * 0.3:  # More than 30% violation
+                    # Mix external init with constraint-based init
+                    constraint_scores = np.zeros(n_classes)
+                    for i_class in range(n_classes):
+                        count = init_class_counts.get(i_class, 0)
+                        lower = lower_threshold[i_bag, i_class]
+                        upper = upper_threshold[i_bag, i_class]
+                        
+                        # Bias towards reducing violations
+                        if count < lower:
+                            constraint_scores[i_class] = (lower - count) / n_instances_in_bag
+                        elif count > upper:
+                            constraint_scores[i_class] = -(count - upper) / n_instances_in_bag
+                    
+                    # Apply soft correction: randomly flip some labels
+                    corrected_labels = init_labels.copy()
+                    n_corrections = min(int(total_violation * 0.5), n_instances_in_bag // 4)
+                    
+                    for _ in range(n_corrections):
+                        # Find instance to change
+                        from_class = np.argmin(constraint_scores)
+                        to_class = np.argmax(constraint_scores)
+                        
+                        candidates = np.where(corrected_labels == from_class)[0]
+                        if len(candidates) > 0:
+                            idx = np.random.choice(candidates)
+                            corrected_labels[idx] = to_class
+                            
+                            # Update scores
+                            constraint_scores[from_class] += 1.0 / n_instances_in_bag
+                            constraint_scores[to_class] -= 1.0 / n_instances_in_bag
+                    
+                    y.append(corrected_labels)
+                else:
+                    # Keep external init if constraints are mostly satisfied
+                    y.append(init_labels.copy())
             
         # Initialize simple parameters
         n_bags = len(bags)
         
-        # Independent temperature schedules for GT-k and ST-k
-        # Gumbel-Top-k needs higher temperature for proper exploration
-        gumbel_temp_start = 1.5   # Higher starting temperature for Gumbel
-        gumbel_temp_end = 0.5     # Higher end temperature for Gumbel
+        # Simplified temperature schedule focusing on Smooth Top-k
+        # Minimal use of Gumbel-Top-k for initial exploration only
+        gumbel_temp = 1.0   # Fixed moderate temperature for Gumbel
         
-        # Smooth Top-k temperature schedule
-        smooth_temp_start = 0.9   # Lower starting temperature
-        smooth_temp_end = 0.25    # Lower final temperature
+        # Smooth Top-k temperature schedule with cosine annealing
+        smooth_temp_start = 1.0   # Slightly higher starting temperature
+        smooth_temp_end = 0.2     # Lower final temperature for precision
         
-        temperature_half_life = 0.25  # Temperature half-life as fraction of total iterations
+        # Temperature scheduling parameters
+        temperature_cosine_period = 0.6  # Cosine annealing for first 60% of iterations
         
-        # Self-paced learning: track bag difficulty scores
+        # Self-paced learning: track bag difficulty scores and convergence
         bag_difficulty = np.zeros(n_bags)
+        bag_convergence = np.zeros(n_bags)  # Track how stable each bag's assignments are
         
-        # Simple confidence-based freezing (fixed threshold)
-        confidence_threshold = 0.97  # Higher threshold for more selective freezing
-        margin_lambda = 0.3   # Slightly increased margin importance
+        # Adaptive confidence-based freezing
+        confidence_threshold = 0.95  # Slightly lower for better coverage
+        margin_lambda = 0.4   # Increased margin importance for better discrimination
         
         for i_iter in range(max_iter):
-            # Staged AEM schedule: cosine annealing for first 60% of iterations
-            exploration_phase_end = int(np.ceil(max_iter * 0.6))
+            # Limit Gumbel exploration to first iteration only for minimal stochasticity
+            use_gumbel = (i_iter == 0)
             
-            # Limit Gumbel exploration to first 2 iterations only
-            gumbel_iterations = 2  # Hard limit on stochastic exploration
-            
-            # Phase-dependent temperature schedule
-            if i_iter < exploration_phase_end:
-                # Use Gumbel only in very early iterations
-                if i_iter < gumbel_iterations:
-                    # Rapid temperature decay for Gumbel
-                    temperature = gumbel_temp_start * (0.5 ** i_iter)  # 1.5 -> 0.75 -> 0.375
-                else:
-                    # Switch to deterministic Smooth Top-k early
-                    temperature = max(smooth_temp_end, 
-                                    smooth_temp_start * 0.5 ** ((i_iter - gumbel_iterations) / (temperature_half_life * max_iter)))
-                
-                # Cosine annealing from 0 to max during exploration
-                aem_lambda_max = 0.5  # Increased from 0.3
-                aem_lambda = aem_lambda_max * 0.5 * (1 - np.cos(np.pi * i_iter / exploration_phase_end))
+            # Smooth temperature schedule with cosine annealing
+            if i_iter < int(max_iter * temperature_cosine_period):
+                # Cosine annealing for exploration phase
+                cosine_progress = i_iter / (max_iter * temperature_cosine_period)
+                temperature = smooth_temp_end + 0.5 * (smooth_temp_start - smooth_temp_end) * (1 + np.cos(np.pi * cosine_progress))
             else:
-                # Smooth Top-k temperature for exploitation phase
-                phase_progress = (i_iter - exploration_phase_end) / (max_iter - exploration_phase_end)
-                temperature = max(smooth_temp_end, 
-                                smooth_temp_start * 0.5 ** (phase_progress / temperature_half_life))
-                # Keep small AEM value during exploitation phase
-                aem_lambda = 0.05  # Small constant instead of 0
+                # Linear decay for exploitation phase
+                linear_progress = (i_iter - int(max_iter * temperature_cosine_period)) / (max_iter - int(max_iter * temperature_cosine_period))
+                temperature = smooth_temp_end + (smooth_temp_start * 0.3 - smooth_temp_end) * (1 - linear_progress)
+            
+            # Override temperature for Gumbel case
+            if use_gumbel:
+                temperature = gumbel_temp
+            
+            # AEM schedule: stronger in middle iterations, reduced at start and end
+            if i_iter == 0:
+                aem_lambda = 0.05  # Low at start to establish baseline
+            elif i_iter < int(max_iter * 0.7):
+                # Cosine schedule peaking at iteration 3-4
+                aem_progress = min(1.0, i_iter / 4.0)
+                aem_lambda = 0.4 * 0.5 * (1 - np.cos(np.pi * aem_progress))
+            else:
+                # Gradual reduction in final iterations
+                aem_lambda = 0.1 * (1 - (i_iter - int(max_iter * 0.7)) / (max_iter - int(max_iter * 0.7)))
             
             # Fit
             flatten_bags = np.vstack(bags)
@@ -544,15 +686,18 @@ class MilCountBasedMultiClassLearner:
                 changed_indices = set()
                 new_y = y[i_bag].copy()
                 
-                # Simple confidence-based freezing
+                # Adaptive confidence-based freezing with convergence tracking
                 frozen_indices = set()
-                if i_iter >= 3:  # Start freezing after initial exploration
+                if i_iter >= 2:  # Start freezing earlier
                     max_probs = np.max(probs, axis=1)
                     predicted_classes = np.argmax(probs, axis=1)
                     
+                    # Adjust threshold based on bag convergence
+                    adaptive_threshold = confidence_threshold - 0.02 * min(1.0, bag_convergence[i_bag] / 3.0)
+                    
                     for idx in range(n_instances):
                         # Freeze if high confidence AND consistent with current assignment
-                        if max_probs[idx] > confidence_threshold and y[i_bag][idx] == predicted_classes[idx]:
+                        if max_probs[idx] > adaptive_threshold and y[i_bag][idx] == predicted_classes[idx]:
                             frozen_indices.add(idx)
                 
                 # For binary classification, use exact k-of-n solver
@@ -608,15 +753,20 @@ class MilCountBasedMultiClassLearner:
                         if aem_lambda > 0:
                             aem_scores = compute_attention_entropy_maximization(probs[active_indices], aem_lambda)
                         
-                        # Use Gumbel-Top-k only during first 2 iterations
-                        use_gumbel = i_iter < 2
+                        # Use Gumbel-Top-k only during first iteration
+                        # use_gumbel already set above
+                        
+                        # Get features for diversity if available
+                        active_features = probs[active_indices] if n_active > 1 else None
                         
                         # Always use soft assignment for differentiability
                         soft_weights = soft_k_of_n_assignment(
                             active_probs, k_min_active, k_max_active, 
                             temperature=temperature,  # Use the independent temperature schedule
                             margin_scores=margin_scores, aem_scores=aem_scores,
-                            use_gumbel=use_gumbel
+                            use_gumbel=use_gumbel,
+                            features=active_features,
+                            diversity_lambda=0.15 if i_iter > 1 else 0.0  # Enable diversity after initial iterations
                         )
                         
                         # Straight-through estimator: hard assignment for forward, soft for backward
@@ -787,6 +937,9 @@ class MilCountBasedMultiClassLearner:
                     # Count changes for adaptive temperature
                     total_changes += np.sum(y[i_bag] != new_y)
                     y[i_bag] = new_y
+                    bag_convergence[i_bag] = 0  # Reset convergence counter
+                else:
+                    bag_convergence[i_bag] += 1  # Increment convergence counter
                 
                 # Update bag difficulty score based on constraint violations
                 final_counts = pd.Series(new_y).value_counts().to_dict()
@@ -812,12 +965,16 @@ class MilCountBasedMultiClassLearner:
                 bag_difficulty[i_bag] = constraint_violation + count_loss
 
             if debug:
+                # Compute BEL for monitoring
+                bag_labels = [np.argmax(np.bincount(labels)) for labels in y]
+                bel_loss = compute_bag_embedding_loss(bags, bag_labels, temperature=0.1)
+                
                 # Check which operator is being used
-                if i_iter < gumbel_iterations:
+                if use_gumbel:
                     operator = "Gumbel-Top-k"
                 else:
                     operator = "Smooth-Top-k"
-                print(f"iter: {i_iter}, operator: {operator}, temperature: {temperature:.3f}, aem_lambda: {aem_lambda:.3f}")
+                print(f"iter: {i_iter}, operator: {operator}, temperature: {temperature:.3f}, aem_lambda: {aem_lambda:.3f}, BEL: {bel_loss:.3f}")
                 predicted_count = np.nan_to_num(
                     pd.DataFrame([pd.Series(b).value_counts().to_dict() for b in y])[list(range(n_classes))].values,
                 )
