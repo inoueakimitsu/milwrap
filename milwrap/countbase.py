@@ -33,6 +33,82 @@ def compute_instance_confidence_scores(bag_probs: NDArray[np.float64]) -> NDArra
     return max_probs
 
 
+def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambda_entropy: float = 0.05) -> NDArray[np.float64]:
+    """Compute AEM (Attention Entropy Maximization) regularized scores.
+    
+    Based on AEM research: adds entropy regularizer to prevent over-concentrated attention.
+    
+    Args:
+        bag_probs: Instance probability matrix of shape (n_instances, n_classes).
+        lambda_entropy: Entropy regularization strength.
+        
+    Returns:
+        AEM-regularized scores for each instance.
+    """
+    if len(bag_probs.shape) != 2 or bag_probs.shape[0] == 0:
+        return np.ones(bag_probs.shape[0])
+    
+    # Calculate instance-wise attention weights (softmax over max probabilities)
+    max_probs = np.max(bag_probs, axis=1)
+    attention_weights = np.exp(max_probs) / (np.sum(np.exp(max_probs)) + 1e-10)
+    
+    # Calculate attention entropy: H(α) = -Σ αᵢ log(αᵢ)
+    attention_entropy = -np.sum(attention_weights * np.log(attention_weights + 1e-10))
+    
+    # AEM regularization: encourage higher entropy
+    entropy_bonus = lambda_entropy * attention_entropy
+    
+    # Return scores with entropy bonus
+    return max_probs + entropy_bonus
+
+
+def smooth_topk(scores: NDArray[np.float64], k: float, temperature: float = 1.0) -> NDArray[np.float64]:
+    """Differentiable smooth top-k operator (ST_k).
+    
+    Based on NeurIPS 2024 paper: smooth, differentiable approximation to hard top-k selection.
+    
+    Args:
+        scores: Input scores to select from.
+        k: Target number of selections (can be fractional).
+        temperature: Temperature parameter for smoothness.
+        
+    Returns:
+        Soft selection weights (sum approximately equals k).
+    """
+    n = len(scores)
+    if n == 0 or k <= 0:
+        return np.zeros(n)
+    if k >= n:
+        return np.ones(n)
+    
+    # Sort scores in descending order
+    sorted_indices = np.argsort(scores)[::-1]
+    sorted_scores = scores[sorted_indices]
+    
+    # Compute threshold dynamically
+    # For exact top-k: threshold is between k-th and (k+1)-th elements
+    k_int = int(k)
+    k_frac = k - k_int
+    
+    if k_int < n - 1:
+        # Interpolate threshold between elements
+        threshold = sorted_scores[k_int] * (1 - k_frac)
+        if k_int + 1 < n:
+            threshold += sorted_scores[k_int + 1] * k_frac
+    else:
+        threshold = sorted_scores[k_int]
+    
+    # Smooth selection using sigmoid
+    smooth_scores = 1 / (1 + np.exp(-(scores - threshold) / temperature))
+    
+    # Normalize to ensure sum equals k (projection step)
+    current_sum = np.sum(smooth_scores)
+    if current_sum > 0:
+        smooth_scores = smooth_scores * k / current_sum
+    
+    return smooth_scores
+
+
 def compute_margin_aware_confidence(probs: NDArray[np.float64], target_class: int, margin_lambda: float = 0.25) -> float:
     """Compute margin-aware confidence scores.
     
@@ -126,6 +202,62 @@ def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margi
         assignments[sorted_indices[:best_k]] = 1
     
     return assignments
+
+
+def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=None, aem_scores=None):
+    """Solve soft k-of-n assignment using smooth top-k operator.
+    
+    Find soft assignment weights such that sum approximates the optimal k
+    within [k_min, k_max] range, using differentiable ST_k operator.
+    
+    Args:
+        probs: probabilities for positive class (n_instances,)
+        k_min: minimum number of positive instances
+        k_max: maximum number of positive instances  
+        temperature: temperature for ST_k operator
+        margin_scores: margin-based scores for weighting (optional)
+        aem_scores: AEM-based scores for weighting (optional)
+        
+    Returns:
+        soft_assignments: continuous weights in [0, 1]
+    """
+    n = len(probs)
+    
+    # Handle edge cases
+    if k_min > n:
+        return np.ones(n)
+    if k_max < 0:
+        return np.zeros(n)
+    
+    # Compute scores combining multiple signals
+    eps = 1e-8
+    log_odds = np.log(probs + eps) - np.log(1 - probs + eps)
+    
+    # Combine with margin scores
+    if margin_scores is not None and len(margin_scores) == len(probs):
+        log_odds = log_odds + 0.1 * margin_scores
+    
+    # Combine with AEM scores (when active)
+    if aem_scores is not None and len(aem_scores) == len(probs):
+        log_odds = log_odds + 0.1 * aem_scores  # Moderate weight for AEM
+    
+    # Find optimal k using gradient-free search
+    best_k = k_min
+    best_score = -np.inf
+    
+    for k in range(max(0, k_min), min(n, k_max) + 1):
+        # Use ST_k to get soft assignments
+        soft_weights = smooth_topk(log_odds, k, temperature)
+        
+        # Score is expected log probability
+        score = np.sum(soft_weights * np.log(probs + eps))
+        
+        if score > best_score:
+            best_score = score
+            best_k = k
+    
+    # Return soft assignments for best k
+    return smooth_topk(log_odds, best_k, temperature)
 
 
 def get_order_based_initial_bag_labels(
@@ -279,20 +411,32 @@ class MilCountBasedMultiClassLearner:
         # Initialize simple parameters
         n_bags = len(bags)
         
-        # Simple exponential temperature decay (from ablation study)
-        temperature_start = 2.0  # Higher starting temperature for exploration
-        temperature_end = 0.1    # Final temperature for precise assignments
+        # Independent temperature schedule for ST_k
+        temperature_start = 0.9   # Lower starting temperature (detached from AEM)
+        temperature_end = 0.25    # Higher final temperature to maintain gradient flow
+        temperature_half_life = 0.25  # Temperature half-life as fraction of total iterations
         
         # Self-paced learning: track bag difficulty scores
         bag_difficulty = np.zeros(n_bags)
         
         # Simple confidence-based freezing (fixed threshold)
         confidence_threshold = 0.97  # Higher threshold for more selective freezing
-        margin_lambda = 0.25  # Standard margin importance
+        margin_lambda = 0.3   # Slightly increased margin importance
         
         for i_iter in range(max_iter):
-            # Simple exponential temperature decay
-            temperature = temperature_start * (temperature_end / temperature_start) ** (i_iter / max_iter)
+            # Independent exponential temperature decay with half-life
+            temperature = max(temperature_end, 
+                            temperature_start * 0.5 ** (i_iter / (temperature_half_life * max_iter)))
+            
+            # Staged AEM schedule: cosine annealing for first 60% of iterations
+            exploration_phase_end = int(np.ceil(max_iter * 0.6))  # Use ceiling to ensure proper duration
+            if i_iter < exploration_phase_end:
+                # Cosine annealing from 0 to max during exploration
+                aem_lambda_max = 0.5  # Increased from 0.3
+                aem_lambda = aem_lambda_max * 0.5 * (1 - np.cos(np.pi * i_iter / exploration_phase_end))
+            else:
+                # Keep small AEM value during exploitation phase
+                aem_lambda = 0.05  # Small constant instead of 0
             
             # Fit
             flatten_bags = np.vstack(bags)
@@ -387,10 +531,29 @@ class MilCountBasedMultiClassLearner:
                             for idx in active_indices
                         ])
                         
-                        # Solve exact assignment for active instances with margin scores
-                        optimal_assignment_active = exact_k_of_n_assignment(
-                            active_probs, k_min_active, k_max_active, margin_scores=margin_scores
+                        # Compute AEM scores if in exploration phase
+                        aem_scores = None
+                        if aem_lambda > 0:
+                            aem_scores = compute_attention_entropy_maximization(probs[active_indices], aem_lambda)
+                        
+                        # Always use soft assignment with ST_k for differentiability
+                        soft_weights = soft_k_of_n_assignment(
+                            active_probs, k_min_active, k_max_active, 
+                            temperature=temperature,  # Use the independent temperature schedule
+                            margin_scores=margin_scores, aem_scores=aem_scores
                         )
+                        
+                        # Straight-through estimator: hard assignment for forward, soft for backward
+                        # Get top-k indices based on soft weights
+                        k_target = int(np.round(np.sum(soft_weights)))
+                        k_target = max(k_min_active, min(k_max_active, k_target))
+                        
+                        if k_target > 0:
+                            top_k_indices = np.argsort(soft_weights)[-k_target:]
+                            optimal_assignment_active = np.zeros_like(soft_weights, dtype=int)
+                            optimal_assignment_active[top_k_indices] = 1
+                        else:
+                            optimal_assignment_active = np.zeros(len(active_probs), dtype=int)
                         
                         # Map back to full assignment
                         optimal_assignment = new_y.copy()
@@ -552,6 +715,8 @@ class MilCountBasedMultiClassLearner:
                 # Update bag difficulty score based on constraint violations
                 final_counts = pd.Series(new_y).value_counts().to_dict()
                 constraint_violation = 0
+                count_loss = 0.0
+                
                 for i_class in range(n_classes):
                     class_count = final_counts.get(i_class, 0)
                     # Lower threshold violations
@@ -560,11 +725,18 @@ class MilCountBasedMultiClassLearner:
                     # Upper threshold violations
                     if class_count > upper_threshold[i_bag, i_class]:
                         constraint_violation += class_count - upper_threshold[i_bag, i_class]
+                    
+                    # Add differentiable count constraint loss (L1)
+                    if n_classes == 2 and i_class == 1:
+                        # For binary case, compute soft count loss
+                        target_k = (lower_threshold[i_bag, 1] + upper_threshold[i_bag, 1]) / 2
+                        soft_count = np.sum(probs[:, 1])  # Sum of probabilities for positive class
+                        count_loss = 0.2 * abs(soft_count - target_k)  # Weight = 0.2 as recommended
                 
-                bag_difficulty[i_bag] = constraint_violation
+                bag_difficulty[i_bag] = constraint_violation + count_loss
 
             if debug:
-                print(f"iter: {i_iter}, temperature: {temperature:.3f}")
+                print(f"iter: {i_iter}, temperature: {temperature:.3f}, aem_lambda: {aem_lambda:.3f}")
                 predicted_count = np.nan_to_num(
                     pd.DataFrame([pd.Series(b).value_counts().to_dict() for b in y])[list(range(n_classes))].values,
                 )
