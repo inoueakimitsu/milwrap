@@ -33,6 +33,43 @@ def compute_instance_confidence_scores(bag_probs: NDArray[np.float64]) -> NDArra
     return max_probs
 
 
+def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambda_entropy: float = 0.08) -> NDArray[np.float64]:
+    """Compute AEM (Attention Entropy Maximization) regularized scores.
+    
+    Based on AEM research: adds -H(α) regularizer to prevent over-concentrated attention,
+    keeping entropy high enough for multiple diagnostic instances to share probability mass.
+    
+    Args:
+    ----
+        bag_probs: Instance probability matrix of shape (n_instances, n_classes).
+        lambda_entropy: Entropy regularization strength (default 0.08).
+        
+    Returns:
+    -------
+        AEM-regularized scores for each instance.
+        
+    """
+    if len(bag_probs.shape) != 2 or bag_probs.shape[0] == 0:
+        return np.ones(bag_probs.shape[0])
+    
+    n_instances, n_classes = bag_probs.shape
+    
+    # Calculate instance-wise attention weights (softmax over max probabilities)
+    max_probs = np.max(bag_probs, axis=1)
+    attention_weights = np.exp(max_probs) / (np.sum(np.exp(max_probs)) + 1e-10)
+    
+    # Calculate attention entropy: H(α) = -Σ αᵢ log(αᵢ)
+    attention_entropy = -np.sum(attention_weights * np.log(attention_weights + 1e-10))
+    
+    # AEM regularization: encourage higher entropy (less concentrated attention)
+    entropy_bonus = lambda_entropy * attention_entropy
+    
+    # Apply entropy bonus to instance scores
+    aem_scores = max_probs + entropy_bonus * attention_weights
+    
+    return aem_scores
+
+
 def compute_margin_aware_confidence(probs: NDArray[np.float64], target_class: int, margin_lambda: float = 0.25) -> float:
     """Compute margin-aware confidence scores.
     
@@ -63,8 +100,8 @@ def compute_margin_aware_confidence(probs: NDArray[np.float64], target_class: in
     return confidence
 
 
-def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margin_scores=None):
-    """Solve exact k-of-n assignment problem with optional margin weighting.
+def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margin_scores=None, aem_scores=None):
+    """Solve exact k-of-n assignment problem with optional margin and AEM weighting.
     
     Find optimal assignment of instances to positive class such that
     k_min <= sum(assignments) <= k_max, maximizing sum(log(p_i))
@@ -75,6 +112,7 @@ def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margi
         k_max: maximum number of positive instances
         current_assignments: current assignments (optional)
         margin_scores: margin-based scores for weighting (optional)
+        aem_scores: AEM-based scores for weighting (optional)
         
     Returns:
         optimal_assignments: binary array of assignments
@@ -96,6 +134,10 @@ def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margi
     # Apply margin weighting if provided
     if margin_scores is not None and len(margin_scores) == len(probs):
         log_odds = log_odds + 0.1 * margin_scores  # Moderate weight for margins
+    
+    # Apply AEM weighting if provided
+    if aem_scores is not None and len(aem_scores) == len(probs):
+        log_odds = log_odds + 0.05 * aem_scores  # Light weight for AEM
     
     # Sort by log-odds in descending order
     sorted_indices = np.argsort(log_odds)[::-1]
@@ -279,20 +321,62 @@ class MilCountBasedMultiClassLearner:
         # Initialize simple parameters
         n_bags = len(bags)
         
-        # Simple exponential temperature decay (from ablation study)
+        # Adaptive temperature control parameters
         temperature_start = 2.0  # Higher starting temperature for exploration
         temperature_end = 0.1    # Final temperature for precise assignments
+        temperature_max = 2.2    # Maximum temperature cap
+        current_temperature = temperature_start
+        
+        # Two-level threshold system for adaptive control
+        high_change_threshold = 0.05  # 5% - hold or increase temperature
+        low_change_threshold = 0.01   # 1% - fast cooling threshold
+        
+        # AEM parameters - adaptive based on initialization type
+        if initial_y is None:
+            # Auto-init: higher lambda for better exploration
+            lambda_entropy_max = 0.12  # Higher for auto-init
+            lambda_entropy_min = 0.02
+            aem_start_iter = 0  # Start immediately
+        else:
+            # External-init: lower lambda to preserve pre-trained knowledge
+            lambda_entropy_max = 0.015  # Lower for external-init
+            lambda_entropy_min = 0.005
+            aem_start_iter = 3  # Delay by 3 iterations to let features mature
         
         # Self-paced learning: track bag difficulty scores
         bag_difficulty = np.zeros(n_bags)
         
-        # Simple confidence-based freezing (fixed threshold)
-        confidence_threshold = 0.97  # Higher threshold for more selective freezing
+        # Dynamic confidence-based freezing
+        confidence_threshold_start = 0.97  # Higher threshold for more selective freezing
+        confidence_threshold_end = 0.95    # Keep high threshold throughout
+        confidence_decay = 0.98           # Slower decay rate
         margin_lambda = 0.25  # Standard margin importance
         
+        # Track consecutive low change iterations for freezing
+        consecutive_low_changes = 0
+        freeze_after_consecutive = 2  # Require 2 consecutive low-change iterations
+        
         for i_iter in range(max_iter):
-            # Simple exponential temperature decay
-            temperature = temperature_start * (temperature_end / temperature_start) ** (i_iter / max_iter)
+            # Dynamic confidence threshold decay
+            confidence_threshold = max(
+                confidence_threshold_end,
+                confidence_threshold_start * (confidence_decay ** i_iter)
+            )
+            
+            # Use current_temperature for this iteration
+            temperature = current_temperature
+            
+            # AEM lambda scheduling with cosine annealing
+            if i_iter >= aem_start_iter:
+                # Cosine annealing schedule for lambda - gentler for external init
+                if initial_y is None:
+                    anneal_steps = max_iter * 0.5  # Faster annealing for auto-init
+                else:
+                    anneal_steps = max_iter * 0.7  # Slower annealing for external-init
+                anneal_progress = min(1.0, (i_iter - aem_start_iter) / anneal_steps)
+                lambda_entropy = lambda_entropy_min + 0.5 * (lambda_entropy_max - lambda_entropy_min) * (1 + np.cos(np.pi * anneal_progress))
+            else:
+                lambda_entropy = 0.0  # No AEM before start iteration
             
             # Fit
             flatten_bags = np.vstack(bags)
@@ -328,9 +412,11 @@ class MilCountBasedMultiClassLearner:
                 changed_indices = set()
                 new_y = y[i_bag].copy()
                 
-                # Simple confidence-based freezing
+                # Dynamic confidence-based freezing
                 frozen_indices = set()
-                if i_iter >= 3:  # Start freezing after initial exploration
+                # Start freezing only when temperature is low OR consecutive low changes
+                can_freeze = (current_temperature <= 0.15) or (consecutive_low_changes >= freeze_after_consecutive)
+                if can_freeze:
                     max_probs = np.max(probs, axis=1)
                     predicted_classes = np.argmax(probs, axis=1)
                     
@@ -348,10 +434,10 @@ class MilCountBasedMultiClassLearner:
                     effective_upper_1 = upper_threshold[i_bag, 1]
                     
                     if i_iter == 0:  # Only first iteration
-                        effective_lower_0 = effective_lower_0 * 0.98  # 2% slack - more conservative
-                        effective_upper_0 = effective_upper_0 * 1.02  # 2% slack - more conservative
-                        effective_lower_1 = effective_lower_1 * 0.98  # 2% slack - more conservative
-                        effective_upper_1 = effective_upper_1 * 1.02  # 2% slack - more conservative
+                        effective_lower_0 = effective_lower_0 * 0.95  # 5% slack - more aggressive exploration
+                        effective_upper_0 = effective_upper_0 * 1.05  # 5% slack - more aggressive exploration
+                        effective_lower_1 = effective_lower_1 * 0.95  # 5% slack - more aggressive exploration
+                        effective_upper_1 = effective_upper_1 * 1.05  # 5% slack - more aggressive exploration
                     
                     # For binary case, we optimize for class 1
                     # The constraint is: effective_lower_1 <= k <= effective_upper_1
@@ -387,9 +473,18 @@ class MilCountBasedMultiClassLearner:
                             for idx in active_indices
                         ])
                         
-                        # Solve exact assignment for active instances with margin scores
+                        # Compute AEM scores if lambda > 0 - only for active instances
+                        if lambda_entropy > 0 and n_active > 0:
+                            # Calculate AEM only on active instances
+                            active_probs_full = probs[active_indices]
+                            aem_scores = compute_attention_entropy_maximization(active_probs_full, lambda_entropy=lambda_entropy)
+                        else:
+                            aem_scores = None
+                        
+                        # Solve exact assignment for active instances with margin and AEM scores
                         optimal_assignment_active = exact_k_of_n_assignment(
-                            active_probs, k_min_active, k_max_active, margin_scores=margin_scores
+                            active_probs, k_min_active, k_max_active, 
+                            margin_scores=margin_scores, aem_scores=aem_scores
                         )
                         
                         # Map back to full assignment
@@ -422,6 +517,12 @@ class MilCountBasedMultiClassLearner:
                                 del class_count_dict[old_class]
                 else:
                     # Multi-class case: use original greedy approach
+                    # Compute AEM scores for multi-class case if lambda > 0
+                    if lambda_entropy > 0:
+                        global_aem_scores = compute_attention_entropy_maximization(probs, lambda_entropy=lambda_entropy)
+                    else:
+                        global_aem_scores = None
+                    
                     # Priority 1: Fix constraint violations using most confident instances
                     target_classes = list(range(n_classes))
                     random.shuffle(target_classes)
@@ -431,8 +532,8 @@ class MilCountBasedMultiClassLearner:
                         
                         # Apply constraint slack for first iteration only
                         if i_iter == 0:
-                            # 2% slack in first iteration - more conservative
-                            effective_lower = lower_threshold[i_bag, i_class] * 0.98
+                            # 5% slack in first iteration - more aggressive exploration
+                            effective_lower = lower_threshold[i_bag, i_class] * 0.95
                         else:
                             effective_lower = lower_threshold[i_bag, i_class]
                         
@@ -449,6 +550,10 @@ class MilCountBasedMultiClassLearner:
                                     # Add margin-aware confidence
                                     margin_conf = compute_margin_aware_confidence(probs[idx], i_class, margin_lambda=margin_lambda)
                                     score = base_score + 0.1 * (margin_conf - base_score)
+                                    
+                                    # Add AEM score if available
+                                    if global_aem_scores is not None:
+                                        score += 0.05 * global_aem_scores[idx]
                                     
                                     # Strong boost/penalty based on constraint satisfaction
                                     current_class = new_y[idx]
@@ -482,7 +587,7 @@ class MilCountBasedMultiClassLearner:
                         
                         # Apply adaptive constraint slack for upper threshold
                         if i_iter == 0:
-                            effective_upper = upper_threshold[i_bag, i_class] * 1.02  # 2% slack - more conservative
+                            effective_upper = upper_threshold[i_bag, i_class] * 1.05  # 5% slack - more aggressive exploration
                         else:
                             effective_upper = upper_threshold[i_bag, i_class]
                         
@@ -562,9 +667,26 @@ class MilCountBasedMultiClassLearner:
                         constraint_violation += class_count - upper_threshold[i_bag, i_class]
                 
                 bag_difficulty[i_bag] = constraint_violation
+            
+            # Adaptive temperature control based on label change rate
+            total_instances = sum(len(bag) for bag in bags)
+            label_change_rate = total_changes / total_instances if total_instances > 0 else 0
+            
+            # Two-level threshold adaptive temperature control
+            if label_change_rate >= high_change_threshold:  # High exploration needed
+                # Hold or slightly increase temperature
+                current_temperature = min(temperature_max, current_temperature * 1.07)
+                consecutive_low_changes = 0  # Reset counter
+            elif label_change_rate >= low_change_threshold:  # Moderate exploration
+                # Slow cooling
+                current_temperature = max(temperature_end, current_temperature * 0.97)
+                consecutive_low_changes = 0  # Reset counter
+            else:  # Low changes - fast cooling
+                current_temperature = max(temperature_end, current_temperature * 0.90)
+                consecutive_low_changes += 1  # Increment counter
 
             if debug:
-                print(f"iter: {i_iter}, temperature: {temperature:.3f}")
+                print(f"iter: {i_iter}, temperature: {temperature:.3f}, lambda_entropy: {lambda_entropy:.4f}, label_change_rate: {label_change_rate:.3%}, confidence_threshold: {confidence_threshold:.3f}")
                 predicted_count = np.nan_to_num(
                     pd.DataFrame([pd.Series(b).value_counts().to_dict() for b in y])[list(range(n_classes))].values,
                 )
