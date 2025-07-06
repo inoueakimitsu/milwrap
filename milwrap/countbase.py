@@ -34,6 +34,76 @@ def compute_instance_confidence_scores(bag_probs: NDArray[np.float64]) -> NDArra
     return max_probs
 
 
+def compute_instance_uncertainty_scores(bag_probs: NDArray[np.float64], temperature: float = 1.0) -> NDArray[np.float64]:
+    """Compute uncertainty-based reliability scores for instances.
+    
+    Based on AGP and MIREL recommendations: use entropy-based uncertainty
+    to detect unreliable external initializations.
+    
+    Args:
+        bag_probs: Instance probability matrix of shape (n_instances, n_classes).
+        temperature: Temperature for reliability score computation.
+        
+    Returns:
+        Reliability scores for each instance (higher = more reliable).
+    """
+    if len(bag_probs.shape) != 2 or bag_probs.shape[0] == 0:
+        return np.ones(bag_probs.shape[0])
+    
+    # Compute entropy as uncertainty measure
+    eps = 1e-8
+    entropy = -np.sum(bag_probs * np.log(bag_probs + eps), axis=1)
+    
+    # Normalize by maximum possible entropy
+    n_classes = bag_probs.shape[1]
+    max_entropy = np.log(n_classes)
+    normalized_entropy = entropy / (max_entropy + eps)
+    
+    # Convert to reliability score: r = exp(-entropy/temperature)
+    # Higher entropy = lower reliability
+    reliability_scores = np.exp(-normalized_entropy / temperature)
+    
+    return reliability_scores
+
+
+def compute_attribute_scores(bag_probs: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Compute multi-dimensional attribute scores for instances.
+    
+    Combines multiple signals including confidence, entropy, and margin
+    to create a comprehensive attribute score.
+    
+    Args:
+        bag_probs: Instance probability matrix of shape (n_instances, n_classes).
+        
+    Returns:
+        Attribute scores for each instance.
+    """
+    if len(bag_probs.shape) != 2 or bag_probs.shape[0] == 0:
+        return np.zeros(bag_probs.shape[0])
+    
+    # Max probability (confidence)
+    max_probs = np.max(bag_probs, axis=1)
+    
+    # Entropy (uncertainty)
+    eps = 1e-8
+    entropy = -np.sum(bag_probs * np.log(bag_probs + eps), axis=1)
+    n_classes = bag_probs.shape[1]
+    max_entropy = np.log(n_classes) if n_classes > 1 else 1.0
+    normalized_entropy = entropy / (max_entropy + eps)
+    
+    # Margin (difference between top two classes)
+    sorted_probs = np.sort(bag_probs, axis=1)[:, ::-1]
+    if bag_probs.shape[1] > 1:
+        margin = sorted_probs[:, 0] - sorted_probs[:, 1]
+    else:
+        margin = sorted_probs[:, 0]
+    
+    # Combine signals: high confidence + low entropy + high margin = high score
+    attribute_scores = max_probs * (1 - 0.3 * normalized_entropy) + 0.2 * margin
+    
+    return attribute_scores
+
+
 
 
 
@@ -498,7 +568,7 @@ def compute_differentiable_count_loss(probs, k_target, weight=0.1):
     return weight * (count_deviation + smooth_penalty)
 
 
-def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=None, aem_scores=None, interaction_weights=None, global_context=None, attribute_scores=None, prototype_scores=None, aggregated_global_context=None, iteration=0):
+def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=None, aem_scores=None, interaction_weights=None, global_context=None, attribute_scores=None, prototype_scores=None, aggregated_global_context=None, iteration=0, external_init_weight_schedule=None):
     """Enhanced soft k-of-n assignment using smooth top-k operator with attribute scoring.
     
     Find soft assignment weights such that sum approximates the optimal k
@@ -544,9 +614,17 @@ def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=N
         prob_uniformity = np.std(max_probs) / (np.mean(max_probs) + 1e-8)
         is_external = is_external and prob_uniformity < 0.2
     
+    # Get external init weight decay factor if available
+    external_weight_decay = 1.0
+    if external_init_weight_schedule is not None:
+        external_weight_decay = external_init_weight_schedule(iteration)
+    
     # Combine with attribute scores (primary signal after warmup)
     if attribute_scores is not None and len(attribute_scores) == len(probs):
-        attr_weight = (0.22 if is_external else 0.18) * attr_warmup  # Much stronger for external init
+        # Apply curriculum decay for external init
+        attr_weight = (0.22 if is_external else 0.18) * attr_warmup
+        if is_external:
+            attr_weight *= external_weight_decay  # Decay external init influence
         log_odds = log_odds * (1 - attr_weight) + attribute_scores * attr_weight
     
     # Combine with margin scores
@@ -567,6 +645,8 @@ def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=N
     # Combine with prototype similarity scores (PAMIL-inspired)
     if prototype_scores is not None and len(prototype_scores) == len(probs):
         prototype_weight = (0.24 if is_external else 0.14) * attr_warmup  # Much stronger for external init
+        if is_external:
+            prototype_weight *= external_weight_decay  # Apply curriculum decay
         log_odds = log_odds + prototype_weight * prototype_scores
     
     # Apply global context if available (ProMIL-inspired)
@@ -810,21 +890,44 @@ class MilCountBasedMultiClassLearner:
                     elif count > upper_threshold[i_bag, i_class]:
                         init_constraint_violations += count - upper_threshold[i_bag, i_class]
             
-            # External init typically has lower variance, higher entropy, and some violations
-            if debug:
-                print(f"External init detection - variance: {init_variance:.4f}, entropy: {init_entropy:.4f}, violations: {init_constraint_violations}, n_classes: {n_classes}")
+            # New: compute initial uncertainty scores for better detection
+            initial_uncertainties = []
+            if len(bags) > 0 and hasattr(self.classifier, 'predict_proba'):
+                # Quick initial fit to get uncertainty estimates
+                try:
+                    flatten_bags_init = np.vstack(bags)
+                    flatten_y_init = np.hstack(initial_y)
+                    self.classifier.fit(flatten_bags_init, flatten_y_init)
+                    for bag in bags[:min(5, len(bags))]:  # Sample first 5 bags
+                        probs = self.classifier.predict_proba(bag)
+                        uncertainties = compute_instance_uncertainty_scores(probs, temperature=0.5)
+                        initial_uncertainties.extend(uncertainties)
+                    avg_uncertainty = np.mean(initial_uncertainties) if initial_uncertainties else 0.5
+                except:
+                    avg_uncertainty = 0.5
+            else:
+                avg_uncertainty = 0.5
             
-            # Refined detection thresholds
+            # External init typically has lower variance, higher entropy, lower certainty, and some violations
+            if debug:
+                print(f"External init detection - variance: {init_variance:.4f}, entropy: {init_entropy:.4f}, "
+                      f"avg_uncertainty: {avg_uncertainty:.4f}, violations: {init_constraint_violations}, n_classes: {n_classes}")
+            
+            # Refined detection thresholds with uncertainty signal
             if n_classes == 2:
                 # Binary case: more lenient for external detection
-                is_truly_external = (init_variance < 0.35 and init_entropy > 0.25) or init_constraint_violations > 0
+                is_truly_external = ((init_variance < 0.35 and init_entropy > 0.25) or 
+                                    init_constraint_violations > 0 or 
+                                    avg_uncertainty < 0.6)
             else:
                 # Multi-class: normalize by max possible entropy
                 max_entropy = np.log(n_classes)
                 normalized_entropy = init_entropy / max_entropy
                 # Use class-count normalized variance
                 normalized_variance = init_variance / (n_classes - 1)
-                is_truly_external = (normalized_variance < 12.0 and normalized_entropy > 0.65) or init_constraint_violations > 0
+                is_truly_external = ((normalized_variance < 12.0 and normalized_entropy > 0.65) or 
+                                    init_constraint_violations > 0 or 
+                                    avg_uncertainty < 0.55)
         else:
             is_truly_external = False
         
@@ -863,6 +966,11 @@ class MilCountBasedMultiClassLearner:
             confidence_threshold_decay = 0.018  # Small decay over iterations
             margin_lambda = 0.33   # Moderate margin importance
         
+        # LNPL-MIL style curriculum weighting for external init
+        # λ(t) = exp(-t/T) where T ≈ 10% of training steps
+        external_init_curriculum_T = max_iter * 0.15  # 15% of total iterations for smoother decay
+        external_init_weight_schedule = lambda t: np.exp(-t / external_init_curriculum_T) if is_external_init else 0.0
+        
         # Global context learning (ProMIL-inspired)
         # Track optimal proportions for each class across all bags
         global_proportions = np.zeros((n_bags, n_classes))
@@ -899,13 +1007,16 @@ class MilCountBasedMultiClassLearner:
         
         # Adjust prototype parameters based on initialization type
         if is_external_init and is_truly_external:
-            prototype_temperature = 0.08  # Slightly higher for better flexibility with memory pool
-            prototype_update_interval = 3  # More frequent updates
-            prototype_update_momentum = 0.85  # Higher momentum for stability
+            prototype_temperature = 0.06  # Lower for sharper discrimination
+            prototype_update_interval = 2  # More frequent updates for external init
+            prototype_update_momentum = 0.88  # Higher momentum for stability
+            prototype_uncertainty_threshold = 0.7  # Only use instances with reliability > threshold
+        else:
+            prototype_temperature = 0.14  # Original setting
+            prototype_update_interval = 5
+            prototype_update_momentum = 0.7
+            prototype_uncertainty_threshold = 0.5
         
-        # Adaptive prototype update parameters
-        prototype_update_interval = 5 if not (is_external_init and is_truly_external) else 3
-        prototype_update_momentum = 0.7 if not (is_external_init and is_truly_external) else 0.85
         instance_prototype_assignments = np.zeros(len(all_instances), dtype=int)  # Track assignments
         
         
@@ -1148,7 +1259,8 @@ class MilCountBasedMultiClassLearner:
                             interaction_weights=interaction_weights, global_context=global_context,
                             attribute_scores=attribute_scores_active, prototype_scores=prototype_scores_active,
                             aggregated_global_context=aggregated_context,
-                            iteration=i_iter
+                            iteration=i_iter,
+                            external_init_weight_schedule=external_init_weight_schedule
                         )
                         
                         # Straight-through estimator: hard assignment for forward, soft for backward
@@ -1405,6 +1517,10 @@ class MilCountBasedMultiClassLearner:
                 # Collect all instances with their current predicted labels
                 all_instances_flat = np.vstack(bags)
                 all_labels_flat = np.hstack(y)
+                all_probs_flat = np.vstack(fs)
+                
+                # Compute uncertainty scores for all instances
+                uncertainty_scores = compute_instance_uncertainty_scores(all_probs_flat, temperature=0.5)
                 
                 # For each prototype, find assigned instances and update
                 new_prototypes = prototypes.copy()
@@ -1417,17 +1533,28 @@ class MilCountBasedMultiClassLearner:
                     closest_indices = np.argsort(distances)[:n_closest]
                     positive_closest = closest_indices[all_labels_flat[closest_indices] == 1]
                     
-                    if len(positive_closest) > 3:
-                        # Update prototype with momentum
-                        new_center = np.mean(all_instances_flat[positive_closest], axis=0)
-                        new_prototypes[proto_idx] = (prototype_update_momentum * prototypes[proto_idx] + 
-                                                    (1 - prototype_update_momentum) * new_center)
+                    # Filter by uncertainty threshold
+                    if len(positive_closest) > 0:
+                        reliable_positive = positive_closest[uncertainty_scores[positive_closest] > prototype_uncertainty_threshold]
+                        if len(reliable_positive) > 3:
+                            # Weight by reliability scores
+                            weights = uncertainty_scores[reliable_positive]
+                            weights = weights / np.sum(weights)
+                            # Update prototype with weighted average and momentum
+                            new_center = np.average(all_instances_flat[reliable_positive], axis=0, weights=weights)
+                            new_prototypes[proto_idx] = (prototype_update_momentum * prototypes[proto_idx] + 
+                                                        (1 - prototype_update_momentum) * new_center)
                 
                 prototypes = new_prototypes
                 
                 # Adjust prototype temperature based on convergence
                 if not has_changed:
-                    prototype_temperature *= 0.95  # Reduce temperature when stable
+                    prototype_temperature *= 0.92  # Slightly faster cooling
+                else:
+                    # Apply curriculum decay to prototype temperature for external init
+                    if is_external_init and is_truly_external:
+                        decay_factor = external_init_weight_schedule(i_iter)
+                        prototype_temperature *= (0.95 + 0.05 * decay_factor)  # Adaptive cooling
 
             # Update memory pool with high-confidence instances
             if use_memory_pool and i_iter > 1:
