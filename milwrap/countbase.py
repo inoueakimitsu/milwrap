@@ -34,85 +34,7 @@ def compute_instance_confidence_scores(bag_probs: NDArray[np.float64]) -> NDArra
     return max_probs
 
 
-def compute_multi_head_attention_scores(bag_probs: NDArray[np.float64], bag_features: NDArray[np.float64] = None, n_heads: int = 4) -> NDArray[np.float64]:
-    """Compute multi-head attention scores inspired by MAD-MIL.
-    
-    Uses multiple parallel attention heads with different characteristics,
-    then combines them for more robust instance scoring.
-    
-    Args:
-        bag_probs: Instance probability matrix of shape (n_instances, n_classes).
-        bag_features: Optional instance features for richer attention.
-        n_heads: Number of attention heads.
-        
-    Returns:
-        Multi-head attention scores.
-    """
-    if len(bag_probs.shape) != 2 or bag_probs.shape[0] == 0:
-        return np.ones(bag_probs.shape[0])
-    
-    n_instances, n_classes = bag_probs.shape
-    head_scores = []
-    
-    # Head 1: Confidence-based attention
-    max_probs = np.max(bag_probs, axis=1)
-    conf_attention = max_probs / (np.sum(max_probs) + 1e-10)  # Simplified normalization
-    head_scores.append(conf_attention)
-    
-    # Head 2: Entropy-based attention (uncertainty awareness)
-    entropy = -np.sum(bag_probs * np.log(bag_probs + 1e-10), axis=1)
-    normalized_entropy = 1.0 - entropy / np.log(n_classes)
-    entropy_attention = normalized_entropy / (np.sum(normalized_entropy) + 1e-10)
-    head_scores.append(entropy_attention)
-    
-    # Head 3: Margin-based attention (decision boundary awareness)
-    sorted_probs = np.sort(bag_probs, axis=1)[:, ::-1]
-    if n_classes > 1:
-        margin = sorted_probs[:, 0] - sorted_probs[:, 1]
-    else:
-        margin = sorted_probs[:, 0]
-    margin_attention = margin / (np.sum(margin) + 1e-10)
-    head_scores.append(margin_attention)
-    
-    # Head 4: Feature-based attention (if features available)
-    if bag_features is not None and len(bag_features) == n_instances:
-        # Simple feature-based attention using L2 norm
-        feature_norms = np.linalg.norm(bag_features, axis=1)
-        feature_attention = feature_norms / (np.sum(feature_norms) + 1e-10)
-    else:
-        # Consistency-based attention as fallback
-        consistency = np.max(bag_probs, axis=1) ** 2 / (np.sum(bag_probs ** 2, axis=1) + 1e-10)
-        feature_attention = consistency / (np.sum(consistency) + 1e-10)
-    head_scores.append(feature_attention)
-    
-    # Combine heads with learnable-like weights
-    # Weights optimized for different initialization types
-    head_weights = np.array([0.40, 0.18, 0.27, 0.15])  # Balanced for both init types
-    
-    # Stack and combine
-    combined_scores = np.zeros(n_instances)
-    for i, (score, weight) in enumerate(zip(head_scores, head_weights)):
-        combined_scores += weight * score
-    
-    # Normalize to [0, 1] range
-    combined_scores = (combined_scores - np.min(combined_scores)) / (np.max(combined_scores) - np.min(combined_scores) + 1e-10)
-    
-    return combined_scores
 
-
-def compute_attribute_scores(bag_probs: NDArray[np.float64], bag_features: NDArray[np.float64] = None) -> NDArray[np.float64]:
-    """Compute multi-dimensional attribute scores for instances.
-    
-    Wrapper that uses multi-head attention for better performance.
-    
-    Args:
-        bag_probs: Instance probability matrix of shape (n_instances, n_classes).
-        bag_features: Optional instance features for richer attributes.
-        
-    Returns:
-        Attribute scores combining multiple instance characteristics.
-    """
-    return compute_multi_head_attention_scores(bag_probs, bag_features, n_heads=4)
 
 
 def compute_prototype_similarity_scores(bag_features: NDArray[np.float64], prototypes: NDArray[np.float64], temperature: float = 0.1) -> NDArray[np.float64]:
@@ -144,59 +66,6 @@ def compute_prototype_similarity_scores(bag_features: NDArray[np.float64], proto
     return scores / (np.sum(scores) + 1e-8)
 
 
-def compute_instance_contrastive_loss(features: NDArray[np.float64], labels: NDArray[np.int_], temperature: float = 0.07) -> float:
-    """Compute contrastive loss at instance level inspired by CMIL.
-    
-    Uses InfoNCE loss to encourage instances of the same class to be similar
-    and instances of different classes to be dissimilar.
-    
-    Args:
-        features: Instance feature matrix of shape (n_instances, n_features).
-        labels: Instance labels of shape (n_instances,).
-        temperature: Temperature parameter for contrastive loss.
-        
-    Returns:
-        Contrastive loss value.
-    """
-    n_instances = len(features)
-    if n_instances < 2:
-        return 0.0
-    
-    # Normalize features
-    norm_features = features / (np.linalg.norm(features, axis=1, keepdims=True) + 1e-8)
-    
-    # Compute similarity matrix
-    similarities = np.dot(norm_features, norm_features.T) / temperature
-    
-    # Create label mask
-    labels = labels.reshape(-1, 1)
-    mask = (labels == labels.T).astype(np.float64)
-    
-    # Exclude self-similarities
-    mask = mask - np.eye(n_instances)
-    
-    # Compute InfoNCE loss
-    exp_similarities = np.exp(similarities - np.max(similarities, axis=1, keepdims=True))
-    
-    # For numerical stability
-    denominators = np.sum(exp_similarities, axis=1, keepdims=True) - np.diag(exp_similarities).reshape(-1, 1)
-    
-    # Positive pairs
-    positive_similarities = exp_similarities * mask
-    positive_counts = np.sum(mask, axis=1)
-    
-    # Avoid division by zero
-    positive_counts = np.maximum(positive_counts, 1)
-    
-    # Compute loss for each instance
-    losses = []
-    for i in range(n_instances):
-        if positive_counts[i] > 0:
-            positive_sum = np.sum(positive_similarities[i])
-            loss_i = -np.log(positive_sum / (denominators[i] + 1e-10) + 1e-10)
-            losses.append(loss_i)
-    
-    return np.mean(losses) if losses else 0.0
 
 
 def compute_instance_interaction_weights(bag_probs: NDArray[np.float64], k: int = 5) -> NDArray[np.float64]:
@@ -278,44 +147,6 @@ def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambd
     return max_probs + entropy_bonus
 
 
-def apply_stochastic_instance_masking(probs: NDArray[np.float64], mask_ratio: float = 0.1, top_k_ratio: float = 0.3) -> NDArray[np.float64]:
-    """Apply Stochastic Top-K Instance Masking (STKIM).
-    
-    Based on ACMIL paper: randomly masks high-attention instances to force
-    the model to discover alternative discriminative patterns.
-    
-    Args:
-        probs: Instance probability matrix of shape (n_instances, n_classes).
-        mask_ratio: Fraction of top instances to potentially mask.
-        top_k_ratio: Fraction of instances considered as "top".
-        
-    Returns:
-        Masked probability matrix.
-    """
-    if len(probs.shape) != 2 or probs.shape[0] == 0:
-        return probs
-    
-    n_instances = probs.shape[0]
-    
-    # Get max probabilities for each instance
-    max_probs = np.max(probs, axis=1)
-    
-    # Identify top-k instances
-    k_top = max(1, int(n_instances * top_k_ratio))
-    top_indices = np.argsort(max_probs)[-k_top:]
-    
-    # Randomly select instances to mask from top-k
-    n_mask = max(1, int(k_top * mask_ratio))
-    mask_indices = np.random.choice(top_indices, size=n_mask, replace=False)
-    
-    # Create masked probabilities
-    masked_probs = probs.copy()
-    
-    # For masked instances, reduce their influence (but don't zero out completely)
-    # This maintains differentiability while encouraging exploration
-    masked_probs[mask_indices] *= 0.5  # Reduce but don't eliminate (less aggressive)
-    
-    return masked_probs
 
 
 class PseudoBagMemoryPool:
@@ -389,51 +220,6 @@ class PseudoBagMemoryPool:
             return np.array([]), np.array([])
 
 
-def compute_instance_early_stopping_mask(
-    probs_history: List[NDArray[np.float64]], 
-    y_history: List[NDArray[np.int_]], 
-    confidence_threshold: float = 0.01,
-    min_history: int = 3
-) -> NDArray[np.bool_]:
-    """Compute Instance-dependent Early Stopping (IES) mask.
-    
-    Based on arxiv.org/abs/2502.07547: stops updating instances whose predictions
-    have stabilized, freeing capacity to learn harder instances.
-    
-    Args:
-        probs_history: History of probability predictions for each instance
-        y_history: History of label assignments for each instance
-        confidence_threshold: Threshold for considering an instance as converged
-        min_history: Minimum history length required to compute convergence
-        
-    Returns:
-        Boolean mask where True means the instance should be frozen (stop updating)
-    """
-    if len(probs_history) < min_history:
-        # Not enough history, don't freeze any instances
-        n_instances = len(probs_history[0]) if probs_history else 0
-        return np.zeros(n_instances, dtype=bool)
-    
-    n_instances = len(probs_history[0])
-    freeze_mask = np.zeros(n_instances, dtype=bool)
-    
-    # Check convergence for each instance
-    for i in range(n_instances):
-        # Check if predictions have been stable
-        recent_probs = [probs[i] for probs in probs_history[-min_history:]]
-        recent_labels = [y[i] for y in y_history[-min_history:]]
-        
-        # Check label stability
-        if len(set(recent_labels)) == 1:  # Same label for recent history
-            # Check probability stability (low variance)
-            prob_std = np.std([np.max(p) for p in recent_probs])
-            if prob_std < confidence_threshold:
-                # Also check if confidence is high
-                avg_confidence = np.mean([np.max(p) for p in recent_probs])
-                if avg_confidence > 0.9:  # High confidence threshold
-                    freeze_mask[i] = True
-    
-    return freeze_mask
 
 
 def sparse_differentiable_topk(scores: NDArray[np.float64], k: float, temperature: float = 1.0, sparsity_threshold: float = 0.01, adaptive_sparsity: bool = True) -> NDArray[np.float64]:
@@ -1042,25 +828,26 @@ class MilCountBasedMultiClassLearner:
         else:
             is_truly_external = False
         
-        # Enhanced temperature schedule with cyclical components
-        if is_external_init and is_truly_external:
-            temperature_start = 0.94   # Higher for better exploration with memory pool
-            temperature_end = 0.12     # Lower final temperature for precision
-            temperature_half_life = 0.42  # Slower decay for extended exploration
-            temperature_cycle_amplitude = 0.006  # Smaller cyclical component
-        elif is_external_init:
-            temperature_start = 0.92   # Moderate start for pseudo-external
-            temperature_end = 0.18     # Lower final temperature
-            temperature_half_life = 0.35  # Moderate decay
-            temperature_cycle_amplitude = 0.008  # Small cyclical
+        # Optimized temperature schedule adjusted for max_iter=10
+        if is_external_init:
+            # For external init, use gentler multi-phase schedule
+            temperature_phases = {
+                'phase1_end': 0.3,      # 30% of iterations (iter 3)
+                'phase2_end': 0.5,      # 50% of iterations (iter 5)
+                'phase3_end': 0.8,      # 80% of iterations (iter 8)
+                'temp_start': 0.90,     # Start temperature
+                'temp_phase1': 0.45,    # Higher temperature after phase 1
+                'temp_phase2': 0.35,    # Higher hold temperature
+                'temp_phase3': 0.20,    # Higher temperature after phase 3
+                'temp_end': 0.15        # Higher final temperature
+            }
         else:
-            temperature_start = 0.90   # Slightly higher for better exploration
-            temperature_end = 0.20     # Lower final temperature for better convergence
-            temperature_half_life = 0.30  # Balanced decay rate
-            temperature_cycle_amplitude = 0.015  # Reduced cyclical component
+            # For auto-init, use simpler schedule with longer warmup
+            temperature_start = 0.90
+            temperature_end = 0.30  # Higher final temp for auto-init
+            temperature_half_life = 0.40  # Slower decay
+            temperature_cycle_amplitude = 0.01
         
-        # Self-paced learning: track bag difficulty scores
-        bag_difficulty = np.zeros(n_bags)
         
         # Adaptive confidence-based freezing
         if is_external_init and is_truly_external:
@@ -1121,37 +908,66 @@ class MilCountBasedMultiClassLearner:
         prototype_update_momentum = 0.7 if not (is_external_init and is_truly_external) else 0.85
         instance_prototype_assignments = np.zeros(len(all_instances), dtype=int)  # Track assignments
         
-        # Enhanced STKIM parameters with curriculum
-        stkim_start_iter = 3  # Earlier start with gentler masking
-        stkim_mask_ratio_start = 0.03  # Start with less aggressive masking
-        stkim_mask_ratio_end = 0.08  # End with slightly more masking
-        stkim_top_k_ratio = 0.25  # Consider top 25% as high-attention
         
-        # Enhanced count loss weight schedule
-        count_loss_weight_start = 0.015  # Slightly higher starting weight
-        count_loss_weight_end = 0.18  # Higher ending weight for better constraint satisfaction
-        count_loss_schedule = "cosine"  # Cosine schedule for smoother transition
-        count_loss_warmup = 1  # Faster warmup for count loss
+        # Optimized count loss weight schedule adjusted for max_iter=10
+        if is_external_init:
+            # Multi-phase schedule for external init
+            count_loss_phases = {
+                'warmup_end': 0.3,      # 30% for warmup (iter 3)
+                'plateau_end': 0.6,     # 60% hold at 0.10 (iter 6)
+                'weight_warmup': 0.08,  # Lower weight after warmup
+                'weight_final': 0.16    # Lower final weight
+            }
+        else:
+            # Simple schedule for auto-init
+            count_loss_weight_start = 0.0
+            count_loss_weight_end = 0.15  # Lower final weight for auto-init
+            count_loss_schedule = "cosine"
+            count_loss_warmup = 2
         
-        # Initialize IES (Instance-dependent Early Stopping) tracking
-        ies_history = []  # Track probability and label history per bag
-        for _ in range(n_bags):
-            ies_history.append({
-                'probs': [],
-                'labels': []
-            })
         
         # Initialize Pseudo-Bag Memory Pool
         memory_pool = PseudoBagMemoryPool(pool_size=200, n_classes=n_classes)
         use_memory_pool = is_external_init and is_truly_external  # Enable for true external init
         
+        # Initialize AEM parameters based on o3 MCP recommendations
+        aem_lambda_current = 0.025 if is_external_init else 0.015  # Moderately higher initial λ for external init
+        aem_rho = 0.1  # Penalty coefficient
+        aem_rho_max = 1.2  # Cap for ρ
+        aem_rho_gamma = 1.8  # Multiplication factor when constraint not improving
+        aem_lambda_max = 0.6  # Cap for λ
+        constraint_history = []  # Track constraint violations
+        
         for i_iter in range(max_iter):
-            # Enhanced temperature schedule with cyclical component
-            base_temp = max(temperature_end, 
-                           temperature_start * 0.5 ** (i_iter / (temperature_half_life * max_iter)))
-            # Add small cyclical variation for exploration
-            cycle_factor = temperature_cycle_amplitude * np.sin(2 * np.pi * i_iter / 4)
-            temperature = base_temp + cycle_factor
+            # Compute temperature based on phase schedule
+            if is_external_init:
+                # Multi-phase temperature schedule for external init
+                progress = i_iter / max_iter
+                phases = temperature_phases
+                
+                if progress < phases['phase1_end']:
+                    # Phase 1: cosine decay from start to phase1
+                    phase_progress = progress / phases['phase1_end']
+                    cos_factor = 0.5 * (1 + np.cos(np.pi * phase_progress))
+                    temperature = phases['temp_phase1'] + (phases['temp_start'] - phases['temp_phase1']) * cos_factor
+                elif progress < phases['phase2_end']:
+                    # Phase 2: hold steady
+                    temperature = phases['temp_phase2']
+                elif progress < phases['phase3_end']:
+                    # Phase 3: cosine decay from phase2 to phase3
+                    phase_progress = (progress - phases['phase2_end']) / (phases['phase3_end'] - phases['phase2_end'])
+                    cos_factor = 0.5 * (1 + np.cos(np.pi * phase_progress))
+                    temperature = phases['temp_phase3'] + (phases['temp_phase2'] - phases['temp_phase3']) * cos_factor
+                else:
+                    # Phase 4: linear decay to end
+                    phase_progress = (progress - phases['phase3_end']) / (1.0 - phases['phase3_end'])
+                    temperature = phases['temp_end'] + (phases['temp_phase3'] - phases['temp_end']) * (1 - phase_progress)
+            else:
+                # Simple schedule for auto-init
+                base_temp = max(temperature_end, 
+                               temperature_start * 0.5 ** (i_iter / (temperature_half_life * max_iter)))
+                cycle_factor = temperature_cycle_amplitude * np.sin(2 * np.pi * i_iter / 4)
+                temperature = base_temp + cycle_factor
             
             # Enhanced AEM schedule with initialization-aware transition
             if is_external_init and is_truly_external:
@@ -1184,17 +1000,33 @@ class MilCountBasedMultiClassLearner:
                     exploitation_progress = (i_iter - exploration_phase_end) / (max_iter - exploration_phase_end)
                     aem_lambda = 0.08 * (1 - 0.5 * exploitation_progress)
             
-            # Enhanced count loss weight schedule with warmup
-            if i_iter < count_loss_warmup:
-                count_loss_weight = 0.0  # No count loss during warmup
-            elif count_loss_schedule == "linear":
-                progress = (i_iter - count_loss_warmup) / (max_iter - count_loss_warmup)
-                count_loss_weight = count_loss_weight_start + (count_loss_weight_end - count_loss_weight_start) * progress
-            elif count_loss_schedule == "cosine":
-                # Cosine annealing for smoother transition
-                count_loss_weight = count_loss_weight_start + (count_loss_weight_end - count_loss_weight_start) * 0.5 * (1 - np.cos(np.pi * i_iter / max_iter))
+            # Compute count loss weight based on schedule
+            if is_external_init:
+                # Multi-phase schedule for external init
+                phases = count_loss_phases
+                if i_iter < phases['warmup_end'] * max_iter:
+                    # Linear warmup from 0 to weight_warmup
+                    progress = i_iter / (phases['warmup_end'] * max_iter)
+                    count_loss_weight = phases['weight_warmup'] * progress
+                elif i_iter < phases['plateau_end'] * max_iter:
+                    # Hold at weight_warmup
+                    count_loss_weight = phases['weight_warmup']
+                else:
+                    # Linear increase to final weight
+                    plateau_end_iter = phases['plateau_end'] * max_iter
+                    if plateau_end_iter < max_iter:
+                        progress = (i_iter - plateau_end_iter) / (max_iter - plateau_end_iter)
+                        count_loss_weight = phases['weight_warmup'] + (phases['weight_final'] - phases['weight_warmup']) * progress
+                    else:
+                        count_loss_weight = phases['weight_warmup']
             else:
-                count_loss_weight = count_loss_weight_start
+                # Simple schedule for auto-init
+                if i_iter < count_loss_warmup:
+                    count_loss_weight = 0.0
+                elif count_loss_schedule == "cosine":
+                    count_loss_weight = count_loss_weight_start + (count_loss_weight_end - count_loss_weight_start) * 0.5 * (1 - np.cos(np.pi * i_iter / max_iter))
+                else:
+                    count_loss_weight = count_loss_weight_start
             
             # Fit
             flatten_bags = np.vstack(bags)
@@ -1204,28 +1036,6 @@ class MilCountBasedMultiClassLearner:
             # Compute outputs
             fs = [self.classifier.predict_proba(bag) for bag in bags]
             
-            # Apply STKIM with curriculum masking
-            if i_iter >= stkim_start_iter:
-                # Curriculum masking: gradually increase mask ratio
-                mask_progress = (i_iter - stkim_start_iter) / (max_iter - stkim_start_iter)
-                current_mask_ratio = stkim_mask_ratio_start + (stkim_mask_ratio_end - stkim_mask_ratio_start) * mask_progress
-                
-                fs_masked = []
-                for bag_idx, bag_probs in enumerate(fs):
-                    # Adaptive masking based on bag difficulty
-                    bag_specific_ratio = current_mask_ratio
-                    if i_iter > stkim_start_iter + 1:  # After initial STKIM iterations
-                        difficulty_factor = min(1.5, 1 + 0.5 * bag_difficulty[bag_idx] / (np.mean(bag_difficulty) + 1e-6))
-                        bag_specific_ratio = min(0.15, current_mask_ratio * difficulty_factor)  # Cap at 15%
-                    
-                    masked_probs = apply_stochastic_instance_masking(
-                        bag_probs, 
-                        mask_ratio=bag_specific_ratio,
-                        top_k_ratio=stkim_top_k_ratio
-                    )
-                    fs_masked.append(masked_probs)
-                fs = fs_masked
-            
             y_pred = [self.classifier.predict(bag) for bag in bags]
             flatten_original_y = np.hstack(list(y))
             
@@ -1234,21 +1044,11 @@ class MilCountBasedMultiClassLearner:
             has_changed = False
             total_changes = 0  # Initialize total changes counter
             
-            # Self-paced learning: sort bags by difficulty (constraint violations)
-            if i_iter > 1:  # Start self-paced learning after initial iterations
-                bag_order = np.argsort(bag_difficulty)  # Process easier bags first
-            else:
-                bag_order = np.arange(n_bags)
-            
-            for bag_idx in range(len(bags)):
-                i_bag = bag_order[bag_idx]
+            for i_bag in range(len(bags)):
                 # Hybrid approach: combine constraint-based selection with soft assignments
                 n_instances = len(bags[i_bag])
                 probs = fs[i_bag]  # Shape: (n_instances, n_classes)
                 
-                # Update IES history
-                ies_history[i_bag]['probs'].append(probs.copy())
-                ies_history[i_bag]['labels'].append(y[i_bag].copy())
                 
                 # Get current class counts
                 class_count_dict = pd.Series(y[i_bag]).value_counts().to_dict()
@@ -1257,36 +1057,9 @@ class MilCountBasedMultiClassLearner:
                 changed_indices = set()
                 new_y = y[i_bag].copy()
                 
-                # Compute IES mask (instances that have converged)
-                ies_mask = compute_instance_early_stopping_mask(
-                    ies_history[i_bag]['probs'],
-                    ies_history[i_bag]['labels'],
-                    confidence_threshold=0.01,
-                    min_history=3
-                )
                 
-                # Adaptive confidence-based freezing
+                # No freezing - all instances remain active
                 frozen_indices = set()
-                freeze_start_iter = 2  # Earlier freezing with adaptive threshold
-                if i_iter >= freeze_start_iter:
-                    # Adaptive confidence threshold based on iteration
-                    confidence_threshold = confidence_threshold_base - confidence_threshold_decay * (i_iter - freeze_start_iter)
-                    confidence_threshold = max(0.92, confidence_threshold)  # Floor at 0.92
-                    
-                    max_probs = np.max(probs, axis=1)
-                    predicted_classes = np.argmax(probs, axis=1)
-                    
-                    # Also compute attribute scores for freezing decision
-                    attr_scores = compute_attribute_scores(probs)
-                    attr_threshold = np.percentile(attr_scores, 80)  # Top 20% by attributes
-                    
-                    for idx in range(n_instances):
-                        # Enhanced freezing: high confidence AND consistent AND high attribute score OR IES converged
-                        if ((max_probs[idx] > confidence_threshold and 
-                             y[i_bag][idx] == predicted_classes[idx] and
-                             attr_scores[idx] > attr_threshold) or 
-                            ies_mask[idx]):
-                            frozen_indices.add(idx)
                 
                 # For binary classification, use exact k-of-n solver
                 if n_classes == 2:
@@ -1572,15 +1345,6 @@ class MilCountBasedMultiClassLearner:
                         )
                 
                 # Add contrastive loss for better instance-level clustering
-                contrastive_loss = 0.0
-                # TODO: Re-enable after debugging performance issues
-                # if i_iter > 1 and n_instances > 5:  # Need sufficient instances
-                #     contrastive_weight = 0.05 * min(1.0, i_iter / 5.0)  # Gradual warmup
-                #     contrastive_loss = compute_instance_contrastive_loss(
-                #         bags[i_bag], new_y, temperature=0.07
-                #     ) * contrastive_weight
-                
-                bag_difficulty[i_bag] = constraint_violation + count_loss + contrastive_loss
                 
                 # Update global proportions with momentum (ProMIL-inspired)
                 current_proportions = np.zeros(n_classes)
@@ -1593,10 +1357,9 @@ class MilCountBasedMultiClassLearner:
                     global_proportions[i_bag] = (proportion_momentum * global_proportions[i_bag] + 
                                                  (1 - proportion_momentum) * current_proportions)
                 
-                # Enhanced global context: update aggregated proportions with bag difficulty weighting
+                # Equal weighting for all bags
                 if i_iter > 0:
-                    # Weight by inverse difficulty (easier bags are more reliable)
-                    bag_weight = np.exp(-bag_difficulty[i_bag] / (np.mean(bag_difficulty) + 1e-8))
+                    bag_weight = 1.0
                     aggregated_proportion_weights[i_bag] = bag_weight
                     
                     # Compute weighted average across all bags
@@ -1673,10 +1436,9 @@ class MilCountBasedMultiClassLearner:
                 all_labels = np.hstack(y)
                 all_features = np.vstack(bags)
                 
-                # Compute importance scores (max probability * attribute score)
+                # Compute importance scores (max probability only)
                 max_probs = np.max(all_probs, axis=1)
-                attr_scores = compute_attribute_scores(all_probs)
-                importance_scores = max_probs * attr_scores
+                importance_scores = max_probs
                 
                 # Update memory pool with top instances
                 high_conf_mask = max_probs > 0.85
