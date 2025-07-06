@@ -485,31 +485,37 @@ def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=N
     attr_warmup = min(1.0, iteration / 6.0)  # Slower warm up over 6 iterations
     
     # Adjust weights based on initialization type (external init needs different balance)
-    is_external = iteration == 0 and np.var(probs) < 0.15  # Heuristic for external init
+    # Enhanced detection using multiple signals
+    is_external = iteration == 0 and np.var(probs) < 0.15
+    # Additional check: external init often has more uniform max probabilities
+    if is_external and len(probs) > 3:
+        max_probs = np.max(probs, axis=1)
+        prob_uniformity = np.std(max_probs) / (np.mean(max_probs) + 1e-8)
+        is_external = is_external and prob_uniformity < 0.2
     
     # Combine with attribute scores (primary signal after warmup)
     if attribute_scores is not None and len(attribute_scores) == len(probs):
-        attr_weight = (0.17 if is_external else 0.18) * attr_warmup  # Increased for external init
+        attr_weight = (0.22 if is_external else 0.18) * attr_warmup  # Much stronger for external init
         log_odds = log_odds * (1 - attr_weight) + attribute_scores * attr_weight
     
     # Combine with margin scores
     if margin_scores is not None and len(margin_scores) == len(probs):
-        margin_weight = (0.12 if is_external else 0.1) * (1 - 0.3 * attr_warmup)
+        margin_weight = (0.14 if is_external else 0.1) * (1 - 0.3 * attr_warmup)
         log_odds = log_odds + margin_weight * margin_scores
     
     # Combine with AEM scores (when active)
     if aem_scores is not None and len(aem_scores) == len(probs):
-        aem_weight = (0.06 if is_external else 0.08) * (1 - 0.2 * attr_warmup)
+        aem_weight = (0.10 if is_external else 0.08) * (1 - 0.15 * attr_warmup)  # Stronger for external
         log_odds = log_odds + aem_weight * aem_scores
     
     # Combine with instance interaction weights
     if interaction_weights is not None and len(interaction_weights) == len(probs):
-        interaction_weight = (0.14 if is_external else 0.12) * (1 + 0.2 * attr_warmup)
+        interaction_weight = (0.16 if is_external else 0.12) * (1 + 0.2 * attr_warmup)
         log_odds = log_odds + interaction_weight * interaction_weights
     
     # Combine with prototype similarity scores (PAMIL-inspired)
     if prototype_scores is not None and len(prototype_scores) == len(probs):
-        prototype_weight = (0.18 if is_external else 0.14) * attr_warmup  # Stronger for external init
+        prototype_weight = (0.24 if is_external else 0.14) * attr_warmup  # Much stronger for external init
         log_odds = log_odds + prototype_weight * prototype_scores
     
     # Apply global context if available (ProMIL-inspired)
@@ -733,14 +739,43 @@ class MilCountBasedMultiClassLearner:
         n_bags = len(bags)
         
         # Detect initialization type for adaptive parameters
+        # Enhanced detection: check both presence and distribution pattern
         is_external_init = initial_y is not None
+        if is_external_init:
+            # Additional check: external init often has more uniform distribution
+            flatten_init_y = np.hstack(initial_y)
+            init_variance = np.var(flatten_init_y)
+            init_entropy = -np.sum([np.mean(flatten_init_y == c) * np.log(np.mean(flatten_init_y == c) + 1e-8) 
+                                    for c in range(n_classes)])
+            # External init typically has lower variance and higher entropy
+            # Relaxed conditions for better detection
+            if debug:
+                print(f"External init detection - variance: {init_variance:.4f}, entropy: {init_entropy:.4f}, n_classes: {n_classes}")
+            # Adjust thresholds based on number of classes
+            if n_classes == 2:
+                # Binary case: max entropy is log(2) ≈ 0.693
+                is_truly_external = init_variance < 0.3 and init_entropy > 0.3
+            else:
+                # Multi-class: normalize by max possible entropy
+                max_entropy = np.log(n_classes)
+                normalized_entropy = init_entropy / max_entropy
+                # Use class-count normalized variance
+                normalized_variance = init_variance / (n_classes - 1)
+                is_truly_external = normalized_variance < 10.0 and normalized_entropy > 0.7
+        else:
+            is_truly_external = False
         
         # Enhanced temperature schedule with cyclical components
-        if is_external_init:
-            temperature_start = 0.94   # Higher for better exploration with external init
-            temperature_end = 0.22     # Lower final temperature for better convergence
-            temperature_half_life = 0.30  # Slower decay to maintain exploration
-            temperature_cycle_amplitude = 0.008  # Minimal cyclical for stability
+        if is_external_init and is_truly_external:
+            temperature_start = 0.85   # Reduced from 0.94 for faster convergence
+            temperature_end = 0.18     # Lower final temperature for precision
+            temperature_half_life = 0.35  # Slightly slower decay
+            temperature_cycle_amplitude = 0.005  # Very minimal cyclical
+        elif is_external_init:
+            temperature_start = 0.90   # Moderate start for pseudo-external
+            temperature_end = 0.20     # Lower final temperature
+            temperature_half_life = 0.32  # Moderate decay
+            temperature_cycle_amplitude = 0.010  # Small cyclical
         else:
             temperature_start = 0.88   # Slightly higher for better exploration
             temperature_end = 0.23     # Moderate final temperature
@@ -751,10 +786,14 @@ class MilCountBasedMultiClassLearner:
         bag_difficulty = np.zeros(n_bags)
         
         # Adaptive confidence-based freezing
-        if is_external_init:
-            confidence_threshold_base = 0.97  # Slightly lower for external init
-            confidence_threshold_decay = 0.015  # Slower decay
-            margin_lambda = 0.38   # Higher margin importance for external init
+        if is_external_init and is_truly_external:
+            confidence_threshold_base = 0.96  # Lower for true external init
+            confidence_threshold_decay = 0.012  # Slower decay
+            margin_lambda = 0.42   # Higher margin importance
+        elif is_external_init:
+            confidence_threshold_base = 0.97  # Slightly lower for pseudo-external
+            confidence_threshold_decay = 0.015  # Moderate decay
+            margin_lambda = 0.38   # Higher margin importance
         else:
             confidence_threshold_base = 0.975  # Higher base threshold
             confidence_threshold_decay = 0.02  # Small decay over iterations
@@ -779,7 +818,13 @@ class MilCountBasedMultiClassLearner:
             kmeans = KMeans(n_clusters=n_prototypes, random_state=seed, n_init=3)
             kmeans.fit(all_instances)
             prototypes = kmeans.cluster_centers_
-            prototype_temperature = 0.08 if is_external_init else 0.15  # Lower temperature for sharper prototype matching
+            # Use is_truly_external if available for more precise setting
+            if 'is_truly_external' in locals() and is_external_init and is_truly_external:
+                prototype_temperature = 0.05  # Much sharper for true external init
+            elif is_external_init:
+                prototype_temperature = 0.08  # Lower temperature for external init
+            else:
+                prototype_temperature = 0.15  # Standard temperature for auto init
         else:
             # Fall back to using subset of instances as prototypes
             prototype_indices = np.random.RandomState(seed).choice(len(all_instances), 
@@ -788,9 +833,15 @@ class MilCountBasedMultiClassLearner:
             prototypes = all_instances[prototype_indices]
             prototype_temperature = 0.2
         
+        # Adjust prototype parameters based on initialization type
+        if is_external_init and is_truly_external:
+            prototype_temperature = 0.06  # Much sharper for external init
+            prototype_update_interval = 3  # More frequent updates
+            prototype_update_momentum = 0.8  # Higher momentum
+        
         # Adaptive prototype update parameters
-        prototype_update_interval = 5  # Update prototypes every N iterations
-        prototype_update_momentum = 0.7  # Momentum for prototype updates
+        prototype_update_interval = 5 if not (is_external_init and is_truly_external) else 3
+        prototype_update_momentum = 0.7 if not (is_external_init and is_truly_external) else 0.8
         instance_prototype_assignments = np.zeros(len(all_instances), dtype=int)  # Track assignments
         
         # Enhanced STKIM parameters with curriculum
@@ -813,21 +864,36 @@ class MilCountBasedMultiClassLearner:
             cycle_factor = temperature_cycle_amplitude * np.sin(2 * np.pi * i_iter / 4)
             temperature = base_temp + cycle_factor
             
-            # Enhanced AEM schedule with better transition
-            exploration_phase_end = int(np.ceil(max_iter * 0.65))  # Slightly longer exploration
-            if i_iter < exploration_phase_end:
-                # Smoother cosine annealing with warmup
-                warmup_iters = 2
-                if i_iter < warmup_iters:
-                    aem_lambda = 0.015 * (i_iter + 1) / warmup_iters  # Gentler warmup
+            # Enhanced AEM schedule with initialization-aware transition
+            if is_external_init and is_truly_external:
+                # For true external init, use stronger AEM throughout
+                exploration_phase_end = int(np.ceil(max_iter * 0.7))  # Longer exploration
+                if i_iter < exploration_phase_end:
+                    warmup_iters = 1  # Faster warmup
+                    if i_iter < warmup_iters:
+                        aem_lambda = 0.02 * (i_iter + 1) / warmup_iters
+                    else:
+                        aem_lambda_max = 0.65  # Higher max for external init
+                        progress = (i_iter - warmup_iters) / (exploration_phase_end - warmup_iters)
+                        # Fixed cosine annealing to ensure non-zero values
+                        aem_lambda = aem_lambda_max * (0.3 + 0.7 * 0.5 * (1 - np.cos(np.pi * progress)))
                 else:
-                    aem_lambda_max = 0.52  # More moderate max
-                    progress = (i_iter - warmup_iters) / (exploration_phase_end - warmup_iters)
-                    aem_lambda = aem_lambda_max * 0.5 * (1 - np.cos(np.pi * progress))
+                    exploitation_progress = (i_iter - exploration_phase_end) / (max_iter - exploration_phase_end)
+                    aem_lambda = 0.12 * (1 - 0.4 * exploitation_progress)  # Higher floor
             else:
-                # Gradual decay in exploitation phase
-                exploitation_progress = (i_iter - exploration_phase_end) / (max_iter - exploration_phase_end)
-                aem_lambda = 0.08 * (1 - 0.5 * exploitation_progress)  # Decay from 0.08 to 0.04
+                # Original schedule for auto-init
+                exploration_phase_end = int(np.ceil(max_iter * 0.65))
+                if i_iter < exploration_phase_end:
+                    warmup_iters = 2
+                    if i_iter < warmup_iters:
+                        aem_lambda = 0.015 * (i_iter + 1) / warmup_iters
+                    else:
+                        aem_lambda_max = 0.52
+                        progress = (i_iter - warmup_iters) / (exploration_phase_end - warmup_iters)
+                        aem_lambda = aem_lambda_max * 0.5 * (1 - np.cos(np.pi * progress))
+                else:
+                    exploitation_progress = (i_iter - exploration_phase_end) / (max_iter - exploration_phase_end)
+                    aem_lambda = 0.08 * (1 - 0.5 * exploitation_progress)
             
             # Enhanced count loss weight schedule with warmup
             if i_iter < count_loss_warmup:
