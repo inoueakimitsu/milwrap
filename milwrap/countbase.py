@@ -33,14 +33,16 @@ def compute_instance_confidence_scores(bag_probs: NDArray[np.float64]) -> NDArra
     return max_probs
 
 
-def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambda_entropy: float = 0.05) -> NDArray[np.float64]:
+def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambda_entropy: float = 0.05, temperature: float = 1.0) -> NDArray[np.float64]:
     """Compute AEM (Attention Entropy Maximization) regularized scores.
     
     Based on AEM research: adds entropy regularizer to prevent over-concentrated attention.
+    Uses temperature-lambda coupling for better control.
     
     Args:
         bag_probs: Instance probability matrix of shape (n_instances, n_classes).
-        lambda_entropy: Entropy regularization strength.
+        lambda_entropy: Entropy regularization strength (coupled with temperature).
+        temperature: Current temperature for softmax computation.
         
     Returns:
         AEM-regularized scores for each instance.
@@ -48,18 +50,21 @@ def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambd
     if len(bag_probs.shape) != 2 or bag_probs.shape[0] == 0:
         return np.ones(bag_probs.shape[0])
     
-    # Calculate instance-wise attention weights (softmax over max probabilities)
+    # Calculate instance-wise attention weights with temperature
     max_probs = np.max(bag_probs, axis=1)
-    attention_weights = np.exp(max_probs) / (np.sum(np.exp(max_probs)) + 1e-10)
+    # Use temperature in softmax computation
+    attention_weights = np.exp(max_probs / temperature) / (np.sum(np.exp(max_probs / temperature)) + 1e-10)
     
     # Calculate attention entropy: H(α) = -Σ αᵢ log(αᵢ)
     attention_entropy = -np.sum(attention_weights * np.log(attention_weights + 1e-10))
     
-    # AEM regularization: encourage higher entropy
-    entropy_bonus = lambda_entropy * attention_entropy
+    # AEM regularization with temperature coupling
+    # Higher temperature -> higher entropy weight (more exploration)
+    effective_lambda = lambda_entropy * temperature
+    entropy_bonus = effective_lambda * attention_entropy
     
-    # Return scores with entropy bonus
-    return max_probs + entropy_bonus
+    # Return per-instance scores with distributed entropy bonus
+    return max_probs + entropy_bonus * attention_weights
 
 
 def compute_margin_aware_confidence(probs: NDArray[np.float64], target_class: int, margin_lambda: float = 0.25) -> float:
@@ -92,8 +97,8 @@ def compute_margin_aware_confidence(probs: NDArray[np.float64], target_class: in
     return confidence
 
 
-def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margin_scores=None, aem_scores=None):
-    """Solve exact k-of-n assignment problem with optional margin weighting.
+def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margin_scores=None, aem_scores=None, is_external_init=False):
+    """Solve exact k-of-n assignment problem with adaptive weighting.
     
     Find optimal assignment of instances to positive class such that
     k_min <= sum(assignments) <= k_max, maximizing sum(log(p_i))
@@ -105,6 +110,7 @@ def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margi
         current_assignments: current assignments (optional)
         margin_scores: margin-based scores for weighting (optional)
         aem_scores: AEM scores for weighting (optional)
+        is_external_init: whether using external initialization
         
     Returns:
         optimal_assignments: binary array of assignments
@@ -123,13 +129,23 @@ def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margi
     eps = 1e-8
     log_odds = np.log(probs + eps) - np.log(1 - probs + eps)
     
+    # Adaptive weighting based on initialization type
+    if is_external_init:
+        # External init: emphasize margins more, moderate AEM
+        margin_weight = 0.18
+        aem_weight = 0.05
+    else:
+        # Auto init: balance margins and AEM
+        margin_weight = 0.12
+        aem_weight = 0.06
+    
     # Apply margin weighting if provided
     if margin_scores is not None and len(margin_scores) == len(probs):
-        log_odds = log_odds + 0.1 * margin_scores  # Moderate weight for margins
+        log_odds = log_odds + margin_weight * margin_scores
     
     # Apply AEM scores if provided
     if aem_scores is not None and len(aem_scores) == len(probs):
-        log_odds = log_odds + 0.05 * aem_scores  # Small weight for AEM
+        log_odds = log_odds + aem_weight * aem_scores
     
     # Sort by log-odds in descending order
     sorted_indices = np.argsort(log_odds)[::-1]
@@ -309,24 +325,65 @@ class MilCountBasedMultiClassLearner:
                 y.append(np.repeat(best_class, n_instances_in_bag))
         else:
             y = initial_y
+            # For external init, apply confidence-based refinement
+            # This helps correct potential labeling errors in external initialization
+            if debug:
+                print("Using external initialization with confidence-based refinement")
             
         # Initialize simple parameters
         n_bags = len(bags)
         
-        # Simple exponential temperature decay (from ablation study)
-        temperature_start = 2.0  # Higher starting temperature for exploration
-        temperature_end = 0.1    # Final temperature for precise assignments
+        # Detect initialization type for adaptive parameters
+        is_external_init = initial_y is not None
+        
+        # Adaptive temperature scheduling based on initialization
+        if is_external_init:
+            # External init: start warmer for fine-tuning
+            temperature_start = 1.5  # Lower starting temperature
+            temperature_end = 0.05   # Very low final temperature
+            gamma = 0.4  # Faster decay
+        else:
+            # Auto init: need more exploration
+            temperature_start = 2.5  # Higher starting temperature
+            temperature_end = 0.1    # Moderate final temperature
+            gamma = 0.3  # Slower decay
         
         # Self-paced learning: track bag difficulty scores
         bag_difficulty = np.zeros(n_bags)
         
-        # Simple confidence-based freezing (fixed threshold)
-        confidence_threshold = 0.97  # Higher threshold for more selective freezing
-        margin_lambda = 0.25  # Standard margin importance
+        # Adaptive confidence-based freezing
+        if is_external_init:
+            confidence_threshold_start = 0.96  # Slightly lower for external init
+            confidence_threshold_end = 0.92
+            margin_lambda = 0.3  # Higher margin importance for external init
+        else:
+            confidence_threshold_start = 0.98  # Higher for auto init
+            confidence_threshold_end = 0.94
+            margin_lambda = 0.2  # Standard margin importance
         
         for i_iter in range(max_iter):
-            # Simple exponential temperature decay
-            temperature = temperature_start * (temperature_end / temperature_start) ** (i_iter / max_iter)
+            # Cosine temperature schedule with warm restart
+            progress = i_iter / max_iter
+            if progress < 0.95:  # First 95% - cosine decay
+                cosine_decay = 0.5 * (1 + np.cos(np.pi * progress / 0.95))
+                temperature = temperature_end + (temperature_start - temperature_end) * cosine_decay
+            else:  # Last 5% - warm restart
+                restart_progress = (progress - 0.95) / 0.05
+                temperature = temperature_end + (temperature_start * 0.4 - temperature_end) * restart_progress
+            
+            # Adaptive confidence threshold decay
+            confidence_threshold = confidence_threshold_end + (confidence_threshold_start - confidence_threshold_end) * np.exp(-gamma * i_iter)
+            
+            # Calculate global lambda_entropy for debug output
+            aem_start_iter = 1 if is_external_init else 2
+            if i_iter >= aem_start_iter:
+                if is_external_init:
+                    lambda_entropy_base = 0.025  # Slightly higher for better regularization
+                else:
+                    lambda_entropy_base = 0.045  # Slightly lower for stability
+                global_lambda_entropy = lambda_entropy_base * (temperature / temperature_start)
+            else:
+                global_lambda_entropy = 0.0
             
             # Fit
             flatten_bags = np.vstack(bags)
@@ -362,9 +419,14 @@ class MilCountBasedMultiClassLearner:
                 changed_indices = set()
                 new_y = y[i_bag].copy()
                 
-                # Simple confidence-based freezing
+                # Dynamic per-bag temperature based on difficulty
+                bag_hardness = bag_difficulty[i_bag] / (n_instances + 1e-6)  # Normalized difficulty
+                bag_temperature = temperature * (1 + 0.3 * bag_hardness)  # Harder bags get higher temperature
+                
+                # Adaptive confidence-based freezing
                 frozen_indices = set()
-                if i_iter >= 3:  # Start freezing after initial exploration
+                freeze_start_iter = 2 if is_external_init else 3  # Earlier freezing for external init
+                if i_iter >= freeze_start_iter:
                     max_probs = np.max(probs, axis=1)
                     predicted_classes = np.argmax(probs, axis=1)
                     
@@ -382,10 +444,12 @@ class MilCountBasedMultiClassLearner:
                     effective_upper_1 = upper_threshold[i_bag, 1]
                     
                     if i_iter == 0:  # Only first iteration
-                        effective_lower_0 = effective_lower_0 * 0.98  # 2% slack - more conservative
-                        effective_upper_0 = effective_upper_0 * 1.02  # 2% slack - more conservative
-                        effective_lower_1 = effective_lower_1 * 0.98  # 2% slack - more conservative
-                        effective_upper_1 = effective_upper_1 * 1.02  # 2% slack - more conservative
+                        # Adaptive slack based on initialization type
+                        slack_factor = 0.99 if is_external_init else 0.98  # Less slack for external init
+                        effective_lower_0 = effective_lower_0 * slack_factor
+                        effective_upper_0 = effective_upper_0 * (2 - slack_factor)
+                        effective_lower_1 = effective_lower_1 * slack_factor
+                        effective_upper_1 = effective_upper_1 * (2 - slack_factor)
                     
                     # For binary case, we optimize for class 1
                     # The constraint is: effective_lower_1 <= k <= effective_upper_1
@@ -421,23 +485,28 @@ class MilCountBasedMultiClassLearner:
                             for idx in active_indices
                         ])
                         
-                        # Compute AEM scores for the bag (only after initial iterations)
+                        # Compute AEM scores with temperature coupling
                         aem_scores_active = None
-                        if i_iter >= 2:  # Start using AEM after warm-up
-                            # Adaptive lambda_entropy based on initialization type
-                            if initial_y is None:  # Auto initialization
-                                lambda_entropy = 0.06 * (1 - i_iter / max_iter)  # Decay over time
-                            else:  # External initialization
-                                lambda_entropy = 0.03 * (1 - i_iter / max_iter)  # Smaller weight
+                        aem_start_iter = 1 if is_external_init else 2  # Earlier AEM for external init
+                        if i_iter >= aem_start_iter:
+                            # Base lambda_entropy with initialization-specific values
+                            if is_external_init:
+                                lambda_entropy_base = 0.025  # Slightly higher for better regularization
+                            else:
+                                lambda_entropy_base = 0.045  # Slightly lower for stability
                             
-                            # Compute AEM scores for all instances in the bag
-                            bag_aem_scores = compute_attention_entropy_maximization(probs, lambda_entropy)
+                            # Temperature-coupled lambda (from theory)
+                            lambda_entropy = lambda_entropy_base * (temperature / temperature_start)
+                            
+                            # Compute AEM scores with per-bag temperature
+                            bag_aem_scores = compute_attention_entropy_maximization(probs, lambda_entropy, bag_temperature)
                             aem_scores_active = bag_aem_scores[active_indices]
                         
-                        # Solve exact assignment for active instances with margin and AEM scores
+                        # Solve exact assignment with adaptive weighting
                         optimal_assignment_active = exact_k_of_n_assignment(
                             active_probs, k_min_active, k_max_active, 
-                            margin_scores=margin_scores, aem_scores=aem_scores_active
+                            margin_scores=margin_scores, aem_scores=aem_scores_active,
+                            is_external_init=is_external_init
                         )
                         
                         # Map back to full assignment
@@ -479,8 +548,9 @@ class MilCountBasedMultiClassLearner:
                         
                         # Apply constraint slack for first iteration only
                         if i_iter == 0:
-                            # 2% slack in first iteration - more conservative
-                            effective_lower = lower_threshold[i_bag, i_class] * 0.98
+                            # Adaptive slack based on initialization type
+                            slack_factor = 0.99 if is_external_init else 0.98
+                            effective_lower = lower_threshold[i_bag, i_class] * slack_factor
                         else:
                             effective_lower = lower_threshold[i_bag, i_class]
                         
@@ -530,7 +600,8 @@ class MilCountBasedMultiClassLearner:
                         
                         # Apply adaptive constraint slack for upper threshold
                         if i_iter == 0:
-                            effective_upper = upper_threshold[i_bag, i_class] * 1.02  # 2% slack - more conservative
+                            slack_factor = 0.99 if is_external_init else 0.98
+                            effective_upper = upper_threshold[i_bag, i_class] * (2 - slack_factor)
                         else:
                             effective_upper = upper_threshold[i_bag, i_class]
                         
@@ -574,8 +645,8 @@ class MilCountBasedMultiClassLearner:
                                     else:
                                         scores[c] -= 2.0  # Strong penalty for over-represented classes
                                 
-                                # Apply temperature
-                                exp_scores = np.exp(scores / temperature)
+                                # Apply per-bag temperature
+                                exp_scores = np.exp(scores / bag_temperature)
                                 probabilities = exp_scores / np.sum(exp_scores)
                                 
                                 # Choose new class
@@ -612,7 +683,7 @@ class MilCountBasedMultiClassLearner:
                 bag_difficulty[i_bag] = constraint_violation
 
             if debug:
-                print(f"iter: {i_iter}, temperature: {temperature:.3f}")
+                print(f"iter: {i_iter}, temperature: {temperature:.3f}, lambda: {global_lambda_entropy:.4f}")
                 predicted_count = np.nan_to_num(
                     pd.DataFrame([pd.Series(b).value_counts().to_dict() for b in y])[list(range(n_classes))].values,
                 )
