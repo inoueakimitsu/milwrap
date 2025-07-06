@@ -33,6 +33,85 @@ def compute_instance_confidence_scores(bag_probs: NDArray[np.float64]) -> NDArra
     return max_probs
 
 
+def compute_prototype_similarity_scores(bag_features: NDArray[np.float64], prototypes: NDArray[np.float64], temperature: float = 0.1) -> NDArray[np.float64]:
+    """Compute prototype-based similarity scores inspired by PAMIL.
+    
+    Args:
+        bag_features: Instance feature matrix of shape (n_instances, n_features).
+        prototypes: Prototype vectors of shape (n_prototypes, n_features).
+        temperature: Temperature for similarity computation.
+        
+    Returns:
+        Similarity scores for each instance.
+    """
+    if len(bag_features.shape) != 2 or bag_features.shape[0] == 0:
+        return np.ones(bag_features.shape[0])
+    
+    # Compute cosine similarity to prototypes
+    norm_features = bag_features / (np.linalg.norm(bag_features, axis=1, keepdims=True) + 1e-8)
+    norm_prototypes = prototypes / (np.linalg.norm(prototypes, axis=1, keepdims=True) + 1e-8)
+    
+    # Similarity matrix: (n_instances, n_prototypes)
+    similarities = np.dot(norm_features, norm_prototypes.T)
+    
+    # Max similarity to any prototype
+    max_similarities = np.max(similarities, axis=1)
+    
+    # Apply temperature scaling
+    scores = np.exp(max_similarities / temperature)
+    return scores / (np.sum(scores) + 1e-8)
+
+
+def compute_instance_interaction_weights(bag_probs: NDArray[np.float64], k: int = 5) -> NDArray[np.float64]:
+    """Compute instance interaction weights based on neighborhood consistency.
+    
+    Inspired by ViT-IWRS: instances that agree with their neighbors get higher weights.
+    
+    Args:
+        bag_probs: Instance probability matrix of shape (n_instances, n_classes).
+        k: Number of nearest neighbors to consider.
+        
+    Returns:
+        Interaction-based weights for each instance.
+    """
+    if len(bag_probs.shape) != 2 or bag_probs.shape[0] == 0:
+        return np.ones(bag_probs.shape[0])
+    
+    n_instances = bag_probs.shape[0]
+    
+    # Faster distance computation using L2 distance on probability vectors
+    # Compute pairwise distances efficiently
+    prob_squared = np.sum(bag_probs ** 2, axis=1, keepdims=True)
+    distances = prob_squared + prob_squared.T - 2 * np.dot(bag_probs, bag_probs.T)
+    distances = np.maximum(distances, 0)  # Numerical stability
+    
+    # Get predicted classes
+    pred_classes = np.argmax(bag_probs, axis=1)
+    
+    # For each instance, compute consistency with k nearest neighbors
+    consistency_scores = np.zeros(n_instances)
+    for i in range(n_instances):
+        # Find k nearest neighbors (excluding self)
+        neighbor_indices = np.argsort(distances[i])[1:min(k+1, n_instances)]
+        
+        if len(neighbor_indices) > 0:
+            # Count how many neighbors agree
+            agreement = np.mean(pred_classes[neighbor_indices] == pred_classes[i])
+            
+            # Also consider probability similarity
+            prob_similarity = np.mean([
+                bag_probs[i, pred_classes[i]] * bag_probs[j, pred_classes[i]]
+                for j in neighbor_indices
+            ])
+            
+            # Combine agreement and probability similarity
+            consistency_scores[i] = 0.7 * agreement + 0.3 * prob_similarity
+        else:
+            consistency_scores[i] = 1.0
+    
+    return consistency_scores
+
+
 def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambda_entropy: float = 0.05) -> NDArray[np.float64]:
     """Compute AEM (Attention Entropy Maximization) regularized scores.
     
@@ -204,7 +283,7 @@ def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margi
     return assignments
 
 
-def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=None, aem_scores=None):
+def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=None, aem_scores=None, interaction_weights=None, global_context=None):
     """Solve soft k-of-n assignment using smooth top-k operator.
     
     Find soft assignment weights such that sum approximates the optimal k
@@ -217,6 +296,8 @@ def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=N
         temperature: temperature for ST_k operator
         margin_scores: margin-based scores for weighting (optional)
         aem_scores: AEM-based scores for weighting (optional)
+        interaction_weights: instance interaction weights (optional)
+        global_context: global optimization context (optional)
         
     Returns:
         soft_assignments: continuous weights in [0, 1]
@@ -240,6 +321,19 @@ def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=N
     # Combine with AEM scores (when active)
     if aem_scores is not None and len(aem_scores) == len(probs):
         log_odds = log_odds + 0.1 * aem_scores  # Moderate weight for AEM
+    
+    # Combine with instance interaction weights
+    if interaction_weights is not None and len(interaction_weights) == len(probs):
+        log_odds = log_odds + 0.15 * interaction_weights  # Weight for interaction
+    
+    # Apply global context if available (ProMIL-inspired)
+    if global_context is not None:
+        # global_context contains optimal proportion learned from data
+        optimal_k = int(np.round(global_context * n))
+        optimal_k = max(k_min, min(k_max, optimal_k))
+        # Bias towards the learned optimal k
+        k_min = max(k_min, optimal_k - 1)
+        k_max = min(k_max, optimal_k + 1)
     
     # Find optimal k using gradient-free search
     best_k = k_min
@@ -402,9 +496,27 @@ class MilCountBasedMultiClassLearner:
                 # Add small noise to break ties
                 constraint_scores += np.random.randn(n_classes) * 0.01
                 
-                # Select class with best constraint satisfaction potential
-                best_class = np.argmax(constraint_scores)
-                y.append(np.repeat(best_class, n_instances_in_bag))
+                # For binary classification, use mixed initialization
+                if n_classes == 2:
+                    # Smart initialization: distribute instances based on constraints
+                    k_target_0 = int((lower_threshold[i_bag, 0] + upper_threshold[i_bag, 0]) / 2)
+                    k_target_1 = int((lower_threshold[i_bag, 1] + upper_threshold[i_bag, 1]) / 2)
+                    
+                    # Check if targets are feasible
+                    if k_target_0 + k_target_1 == n_instances_in_bag:
+                        # Perfect match - use target distribution
+                        labels = np.zeros(n_instances_in_bag, dtype=int)
+                        labels[:k_target_1] = 1
+                        np.random.shuffle(labels)
+                        y.append(labels)
+                    else:
+                        # Use best class based on constraint scores
+                        best_class = np.argmax(constraint_scores)
+                        y.append(np.repeat(best_class, n_instances_in_bag))
+                else:
+                    # Multi-class: use best class
+                    best_class = np.argmax(constraint_scores)
+                    y.append(np.repeat(best_class, n_instances_in_bag))
         else:
             y = initial_y
             
@@ -422,6 +534,11 @@ class MilCountBasedMultiClassLearner:
         # Simple confidence-based freezing (fixed threshold)
         confidence_threshold = 0.97  # Higher threshold for more selective freezing
         margin_lambda = 0.3   # Slightly increased margin importance
+        
+        # Global context learning (ProMIL-inspired)
+        # Track optimal proportions for each class across all bags
+        global_proportions = np.zeros((n_bags, n_classes))
+        proportion_momentum = 0.9  # Momentum for proportion updates
         
         for i_iter in range(max_iter):
             # Independent exponential temperature decay with half-life
@@ -536,11 +653,25 @@ class MilCountBasedMultiClassLearner:
                         if aem_lambda > 0:
                             aem_scores = compute_attention_entropy_maximization(probs[active_indices], aem_lambda)
                         
+                        # Compute instance interaction weights
+                        interaction_weights = None
+                        if n_active > 1:  # Need at least 2 instances for interaction
+                            k_neighbors = min(5, n_active - 1)  # Adaptive k based on bag size
+                            interaction_weights = compute_instance_interaction_weights(
+                                probs[active_indices], k=k_neighbors
+                            )
+                        
+                        # Get global context for this bag (if available after first iteration)
+                        global_context = None
+                        if i_iter > 0:
+                            global_context = global_proportions[i_bag, 1]  # For binary, use class 1 proportion
+                        
                         # Always use soft assignment with ST_k for differentiability
                         soft_weights = soft_k_of_n_assignment(
                             active_probs, k_min_active, k_max_active, 
                             temperature=temperature,  # Use the independent temperature schedule
-                            margin_scores=margin_scores, aem_scores=aem_scores
+                            margin_scores=margin_scores, aem_scores=aem_scores,
+                            interaction_weights=interaction_weights, global_context=global_context
                         )
                         
                         # Straight-through estimator: hard assignment for forward, soft for backward
@@ -734,6 +865,17 @@ class MilCountBasedMultiClassLearner:
                         count_loss = 0.2 * abs(soft_count - target_k)  # Weight = 0.2 as recommended
                 
                 bag_difficulty[i_bag] = constraint_violation + count_loss
+                
+                # Update global proportions with momentum (ProMIL-inspired)
+                current_proportions = np.zeros(n_classes)
+                for i_class in range(n_classes):
+                    current_proportions[i_class] = final_counts.get(i_class, 0) / n_instances
+                
+                if i_iter == 0:
+                    global_proportions[i_bag] = current_proportions
+                else:
+                    global_proportions[i_bag] = (proportion_momentum * global_proportions[i_bag] + 
+                                                 (1 - proportion_momentum) * current_proportions)
 
             if debug:
                 print(f"iter: {i_iter}, temperature: {temperature:.3f}, aem_lambda: {aem_lambda:.3f}")
@@ -773,8 +915,6 @@ class MilCountBasedMultiClassLearner:
                 if debug:
                     print(f"Early convergence at iteration {i_iter}, continuing exploration...")
             
-            # Only break after minimum iterations
-            if i_iter >= min_iterations - 1:
-                break
+            # Continue until max_iter (never break early)
 
         return self.classifier, y
