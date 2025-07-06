@@ -33,20 +33,24 @@ def compute_instance_confidence_scores(bag_probs: NDArray[np.float64]) -> NDArra
     return max_probs
 
 
-def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambda_entropy: float = 0.05) -> NDArray[np.float64]:
+def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambda_entropy: float = 0.08, normalize_by_size: bool = True) -> NDArray[np.float64]:
     """Compute AEM (Attention Entropy Maximization) regularized scores.
     
-    Based on AEM research: adds entropy regularizer to prevent over-concentrated attention.
+    Based on AEM research: adds entropy regularizer to prevent over-concentrated attention,
+    with improved normalization for robustness across different bag sizes.
     
     Args:
         bag_probs: Instance probability matrix of shape (n_instances, n_classes).
-        lambda_entropy: Entropy regularization strength.
+        lambda_entropy: Entropy regularization strength (default 0.08).
+        normalize_by_size: Whether to normalize entropy by bag size.
         
     Returns:
         AEM-regularized scores for each instance.
     """
     if len(bag_probs.shape) != 2 or bag_probs.shape[0] == 0:
         return np.ones(bag_probs.shape[0])
+    
+    n_instances = bag_probs.shape[0]
     
     # Calculate instance-wise attention weights (softmax over max probabilities)
     max_probs = np.max(bag_probs, axis=1)
@@ -55,11 +59,16 @@ def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambd
     # Calculate attention entropy: H(α) = -Σ αᵢ log(αᵢ)
     attention_entropy = -np.sum(attention_weights * np.log(attention_weights + 1e-10))
     
-    # AEM regularization: encourage higher entropy
-    entropy_bonus = lambda_entropy * attention_entropy
+    # Normalize by bag size to make entropy scale-invariant
+    if normalize_by_size and n_instances > 1:
+        max_entropy = np.log(n_instances)
+        attention_entropy = attention_entropy / max_entropy
     
-    # Return scores with entropy bonus
-    return max_probs + entropy_bonus
+    # AEM regularization: encourage higher entropy with instance-wise contribution
+    entropy_bonus = lambda_entropy * attention_entropy
+    aem_scores = max_probs + entropy_bonus * attention_weights
+    
+    return aem_scores
 
 
 def smooth_topk(scores: NDArray[np.float64], k: float, temperature: float = 1.0) -> NDArray[np.float64]:
@@ -204,7 +213,7 @@ def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margi
     return assignments
 
 
-def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=None, aem_scores=None):
+def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=None, aem_scores=None, constraint_weight=1.0):
     """Solve soft k-of-n assignment using smooth top-k operator.
     
     Find soft assignment weights such that sum approximates the optimal k
@@ -237,9 +246,11 @@ def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=N
     if margin_scores is not None and len(margin_scores) == len(probs):
         log_odds = log_odds + 0.1 * margin_scores
     
-    # Combine with AEM scores (when active)
+    # Combine with AEM scores with adaptive weight
     if aem_scores is not None and len(aem_scores) == len(probs):
-        log_odds = log_odds + 0.1 * aem_scores  # Moderate weight for AEM
+        # Increase AEM influence during exploration (low constraint weight)
+        aem_weight = 0.15 * max(0.5, 1.0 - min(1.0, constraint_weight / 3.0))
+        log_odds = log_odds + aem_weight * aem_scores
     
     # Find optimal k using gradient-free search
     best_k = k_min
@@ -256,8 +267,10 @@ def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=N
             best_score = score
             best_k = k
     
-    # Return soft assignments for best k
-    return smooth_topk(log_odds, best_k, temperature)
+    # Return soft assignments for best k with adaptive temperature
+    # Use lower temperature for ST_k when constraint weight is high (exploitation phase)
+    st_temperature = temperature * max(0.5, 1.0 - 0.3 * min(1.0, constraint_weight / 2.0))
+    return smooth_topk(log_odds, best_k, st_temperature)
 
 
 def get_order_based_initial_bag_labels(
@@ -411,32 +424,49 @@ class MilCountBasedMultiClassLearner:
         # Initialize simple parameters
         n_bags = len(bags)
         
-        # Independent temperature schedule for ST_k
-        temperature_start = 0.9   # Lower starting temperature (detached from AEM)
-        temperature_end = 0.25    # Higher final temperature to maintain gradient flow
-        temperature_half_life = 0.25  # Temperature half-life as fraction of total iterations
+        # Improved temperature schedule based on recent research
+        temperature_start = 5.0   # Higher starting temperature for better exploration
+        temperature_end = 0.3     # Slightly higher end temperature for stability
+        temperature_decay = 0.93  # Exponential decay rate (α≈0.93-0.95)
+        
+        # Adaptive AEM-temperature coupling
+        aem_coupling_factor = 0.35  # κ≈0.25-0.4 for λ(t) = κ * T(t)
+        
+        # Constraint penalty schedule (μ increases over time)
+        constraint_penalty_start = 0.1
+        constraint_penalty_end = 2.0
         
         # Self-paced learning: track bag difficulty scores
         bag_difficulty = np.zeros(n_bags)
         
-        # Simple confidence-based freezing (fixed threshold)
-        confidence_threshold = 0.97  # Higher threshold for more selective freezing
-        margin_lambda = 0.3   # Slightly increased margin importance
+        # Adaptive confidence-based freezing
+        confidence_threshold_start = 0.99  # Very high initial threshold
+        confidence_threshold_end = 0.96    # Slightly lower final threshold
+        margin_lambda = 0.35  # Increased margin importance for robustness
+        
+        # Structured initialization detection for external-init robustness
+        is_external_init = initial_y is not None
+        warmup_epochs = 3 if is_external_init else 1  # Longer warmup for external init
         
         for i_iter in range(max_iter):
-            # Independent exponential temperature decay with half-life
+            # Exponential temperature decay: T(t) = max(Tmin, T0 * α^t)
             temperature = max(temperature_end, 
-                            temperature_start * 0.5 ** (i_iter / (temperature_half_life * max_iter)))
+                            temperature_start * (temperature_decay ** i_iter))
             
-            # Staged AEM schedule: cosine annealing for first 60% of iterations
-            exploration_phase_end = int(np.ceil(max_iter * 0.6))  # Use ceiling to ensure proper duration
-            if i_iter < exploration_phase_end:
-                # Cosine annealing from 0 to max during exploration
-                aem_lambda_max = 0.5  # Increased from 0.3
-                aem_lambda = aem_lambda_max * 0.5 * (1 - np.cos(np.pi * i_iter / exploration_phase_end))
-            else:
-                # Keep small AEM value during exploitation phase
-                aem_lambda = 0.05  # Small constant instead of 0
+            # Adaptive AEM weight coupled to temperature: λ(t) = κ * T(t)
+            aem_lambda = aem_coupling_factor * temperature
+            
+            # Constraint penalty increases over time: μ(t)
+            progress = i_iter / max(1, max_iter - 1)
+            constraint_penalty = constraint_penalty_start + \
+                               (constraint_penalty_end - constraint_penalty_start) * progress
+            
+            # Adaptive confidence threshold for freezing
+            confidence_threshold = confidence_threshold_start - \
+                                 (confidence_threshold_start - confidence_threshold_end) * progress
+            
+            # Skip constraint enforcement during warmup for external-init
+            enforce_constraints = (i_iter >= warmup_epochs) or not is_external_init
             
             # Fit
             flatten_bags = np.vstack(bags)
@@ -472,30 +502,39 @@ class MilCountBasedMultiClassLearner:
                 changed_indices = set()
                 new_y = y[i_bag].copy()
                 
-                # Simple confidence-based freezing
+                # Adaptive confidence-based freezing with warmup consideration
                 frozen_indices = set()
-                if i_iter >= 3:  # Start freezing after initial exploration
+                if i_iter >= warmup_epochs:  # Respect warmup period
                     max_probs = np.max(probs, axis=1)
                     predicted_classes = np.argmax(probs, axis=1)
                     
                     for idx in range(n_instances):
-                        # Freeze if high confidence AND consistent with current assignment
-                        if max_probs[idx] > confidence_threshold and y[i_bag][idx] == predicted_classes[idx]:
+                        # Consider margin in addition to max probability
+                        margin = compute_margin_aware_confidence(probs[idx], predicted_classes[idx], margin_lambda)
+                        
+                        # Freeze if high confidence AND consistent assignment AND good margin
+                        if (max_probs[idx] > confidence_threshold and 
+                            y[i_bag][idx] == predicted_classes[idx] and
+                            margin > confidence_threshold * 0.9):
                             frozen_indices.add(idx)
                 
                 # For binary classification, use exact k-of-n solver
                 if n_classes == 2:
-                    # Apply minimal slack only in first iteration for robustness
+                    # Apply constraint relaxation during warmup or high temperature
                     effective_lower_0 = lower_threshold[i_bag, 0]
                     effective_upper_0 = upper_threshold[i_bag, 0]
                     effective_lower_1 = lower_threshold[i_bag, 1]
                     effective_upper_1 = upper_threshold[i_bag, 1]
                     
-                    if i_iter == 0:  # Only first iteration
-                        effective_lower_0 = effective_lower_0 * 0.98  # 2% slack - more conservative
-                        effective_upper_0 = effective_upper_0 * 1.02  # 2% slack - more conservative
-                        effective_lower_1 = effective_lower_1 * 0.98  # 2% slack - more conservative
-                        effective_upper_1 = effective_upper_1 * 1.02  # 2% slack - more conservative
+                    if not enforce_constraints or temperature > 2.0:
+                        # Softer constraints during exploration with smoother transition
+                        temp_ratio = min(1.0, temperature / temperature_start)
+                        # Use quadratic easing for smoother constraint relaxation
+                        slack_factor = 1 + 0.02 * (temp_ratio ** 2)
+                        effective_lower_0 = effective_lower_0 * (2 - slack_factor)
+                        effective_upper_0 = effective_upper_0 * slack_factor
+                        effective_lower_1 = effective_lower_1 * (2 - slack_factor)
+                        effective_upper_1 = effective_upper_1 * slack_factor
                     
                     # For binary case, we optimize for class 1
                     # The constraint is: effective_lower_1 <= k <= effective_upper_1
@@ -531,16 +570,19 @@ class MilCountBasedMultiClassLearner:
                             for idx in active_indices
                         ])
                         
-                        # Compute AEM scores if in exploration phase
-                        aem_scores = None
-                        if aem_lambda > 0:
-                            aem_scores = compute_attention_entropy_maximization(probs[active_indices], aem_lambda)
+                        # Always compute AEM scores with adaptive weight
+                        aem_scores = compute_attention_entropy_maximization(
+                            probs[active_indices], 
+                            lambda_entropy=aem_lambda,
+                            normalize_by_size=True
+                        )
                         
                         # Always use soft assignment with ST_k for differentiability
                         soft_weights = soft_k_of_n_assignment(
                             active_probs, k_min_active, k_max_active, 
                             temperature=temperature,  # Use the independent temperature schedule
-                            margin_scores=margin_scores, aem_scores=aem_scores
+                            margin_scores=margin_scores, aem_scores=aem_scores,
+                            constraint_weight=constraint_penalty
                         )
                         
                         # Straight-through estimator: hard assignment for forward, soft for backward
@@ -592,10 +634,10 @@ class MilCountBasedMultiClassLearner:
                     for i_class in target_classes:
                         class_count = class_count_dict.get(i_class, 0)
                         
-                        # Apply constraint slack for first iteration only
-                        if i_iter == 0:
-                            # 2% slack in first iteration - more conservative
-                            effective_lower = lower_threshold[i_bag, i_class] * 0.98
+                        # Apply adaptive constraint relaxation
+                        if not enforce_constraints:
+                            # Softer constraints during warmup
+                            effective_lower = lower_threshold[i_bag, i_class] * 0.95
                         else:
                             effective_lower = lower_threshold[i_bag, i_class]
                         
@@ -643,9 +685,9 @@ class MilCountBasedMultiClassLearner:
                     for i_class in target_classes:
                         class_count = class_count_dict.get(i_class, 0)
                         
-                        # Apply adaptive constraint slack for upper threshold
-                        if i_iter == 0:
-                            effective_upper = upper_threshold[i_bag, i_class] * 1.02  # 2% slack - more conservative
+                        # Apply adaptive constraint relaxation for upper threshold
+                        if not enforce_constraints:
+                            effective_upper = upper_threshold[i_bag, i_class] * 1.05
                         else:
                             effective_upper = upper_threshold[i_bag, i_class]
                         
@@ -726,17 +768,18 @@ class MilCountBasedMultiClassLearner:
                     if class_count > upper_threshold[i_bag, i_class]:
                         constraint_violation += class_count - upper_threshold[i_bag, i_class]
                     
-                    # Add differentiable count constraint loss (L1)
+                    # Add differentiable count constraint loss with adaptive weight
                     if n_classes == 2 and i_class == 1:
                         # For binary case, compute soft count loss
                         target_k = (lower_threshold[i_bag, 1] + upper_threshold[i_bag, 1]) / 2
                         soft_count = np.sum(probs[:, 1])  # Sum of probabilities for positive class
-                        count_loss = 0.2 * abs(soft_count - target_k)  # Weight = 0.2 as recommended
+                        # Use constraint penalty weight from schedule
+                        count_loss = constraint_penalty * 0.15 * abs(soft_count - target_k)
                 
                 bag_difficulty[i_bag] = constraint_violation + count_loss
 
             if debug:
-                print(f"iter: {i_iter}, temperature: {temperature:.3f}, aem_lambda: {aem_lambda:.3f}")
+                print(f"iter: {i_iter}, temp: {temperature:.3f}, aem_λ: {aem_lambda:.3f}, constraint_μ: {constraint_penalty:.3f}")
                 predicted_count = np.nan_to_num(
                     pd.DataFrame([pd.Series(b).value_counts().to_dict() for b in y])[list(range(n_classes))].values,
                 )
@@ -767,7 +810,9 @@ class MilCountBasedMultiClassLearner:
                 if debug:
                     print(f"Labels converged at iteration {i_iter}, continuing to refine classifier...")
                 # Train with additional inner iterations when labels are stable
-                for inner_iter in range(5):
+                # More iterations for external-init to improve robustness
+                inner_iterations = 8 if is_external_init else 5
+                for inner_iter in range(inner_iterations):
                     self.classifier.fit(flatten_bags, flatten_y)
             elif not has_changed and i_iter < 4:
                 if debug:
