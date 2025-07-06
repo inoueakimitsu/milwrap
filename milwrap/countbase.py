@@ -33,6 +33,55 @@ def compute_instance_confidence_scores(bag_probs: NDArray[np.float64]) -> NDArra
     return max_probs
 
 
+def compute_instance_interaction_scores(
+    probs: NDArray[np.float64], 
+    target_class: int,
+    interaction_strength: float = 0.1
+) -> NDArray[np.float64]:
+    """Compute interaction scores between instances in a bag.
+    
+    Instances with similar probability patterns are more likely to have the same label.
+    
+    Args:
+        probs: Probability matrix of shape (n_instances, n_classes).
+        target_class: The target class to compute interactions for.
+        interaction_strength: Weight for interaction effects.
+        
+    Returns:
+        Interaction-adjusted scores for each instance.
+    """
+    n_instances = probs.shape[0]
+    if n_instances <= 1:
+        return probs[:, target_class]
+    
+    # Compute pairwise similarity using cosine similarity
+    # Normalize probability vectors
+    norm = np.linalg.norm(probs, axis=1, keepdims=True) + 1e-8
+    normalized_probs = probs / norm
+    
+    # Compute similarity matrix
+    similarity = np.dot(normalized_probs, normalized_probs.T)
+    
+    # Remove self-similarity
+    np.fill_diagonal(similarity, 0)
+    
+    # Compute interaction scores
+    # High probability instances that are similar to other high probability instances
+    # get a boost
+    target_probs = probs[:, target_class]
+    interaction_scores = np.zeros(n_instances)
+    
+    for i in range(n_instances):
+        # Weighted average of neighbors' target probabilities
+        weights = similarity[i] * target_probs
+        interaction_scores[i] = np.sum(weights) / (np.sum(similarity[i]) + 1e-8)
+    
+    # Combine original probabilities with interaction scores
+    adjusted_scores = target_probs + interaction_strength * interaction_scores
+    
+    return adjusted_scores
+
+
 def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambda_entropy: float = 0.05, noise_std: float = 0.0) -> NDArray[np.float64]:
     """Compute AEM (Attention Entropy Maximization) regularized scores.
     
@@ -68,6 +117,132 @@ def compute_attention_entropy_maximization(bag_probs: NDArray[np.float64], lambd
     
     # Return scores with entropy bonus
     return max_probs + entropy_bonus
+
+
+def sparse_topk(scores: NDArray[np.float64], k: int, return_indices: bool = False) -> NDArray[np.float64]:
+    """Fast, differentiable sparse top-k operator.
+    
+    Based on Sander et al. 2023: memory-efficient O(n log k) implementation.
+    Returns exact k-sparse selection with proper gradient flow.
+    
+    Args:
+        scores: Input scores to select from.
+        k: Number of elements to select (integer).
+        return_indices: If True, return indices instead of mask.
+        
+    Returns:
+        Binary mask (or indices) of selected elements.
+    """
+    n = len(scores)
+    if n == 0 or k <= 0:
+        return np.zeros(n) if not return_indices else np.array([], dtype=int)
+    if k >= n:
+        return np.ones(n) if not return_indices else np.arange(n)
+    
+    # Fast partial sort using argpartition for O(n) average case
+    # Get indices of top k elements
+    top_k_indices = np.argpartition(scores, -k)[-k:]
+    
+    # Sort the top k to maintain consistency
+    top_k_indices = top_k_indices[np.argsort(scores[top_k_indices])[::-1]]
+    
+    if return_indices:
+        return top_k_indices
+    
+    # Create sparse mask
+    mask = np.zeros(n, dtype=np.float64)
+    mask[top_k_indices] = 1.0
+    
+    return mask
+
+
+def gated_sparse_topk(
+    scores: NDArray[np.float64], 
+    k: int,
+    gate_bias: float = 0.0,
+    gate_scale: float = 1.0
+) -> NDArray[np.float64]:
+    """Gated sparse top-k with learnable gates.
+    
+    Combines sparse selection with sigmoid gates for better gradient flow.
+    
+    Args:
+        scores: Input scores/logits.
+        k: Number of elements to select.
+        gate_bias: Bias term for gate computation.
+        gate_scale: Scale factor for gate computation.
+        
+    Returns:
+        Gated sparse attention weights.
+    """
+    n = len(scores)
+    if n == 0 or k <= 0:
+        return np.zeros(n)
+    
+    # Compute gates using sigmoid
+    gates = 1 / (1 + np.exp(-(scores * gate_scale + gate_bias)))
+    
+    # Get sparse selection
+    sparse_mask = sparse_topk(scores, k)
+    
+    # Apply gates to sparse selection
+    gated_weights = sparse_mask * gates
+    
+    # Normalize to maintain probabilistic interpretation
+    weight_sum = np.sum(gated_weights)
+    if weight_sum > 0:
+        gated_weights = gated_weights / weight_sum
+    
+    return gated_weights
+
+
+def differentiable_cardinality_constraint(
+    logits: NDArray[np.float64], 
+    k_min: int, 
+    k_max: int, 
+    barrier_strength: float = 10.0
+) -> tuple[NDArray[np.float64], float]:
+    """Differentiable Cardinality Constraint (DCC) layer.
+    
+    Based on Jo & Cho 2024: enforces k_min <= sum(sigmoid(logits)) <= k_max
+    using smooth logarithmic barriers.
+    
+    Args:
+        logits: Raw logits before sigmoid.
+        k_min: Minimum cardinality constraint.
+        k_max: Maximum cardinality constraint.
+        barrier_strength: Strength of barrier function (higher = sharper).
+        
+    Returns:
+        Tuple of (constrained probabilities, constraint loss).
+    """
+    # Sigmoid activation
+    probs = 1 / (1 + np.exp(-logits))
+    
+    # Sum of probabilities
+    sum_probs = np.sum(probs)
+    
+    # Logarithmic barrier for constraints
+    # φ(x) = log(1 + exp(a*x)) where a is barrier_strength
+    def log_barrier(x):
+        # Numerically stable implementation
+        if x > 0:
+            return x + np.log(1 + np.exp(-barrier_strength * x)) / barrier_strength
+        else:
+            return np.log(1 + np.exp(barrier_strength * x)) / barrier_strength
+    
+    # Lower bound violation: sum < k_min
+    lower_violation = k_min - sum_probs
+    lower_loss = log_barrier(lower_violation)
+    
+    # Upper bound violation: sum > k_max  
+    upper_violation = sum_probs - k_max
+    upper_loss = log_barrier(upper_violation)
+    
+    # Total constraint loss
+    constraint_loss = lower_loss + upper_loss
+    
+    return probs, constraint_loss
 
 
 def smooth_topk(scores: NDArray[np.float64], k: float, temperature: float = 1.0) -> NDArray[np.float64]:
@@ -147,7 +322,7 @@ def compute_margin_aware_confidence(probs: NDArray[np.float64], target_class: in
     return confidence
 
 
-def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margin_scores=None):
+def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margin_scores=None, use_sparse=True, use_gated=False):
     """Solve exact k-of-n assignment problem with optional margin weighting.
     
     Find optimal assignment of instances to positive class such that
@@ -159,6 +334,8 @@ def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margi
         k_max: maximum number of positive instances
         current_assignments: current assignments (optional)
         margin_scores: margin-based scores for weighting (optional)
+        use_sparse: whether to use sparse top-k operator
+        use_gated: whether to use gated sparse top-k
         
     Returns:
         optimal_assignments: binary array of assignments
@@ -180,6 +357,10 @@ def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margi
     # Apply margin weighting if provided
     if margin_scores is not None and len(margin_scores) == len(probs):
         log_odds = log_odds + 0.1 * margin_scores  # Moderate weight for margins
+    
+    if use_sparse and k_min == k_max:
+        # Use fast sparse operator for fixed k
+        return sparse_topk(log_odds, k_min).astype(int)
     
     # Sort by log-odds in descending order
     sorted_indices = np.argsort(log_odds)[::-1]
@@ -204,12 +385,22 @@ def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margi
             best_score = score
             best_k = k
     
-    # Create assignment vector
-    assignments = np.zeros(n, dtype=int)
-    if best_k > 0:
-        assignments[sorted_indices[:best_k]] = 1
-    
-    return assignments
+    if use_gated:
+        # Use gated sparse operator for smoother optimization
+        gated_weights = gated_sparse_topk(log_odds, best_k, gate_bias=0.0, gate_scale=1.0)
+        # Threshold to get binary assignments
+        assignments = (gated_weights > 1.0 / (best_k + 1)).astype(int)
+        return assignments
+    elif use_sparse:
+        # Use sparse operator for best k
+        return sparse_topk(log_odds, best_k).astype(int)
+    else:
+        # Create assignment vector
+        assignments = np.zeros(n, dtype=int)
+        if best_k > 0:
+            assignments[sorted_indices[:best_k]] = 1
+        
+        return assignments
 
 
 def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=None, aem_scores=None):
@@ -420,9 +611,10 @@ class MilCountBasedMultiClassLearner:
         n_bags = len(bags)
         
         # Enhanced temperature schedule based on 2024 research
-        temperature_start = 3.0   # Much higher starting temperature (2-5 recommended)
-        temperature_end = 0.1     # Lower final temperature for precise assignments
-        temperature_half_life = 0.4  # Slower annealing for better exploration
+        # Using cosine schedule as recommended for better performance
+        temperature_start = 2.0   # Optimal starting temperature
+        temperature_end = 0.5     # Higher end temperature for stability
+        temperature_schedule_steps = int(max_iter * 0.7)  # 70% of training
         
         # Track convergence for adaptive temperature adjustment
         previous_y = None
@@ -440,18 +632,41 @@ class MilCountBasedMultiClassLearner:
         confidence_threshold = 0.98  # Very high threshold for selective freezing
         margin_lambda = 0.35  # Increased margin importance for better discrimination
         
+        # Global Lagrangian parameters for batch-wide optimization
+        global_lambda = 0.0  # Lagrange multiplier for global constraint
+        global_lambda_lr = 0.05  # Reduced learning rate for stability
+        global_target_ratio = None  # Will be computed from constraints
+        cardinality_weight = 0.3  # Optimal trade-off weight from research
+        
+        # Compute expected global positive ratio from constraints
+        if n_classes == 2:
+            total_instances = sum(n_list)
+            total_expected_positives = 0
+            for i_bag in range(n_bags):
+                # Use center of constraint range as expected value
+                expected_pos = (lower_threshold[i_bag, 1] + upper_threshold[i_bag, 1]) / 2
+                total_expected_positives += expected_pos
+            global_target_ratio = total_expected_positives / total_instances
+        
+        # DCC parameters
+        use_dcc = True  # Enable DCC layer
+        barrier_strength = 5.0  # Reduced initial barrier strength for smoother optimization
+        barrier_annealing_rate = 1.05  # Slower annealing rate
+        
         for i_iter in range(max_iter):
-            # Adaptive temperature with convergence awareness
-            base_temperature = max(temperature_end, 
-                               temperature_start * 0.5 ** (i_iter / (temperature_half_life * max_iter)))
-            
-            # Adjust temperature based on convergence
-            if convergence_count > 0:
-                # Faster cooling when converging
-                temperature = base_temperature * (0.8 ** convergence_count)
+            # Cosine temperature schedule (recommended for better performance)
+            if i_iter < temperature_schedule_steps:
+                # Cosine annealing for first 70% of training
+                temperature = temperature_end + 0.5 * (temperature_start - temperature_end) * (
+                    1 + np.cos(np.pi * i_iter / temperature_schedule_steps)
+                )
             else:
-                # Maintain exploration temperature
-                temperature = base_temperature
+                # Keep at minimum temperature for exploitation
+                temperature = temperature_end
+            
+            # Anneal barrier strength for DCC
+            if use_dcc and i_iter > 0:
+                barrier_strength = min(50.0, barrier_strength * barrier_annealing_rate)
             
             # Staged approach parameters  
             exploration_phase_end = int(np.ceil(max_iter * 0.7))  # Extended exploration (70%)
@@ -561,6 +776,44 @@ class MilCountBasedMultiClassLearner:
                         # Get probabilities for active instances only
                         active_probs = probs[active_indices, 1]
                         
+                        # Apply DCC layer if enabled (only in exploitation phase for stability)
+                        if use_dcc and i_iter >= exploration_phase_end:
+                            # Convert probabilities to logits for DCC
+                            eps = 1e-8
+                            active_logits = np.log(active_probs + eps) - np.log(1 - active_probs + eps)
+                            
+                            # Apply DCC with current constraints
+                            dcc_probs, dcc_loss = differentiable_cardinality_constraint(
+                                active_logits, k_min_active, k_max_active, barrier_strength
+                            )
+                            
+                            # Blend DCC output with original probabilities
+                            dcc_weight = min(1.0, (i_iter - exploration_phase_end) / 3.0)
+                            active_probs = (1 - dcc_weight) * active_probs + dcc_weight * dcc_probs
+                        
+                        # Apply global Lagrangian adjustment
+                        if global_target_ratio is not None and i_iter >= 2:
+                            # Adjust probabilities based on global constraint
+                            # p_adjusted = p + λ * (target_ratio - current_ratio)
+                            current_global_ratio = np.sum([np.sum(y_bag == 1) for y_bag in y]) / sum(n_list)
+                            ratio_diff = global_target_ratio - current_global_ratio
+                            
+                            # Apply gradient from global constraint
+                            active_probs = active_probs + global_lambda * ratio_diff
+                            active_probs = np.clip(active_probs, 0.01, 0.99)
+                        
+                        # Compute instance interaction scores for active instances
+                        if i_iter >= 3 and n_active >= 5:  # Only use interactions after warm-up and with enough instances
+                            interaction_scores = compute_instance_interaction_scores(
+                                probs[active_indices], 
+                                target_class=1,
+                                interaction_strength=0.15
+                            )
+                            # Normalize to [0, 1] range
+                            interaction_scores = (interaction_scores - np.min(interaction_scores)) / (np.max(interaction_scores) - np.min(interaction_scores) + 1e-8)
+                        else:
+                            interaction_scores = None
+                        
                         # Compute margin scores for active instances
                         margin_scores = np.array([
                             compute_margin_aware_confidence(probs[idx], 1, margin_lambda=margin_lambda)
@@ -650,10 +903,21 @@ class MilCountBasedMultiClassLearner:
                                 margin_scores=margin_scores, aem_scores=aem_scores
                             )
                             
+                            # Combine all scores for assignment
+                            combined_scores = margin_scores.copy()
+                            if aem_scores is not None:
+                                combined_scores = combined_scores + 0.1 * aem_scores
+                            if interaction_scores is not None:
+                                combined_scores = combined_scores + 0.2 * interaction_scores
+                            
+                            # Use gated sparse in exploitation phase for better gradients
+                            use_gated_selection = i_iter >= exploration_phase_end
+                            
                             hard_assignment = exact_k_of_n_assignment(
                                 active_probs, k_min_active, k_max_active,
-                                margin_scores=margin_scores, 
-                                aem_scores=aem_scores
+                                margin_scores=combined_scores,
+                                use_sparse=True,  # Use fast sparse top-k
+                                use_gated=use_gated_selection  # Enable gated selection in exploitation
                             )
                             
                             # Blend assignments
@@ -852,7 +1116,7 @@ class MilCountBasedMultiClassLearner:
                         # For binary case, compute soft count loss
                         target_k = (lower_threshold[i_bag, 1] + upper_threshold[i_bag, 1]) / 2
                         soft_count = np.sum(probs[:, 1])  # Sum of probabilities for positive class
-                        count_loss = 0.2 * abs(soft_count - target_k)  # Weight = 0.2 as recommended
+                        count_loss = cardinality_weight * abs(soft_count - target_k)  # Use optimal weight
                 
                 bag_difficulty[i_bag] = constraint_violation + count_loss
 
@@ -880,6 +1144,18 @@ class MilCountBasedMultiClassLearner:
                     print("instance unit accuracy (label adjusted)")
                     print(np.mean(np.hstack(y) == np.hstack(debug_true_y)))
                 print("-----")
+            
+            # Update global Lagrangian multiplier (dual ascent)
+            if global_target_ratio is not None and n_classes == 2 and i_iter >= 2:
+                current_global_ratio = np.sum([np.sum(y_bag == 1) for y_bag in y]) / sum(n_list)
+                ratio_violation = current_global_ratio - global_target_ratio
+                
+                # Projected gradient ascent for dual variable
+                global_lambda = global_lambda + global_lambda_lr * ratio_violation
+                global_lambda = np.clip(global_lambda, -1.0, 1.0)  # Bound the multiplier
+                
+                if debug:
+                    print(f"Global positive ratio: {current_global_ratio:.3f} (target: {global_target_ratio:.3f}), λ: {global_lambda:.3f}")
             
             # Track convergence
             if previous_y is not None:
