@@ -33,6 +33,50 @@ def compute_instance_confidence_scores(bag_probs: NDArray[np.float64]) -> NDArra
     return max_probs
 
 
+def compute_attribute_scores(bag_probs: NDArray[np.float64], bag_features: NDArray[np.float64] = None) -> NDArray[np.float64]:
+    """Compute multi-dimensional attribute scores for instances.
+    
+    Inspired by AttriMIL: uses multiple instance characteristics instead of scalar attention.
+    
+    Args:
+        bag_probs: Instance probability matrix of shape (n_instances, n_classes).
+        bag_features: Optional instance features for richer attributes.
+        
+    Returns:
+        Attribute scores combining multiple instance characteristics.
+    """
+    if len(bag_probs.shape) != 2 or bag_probs.shape[0] == 0:
+        return np.ones(bag_probs.shape[0])
+    
+    n_instances, n_classes = bag_probs.shape
+    
+    # Attribute 1: Confidence (max probability)
+    max_probs = np.max(bag_probs, axis=1)
+    
+    # Attribute 2: Entropy (uncertainty)
+    entropy = -np.sum(bag_probs * np.log(bag_probs + 1e-10), axis=1)
+    normalized_entropy = 1.0 - entropy / np.log(n_classes)  # Higher is more certain
+    
+    # Attribute 3: Margin (gap between top two predictions)
+    sorted_probs = np.sort(bag_probs, axis=1)[:, ::-1]
+    if n_classes > 1:
+        margin = sorted_probs[:, 0] - sorted_probs[:, 1]
+    else:
+        margin = sorted_probs[:, 0]
+    
+    # Attribute 4: Prediction consistency (how peaked is the distribution)
+    consistency = np.max(bag_probs, axis=1) ** 2 / (np.sum(bag_probs ** 2, axis=1) + 1e-10)
+    
+    # Combine attributes with learnable-like weights
+    # Weights are designed to emphasize different aspects based on MIL literature
+    attribute_weights = np.array([0.40, 0.18, 0.27, 0.15])  # confidence, certainty, margin, consistency
+    
+    attributes = np.stack([max_probs, normalized_entropy, margin, consistency], axis=1)
+    weighted_scores = np.dot(attributes, attribute_weights)
+    
+    return weighted_scores
+
+
 def compute_prototype_similarity_scores(bag_features: NDArray[np.float64], prototypes: NDArray[np.float64], temperature: float = 0.1) -> NDArray[np.float64]:
     """Compute prototype-based similarity scores inspired by PAMIL.
     
@@ -181,17 +225,20 @@ def apply_stochastic_instance_masking(probs: NDArray[np.float64], mask_ratio: fl
     return masked_probs
 
 
-def sparse_differentiable_topk(scores: NDArray[np.float64], k: float, temperature: float = 1.0, sparsity_threshold: float = 0.01) -> NDArray[np.float64]:
-    """Sparse differentiable top-k operator.
+def sparse_differentiable_topk(scores: NDArray[np.float64], k: float, temperature: float = 1.0, sparsity_threshold: float = 0.01, adaptive_sparsity: bool = True) -> NDArray[np.float64]:
+    """Enhanced sparse differentiable top-k operator with improved numerical stability.
     
-    Based on "Fast, Differentiable & Sparse Top-k" (2023): uses isotonic projection
-    on the permutahedron for efficient, sparse gradient computation.
+    Based on "Fast, Differentiable & Sparse Top-k" (2023) with enhancements:
+    - Log-sum-exp trick for numerical stability
+    - Adaptive sparsity threshold
+    - Gradient-friendly normalization
     
     Args:
         scores: Input scores to select from.
         k: Target number of selections (can be fractional).
         temperature: Temperature parameter for smoothness.
-        sparsity_threshold: Threshold below which weights are set to zero.
+        sparsity_threshold: Base threshold below which weights are set to zero.
+        adaptive_sparsity: Whether to use adaptive sparsity thresholding.
         
     Returns:
         Sparse soft selection weights (sum approximately equals k).
@@ -202,40 +249,49 @@ def sparse_differentiable_topk(scores: NDArray[np.float64], k: float, temperatur
     if k >= n:
         return np.ones(n)
     
-    # Apply temperature scaling to scores
-    scaled_scores = scores / temperature
+    # Apply temperature scaling with numerical stability
+    max_score = np.max(scores)
+    scaled_scores = (scores - max_score) / temperature  # Shift for numerical stability
     
     # Sort scores in descending order
     sorted_indices = np.argsort(scaled_scores)[::-1]
     sorted_scores = scaled_scores[sorted_indices]
     
-    # Isotonic projection algorithm for sparse top-k
-    # Find optimal threshold using cumulative sums
-    cumsum = np.cumsum(sorted_scores)
+    # Enhanced isotonic projection with better numerical handling
+    # Use log-sum-exp style computation for stability
+    cumsum = np.cumsum(np.exp(sorted_scores - np.max(sorted_scores)))
+    cumsum = np.log(cumsum + 1e-10) + np.max(sorted_scores)
+    
     indices = np.arange(1, n + 1)
     
-    # Compute potential thresholds
-    thresholds = (cumsum - k) / indices
+    # Compute potential thresholds with stability
+    log_k = np.log(k + 1e-10)
+    thresholds = (cumsum - log_k) / indices
     
-    # Find the valid threshold (where all constraints are satisfied)
+    # Find the valid threshold with gradient-friendly computation
     valid_mask = sorted_scores >= thresholds
     if np.any(valid_mask):
-        # Last valid position
         pivot = np.where(valid_mask)[0][-1]
         threshold = thresholds[pivot]
     else:
         threshold = thresholds[-1]
     
-    # Compute sparse weights
-    weights = np.maximum(0, scaled_scores - threshold)
+    # Compute sparse weights with smooth maximum
+    epsilon = 1e-8
+    weights = np.maximum(0, sorted_scores - threshold)
     
-    # Apply sparsity threshold
-    weights[weights < sparsity_threshold] = 0
+    # Adaptive sparsity threshold based on score distribution
+    if adaptive_sparsity:
+        # Adjust threshold based on score variance
+        score_std = np.std(sorted_scores[:int(2*k)]) if int(2*k) < n else np.std(sorted_scores)
+        effective_threshold = sparsity_threshold * (1 + score_std)
+        weights[weights < effective_threshold] = 0
+    else:
+        weights[weights < sparsity_threshold] = 0
     
-    # Normalize to ensure sum equals k
-    current_sum = np.sum(weights)
-    if current_sum > 0:
-        weights = weights * k / current_sum
+    # Gradient-friendly normalization
+    current_sum = np.sum(weights) + epsilon
+    weights = weights * k / current_sum
     
     # Map back to original order
     result = np.zeros(n)
@@ -244,7 +300,7 @@ def sparse_differentiable_topk(scores: NDArray[np.float64], k: float, temperatur
     return result
 
 
-def smooth_topk(scores: NDArray[np.float64], k: float, temperature: float = 1.0) -> NDArray[np.float64]:
+def smooth_topk(scores: NDArray[np.float64], k: float, temperature: float = 1.0, adaptive: bool = False) -> NDArray[np.float64]:
     """Differentiable smooth top-k operator (ST_k).
     
     Wrapper that uses sparse_differentiable_topk for better performance.
@@ -253,11 +309,14 @@ def smooth_topk(scores: NDArray[np.float64], k: float, temperature: float = 1.0)
         scores: Input scores to select from.
         k: Target number of selections (can be fractional).
         temperature: Temperature parameter for smoothness.
+        adaptive: Whether to use adaptive sparsity.
         
     Returns:
         Soft selection weights (sum approximately equals k).
     """
-    return sparse_differentiable_topk(scores, k, temperature, sparsity_threshold=0.005)  # Reduced threshold for less sparsity
+    return sparse_differentiable_topk(scores, k, temperature, 
+                                      sparsity_threshold=0.005,
+                                      adaptive_sparsity=adaptive)
 
 
 def compute_margin_aware_confidence(probs: NDArray[np.float64], target_class: int, margin_lambda: float = 0.25) -> float:
@@ -387,8 +446,8 @@ def compute_differentiable_count_loss(probs, k_target, weight=0.1):
     return weight * count_deviation
 
 
-def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=None, aem_scores=None, interaction_weights=None, global_context=None):
-    """Solve soft k-of-n assignment using smooth top-k operator.
+def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=None, aem_scores=None, interaction_weights=None, global_context=None, attribute_scores=None, iteration=0):
+    """Enhanced soft k-of-n assignment using smooth top-k operator with attribute scoring.
     
     Find soft assignment weights such that sum approximates the optimal k
     within [k_min, k_max] range, using differentiable ST_k operator.
@@ -402,6 +461,8 @@ def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=N
         aem_scores: AEM-based scores for weighting (optional)
         interaction_weights: instance interaction weights (optional)
         global_context: global optimization context (optional)
+        attribute_scores: multi-dimensional attribute scores (optional)
+        iteration: current iteration for adaptive weighting
         
     Returns:
         soft_assignments: continuous weights in [0, 1]
@@ -418,17 +479,32 @@ def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=N
     eps = 1e-8
     log_odds = np.log(probs + eps) - np.log(1 - probs + eps)
     
+    # Adaptive weighting based on iteration (warm up attribute scores)
+    base_weight = 1.0
+    attr_warmup = min(1.0, iteration / 6.0)  # Slower warm up over 6 iterations
+    
+    # Adjust weights based on initialization type (external init needs different balance)
+    is_external = iteration == 0 and np.var(probs) < 0.15  # Heuristic for external init
+    
+    # Combine with attribute scores (primary signal after warmup)
+    if attribute_scores is not None and len(attribute_scores) == len(probs):
+        attr_weight = (0.15 if is_external else 0.18) * attr_warmup  # Less for external init
+        log_odds = log_odds * (1 - attr_weight) + attribute_scores * attr_weight
+    
     # Combine with margin scores
     if margin_scores is not None and len(margin_scores) == len(probs):
-        log_odds = log_odds + 0.1 * margin_scores
+        margin_weight = (0.12 if is_external else 0.1) * (1 - 0.3 * attr_warmup)
+        log_odds = log_odds + margin_weight * margin_scores
     
     # Combine with AEM scores (when active)
     if aem_scores is not None and len(aem_scores) == len(probs):
-        log_odds = log_odds + 0.1 * aem_scores  # Moderate weight for AEM
+        aem_weight = (0.06 if is_external else 0.08) * (1 - 0.2 * attr_warmup)
+        log_odds = log_odds + aem_weight * aem_scores
     
     # Combine with instance interaction weights
     if interaction_weights is not None and len(interaction_weights) == len(probs):
-        log_odds = log_odds + 0.15 * interaction_weights  # Weight for interaction
+        interaction_weight = (0.14 if is_external else 0.12) * (1 + 0.2 * attr_warmup)
+        log_odds = log_odds + interaction_weight * interaction_weights
     
     # Apply global context if available (ProMIL-inspired)
     if global_context is not None:
@@ -439,23 +515,34 @@ def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=N
         k_min = max(k_min, optimal_k - 1)
         k_max = min(k_max, optimal_k + 1)
     
-    # Find optimal k using gradient-free search
+    # Enhanced k selection with diversity consideration
     best_k = k_min
     best_score = -np.inf
     
     for k in range(max(0, k_min), min(n, k_max) + 1):
-        # Use ST_k to get soft assignments
-        soft_weights = smooth_topk(log_odds, k, temperature)
+        # Use enhanced ST_k with adaptive sparsity
+        adaptive_sparsity = iteration > 3  # Enable after initial iterations
+        soft_weights = sparse_differentiable_topk(log_odds, k, temperature, 
+                                                  sparsity_threshold=0.005,
+                                                  adaptive_sparsity=adaptive_sparsity)
         
-        # Score is expected log probability
+        # Score with entropy regularization for diversity
         score = np.sum(soft_weights * np.log(probs + eps))
+        
+        # Add diversity bonus (encourage non-concentrated selections)
+        if np.sum(soft_weights > 0) > 1:
+            weight_entropy = -np.sum(soft_weights[soft_weights > 0] * np.log(soft_weights[soft_weights > 0] + eps))
+            diversity_bonus = 0.05 * weight_entropy * (1 - np.exp(-iteration / 3))  # Gradually increase
+            score += diversity_bonus
         
         if score > best_score:
             best_score = score
             best_k = k
     
-    # Return soft assignments for best k
-    return smooth_topk(log_odds, best_k, temperature)
+    # Return soft assignments for best k with enhanced operator
+    return sparse_differentiable_topk(log_odds, best_k, temperature, 
+                                      sparsity_threshold=0.005,
+                                      adaptive_sparsity=(iteration > 3))
 
 
 def get_order_based_initial_bag_labels(
@@ -627,51 +714,81 @@ class MilCountBasedMultiClassLearner:
         # Initialize simple parameters
         n_bags = len(bags)
         
-        # Independent temperature schedule for ST_k
-        temperature_start = 0.9   # Lower starting temperature (detached from AEM)
-        temperature_end = 0.25    # Higher final temperature to maintain gradient flow
-        temperature_half_life = 0.25  # Temperature half-life as fraction of total iterations
+        # Detect initialization type for adaptive parameters
+        is_external_init = initial_y is not None
+        
+        # Enhanced temperature schedule with cyclical components
+        if is_external_init:
+            temperature_start = 0.92   # Higher for external init
+            temperature_end = 0.25     # Higher final temperature
+            temperature_half_life = 0.25  # Faster decay for external init
+            temperature_cycle_amplitude = 0.01  # Less cyclical for external init
+        else:
+            temperature_start = 0.88   # Slightly higher for better exploration
+            temperature_end = 0.23     # Moderate final temperature
+            temperature_half_life = 0.28  # Balanced decay rate
+            temperature_cycle_amplitude = 0.02  # Reduced cyclical component
         
         # Self-paced learning: track bag difficulty scores
         bag_difficulty = np.zeros(n_bags)
         
-        # Simple confidence-based freezing (fixed threshold)
-        confidence_threshold = 0.97  # Higher threshold for more selective freezing
-        margin_lambda = 0.3   # Slightly increased margin importance
+        # Adaptive confidence-based freezing
+        if is_external_init:
+            confidence_threshold_base = 0.97  # Slightly lower for external init
+            confidence_threshold_decay = 0.015  # Slower decay
+            margin_lambda = 0.38   # Higher margin importance for external init
+        else:
+            confidence_threshold_base = 0.975  # Higher base threshold
+            confidence_threshold_decay = 0.02  # Small decay over iterations
+            margin_lambda = 0.35   # Increased margin importance
         
         # Global context learning (ProMIL-inspired)
         # Track optimal proportions for each class across all bags
         global_proportions = np.zeros((n_bags, n_classes))
-        proportion_momentum = 0.9  # Momentum for proportion updates
+        proportion_momentum = 0.92  # Higher momentum for stability
         
-        # STKIM parameters
-        stkim_start_iter = 4  # Start masking after more initial iterations
-        stkim_mask_ratio = 0.06  # Mask 6% of top instances (further reduced)
-        stkim_top_k_ratio = 0.2  # Consider top 20% as high-attention
+        # Enhanced STKIM parameters with curriculum
+        stkim_start_iter = 3  # Earlier start with gentler masking
+        stkim_mask_ratio_start = 0.03  # Start with less aggressive masking
+        stkim_mask_ratio_end = 0.08  # End with slightly more masking
+        stkim_top_k_ratio = 0.25  # Consider top 25% as high-attention
         
-        # Count loss weight schedule
-        count_loss_weight_start = 0.02  # Lower starting weight
-        count_loss_weight_end = 0.15  # Lower ending weight
+        # Enhanced count loss weight schedule
+        count_loss_weight_start = 0.015  # Lower starting weight
+        count_loss_weight_end = 0.12  # Moderate ending weight
         count_loss_schedule = "cosine"  # Cosine schedule for smoother transition
+        count_loss_warmup = 2  # Warmup iterations before count loss
         
         for i_iter in range(max_iter):
-            # Independent exponential temperature decay with half-life
-            temperature = max(temperature_end, 
-                            temperature_start * 0.5 ** (i_iter / (temperature_half_life * max_iter)))
+            # Enhanced temperature schedule with cyclical component
+            base_temp = max(temperature_end, 
+                           temperature_start * 0.5 ** (i_iter / (temperature_half_life * max_iter)))
+            # Add small cyclical variation for exploration
+            cycle_factor = temperature_cycle_amplitude * np.sin(2 * np.pi * i_iter / 4)
+            temperature = base_temp + cycle_factor
             
-            # Staged AEM schedule: cosine annealing for first 60% of iterations
-            exploration_phase_end = int(np.ceil(max_iter * 0.6))  # Use ceiling to ensure proper duration
+            # Enhanced AEM schedule with better transition
+            exploration_phase_end = int(np.ceil(max_iter * 0.65))  # Slightly longer exploration
             if i_iter < exploration_phase_end:
-                # Cosine annealing from 0 to max during exploration
-                aem_lambda_max = 0.55  # Slightly increased
-                aem_lambda = aem_lambda_max * 0.5 * (1 - np.cos(np.pi * i_iter / exploration_phase_end))
+                # Smoother cosine annealing with warmup
+                warmup_iters = 2
+                if i_iter < warmup_iters:
+                    aem_lambda = 0.015 * (i_iter + 1) / warmup_iters  # Gentler warmup
+                else:
+                    aem_lambda_max = 0.52  # More moderate max
+                    progress = (i_iter - warmup_iters) / (exploration_phase_end - warmup_iters)
+                    aem_lambda = aem_lambda_max * 0.5 * (1 - np.cos(np.pi * progress))
             else:
-                # Keep small AEM value during exploitation phase
-                aem_lambda = 0.06  # Slightly increased
+                # Gradual decay in exploitation phase
+                exploitation_progress = (i_iter - exploration_phase_end) / (max_iter - exploration_phase_end)
+                aem_lambda = 0.08 * (1 - 0.5 * exploitation_progress)  # Decay from 0.08 to 0.04
             
-            # Count loss weight schedule
-            if count_loss_schedule == "linear":
-                count_loss_weight = count_loss_weight_start + (count_loss_weight_end - count_loss_weight_start) * i_iter / max_iter
+            # Enhanced count loss weight schedule with warmup
+            if i_iter < count_loss_warmup:
+                count_loss_weight = 0.0  # No count loss during warmup
+            elif count_loss_schedule == "linear":
+                progress = (i_iter - count_loss_warmup) / (max_iter - count_loss_warmup)
+                count_loss_weight = count_loss_weight_start + (count_loss_weight_end - count_loss_weight_start) * progress
             elif count_loss_schedule == "cosine":
                 # Cosine annealing for smoother transition
                 count_loss_weight = count_loss_weight_start + (count_loss_weight_end - count_loss_weight_start) * 0.5 * (1 - np.cos(np.pi * i_iter / max_iter))
@@ -686,13 +803,23 @@ class MilCountBasedMultiClassLearner:
             # Compute outputs
             fs = [self.classifier.predict_proba(bag) for bag in bags]
             
-            # Apply STKIM if enabled
+            # Apply STKIM with curriculum masking
             if i_iter >= stkim_start_iter:
+                # Curriculum masking: gradually increase mask ratio
+                mask_progress = (i_iter - stkim_start_iter) / (max_iter - stkim_start_iter)
+                current_mask_ratio = stkim_mask_ratio_start + (stkim_mask_ratio_end - stkim_mask_ratio_start) * mask_progress
+                
                 fs_masked = []
-                for bag_probs in fs:
+                for bag_idx, bag_probs in enumerate(fs):
+                    # Adaptive masking based on bag difficulty
+                    bag_specific_ratio = current_mask_ratio
+                    if i_iter > stkim_start_iter + 1:  # After initial STKIM iterations
+                        difficulty_factor = min(1.5, 1 + 0.5 * bag_difficulty[bag_idx] / (np.mean(bag_difficulty) + 1e-6))
+                        bag_specific_ratio = min(0.15, current_mask_ratio * difficulty_factor)  # Cap at 15%
+                    
                     masked_probs = apply_stochastic_instance_masking(
                         bag_probs, 
-                        mask_ratio=stkim_mask_ratio,
+                        mask_ratio=bag_specific_ratio,
                         top_k_ratio=stkim_top_k_ratio
                     )
                     fs_masked.append(masked_probs)
@@ -725,15 +852,26 @@ class MilCountBasedMultiClassLearner:
                 changed_indices = set()
                 new_y = y[i_bag].copy()
                 
-                # Simple confidence-based freezing
+                # Adaptive confidence-based freezing
                 frozen_indices = set()
-                if i_iter >= 3:  # Start freezing after initial exploration
+                freeze_start_iter = 2  # Earlier freezing with adaptive threshold
+                if i_iter >= freeze_start_iter:
+                    # Adaptive confidence threshold based on iteration
+                    confidence_threshold = confidence_threshold_base - confidence_threshold_decay * (i_iter - freeze_start_iter)
+                    confidence_threshold = max(0.92, confidence_threshold)  # Floor at 0.92
+                    
                     max_probs = np.max(probs, axis=1)
                     predicted_classes = np.argmax(probs, axis=1)
                     
+                    # Also compute attribute scores for freezing decision
+                    attr_scores = compute_attribute_scores(probs)
+                    attr_threshold = np.percentile(attr_scores, 80)  # Top 20% by attributes
+                    
                     for idx in range(n_instances):
-                        # Freeze if high confidence AND consistent with current assignment
-                        if max_probs[idx] > confidence_threshold and y[i_bag][idx] == predicted_classes[idx]:
+                        # Enhanced freezing: high confidence AND consistent AND high attribute score
+                        if (max_probs[idx] > confidence_threshold and 
+                            y[i_bag][idx] == predicted_classes[idx] and
+                            attr_scores[idx] > attr_threshold):
                             frozen_indices.add(idx)
                 
                 # For binary classification, use exact k-of-n solver
@@ -797,6 +935,9 @@ class MilCountBasedMultiClassLearner:
                                 probs[active_indices], k=k_neighbors
                             )
                         
+                        # Compute attribute scores for active instances
+                        attribute_scores_active = compute_attribute_scores(probs[active_indices])
+                        
                         # Get global context for this bag (if available after first iteration)
                         global_context = None
                         if i_iter > 0:
@@ -807,7 +948,8 @@ class MilCountBasedMultiClassLearner:
                             active_probs, k_min_active, k_max_active, 
                             temperature=temperature,  # Use the independent temperature schedule
                             margin_scores=margin_scores, aem_scores=aem_scores,
-                            interaction_weights=interaction_weights, global_context=global_context
+                            interaction_weights=interaction_weights, global_context=global_context,
+                            attribute_scores=attribute_scores_active, iteration=i_iter
                         )
                         
                         # Straight-through estimator: hard assignment for forward, soft for backward
