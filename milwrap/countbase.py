@@ -204,17 +204,122 @@ def exact_k_of_n_assignment(probs, k_min, k_max, current_assignments=None, margi
     return assignments
 
 
-def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=None, aem_scores=None):
-    """Solve soft k-of-n assignment using smooth top-k operator.
+def gumbel_sample(shape, eps=1e-6):
+    """Sample from Gumbel(0, 1) distribution.
     
-    Find soft assignment weights such that sum approximates the optimal k
-    within [k_min, k_max] range, using differentiable ST_k operator.
+    Args:
+        shape: Shape of the output tensor
+        eps: Small value for numerical stability
+        
+    Returns:
+        Gumbel noise samples
+    """
+    u = np.random.uniform(eps, 1 - eps, shape)
+    return -np.log(-np.log(u))
+
+
+def binary_gumbel_softmax(logits, temperature, hard=False, backward_temperature=None):
+    """Binary Gumbel-Softmax (Binary Concrete) sampling with decoupled temperature.
+    
+    Args:
+        logits: Log-odds for positive class (n_instances,)
+        temperature: Temperature parameter for forward pass
+        hard: Whether to use straight-through estimator
+        backward_temperature: Temperature for backward pass (decoupled ST-GS)
+        
+    Returns:
+        Relaxed binary samples in [0, 1]
+    """
+    # Sample Gumbel noise
+    g = gumbel_sample(logits.shape)
+    
+    # Apply Gumbel-Softmax transformation
+    # For decoupled temperature, we use lower temp for forward, higher for backward
+    forward_temp = temperature
+    if backward_temperature is None:
+        backward_temperature = temperature
+    
+    # Forward pass uses forward_temp
+    z_tilde = 1 / (1 + np.exp(-(logits + g) / forward_temp))
+    
+    # For gradient computation, we would use backward_temperature
+    # This is a conceptual implementation - in practice this would be handled
+    # by the autograd system
+    z_grad = 1 / (1 + np.exp(-(logits + g) / backward_temperature))
+    
+    if hard:
+        # Straight-through estimator with better gradient flow
+        z_hard = (z_tilde > 0.5).astype(np.float64)
+        # Conceptually: forward uses z_hard, backward uses z_grad
+        return z_hard
+    else:
+        return z_tilde
+
+
+def gumbel_top_k_relaxed(logits, k_min, k_max, temperature):
+    """Relaxed top-k selection with Gumbel noise for range constraints.
+    
+    Args:
+        logits: Log-odds scores for each instance
+        k_min: Minimum number of selections
+        k_max: Maximum number of selections
+        temperature: Temperature parameter
+        
+    Returns:
+        Soft selection weights satisfying constraints
+    """
+    n = len(logits)
+    
+    # Add Gumbel noise to logits
+    g = gumbel_sample(logits.shape)
+    perturbed_logits = logits + g
+    
+    # Sort indices by perturbed logits
+    sorted_indices = np.argsort(perturbed_logits)[::-1]
+    
+    # Compute soft indicators for being in top-k for different k values
+    soft_weights = np.zeros(n)
+    
+    # Find optimal k within [k_min, k_max] based on perturbed scores
+    k_scores = []
+    for k in range(max(0, k_min), min(n, k_max) + 1):
+        if k > 0:
+            # Score is sum of top-k perturbed logits
+            score = np.sum(perturbed_logits[sorted_indices[:k]])
+        else:
+            score = 0
+        k_scores.append((k, score))
+    
+    # Select k with highest score
+    best_k = max(k_scores, key=lambda x: x[1])[0]
+    
+    # Compute soft top-k indicators using sigmoid relaxation
+    if best_k > 0:
+        threshold = perturbed_logits[sorted_indices[best_k-1]]
+        if best_k < n:
+            # Interpolate threshold for smoother gradients
+            next_threshold = perturbed_logits[sorted_indices[best_k]]
+            threshold = 0.5 * (threshold + next_threshold)
+    else:
+        threshold = np.max(perturbed_logits) + 1.0
+    
+    # Soft indicators using temperature-scaled sigmoid
+    soft_weights = 1 / (1 + np.exp(-(perturbed_logits - threshold) / temperature))
+    
+    return soft_weights
+
+
+def constraint_aware_soft_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=None, aem_scores=None):
+    """Constraint-aware soft k-of-n assignment with penalty-based optimization.
+    
+    Find soft assignment weights that maximize probability while satisfying
+    constraints through penalty terms.
     
     Args:
         probs: probabilities for positive class (n_instances,)
         k_min: minimum number of positive instances
         k_max: maximum number of positive instances  
-        temperature: temperature for ST_k operator
+        temperature: temperature for Gumbel-Softmax
         margin_scores: margin-based scores for weighting (optional)
         aem_scores: AEM-based scores for weighting (optional)
         
@@ -229,35 +334,58 @@ def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=N
     if k_max < 0:
         return np.zeros(n)
     
-    # Compute scores combining multiple signals
+    # Compute base scores
     eps = 1e-8
-    log_odds = np.log(probs + eps) - np.log(1 - probs + eps)
+    logits = np.log(probs + eps) - np.log(1 - probs + eps)
     
-    # Combine with margin scores
+    # Add margin and AEM contributions
     if margin_scores is not None and len(margin_scores) == len(probs):
-        log_odds = log_odds + 0.1 * margin_scores
+        logits = logits + 0.25 * margin_scores  # Increased weight
     
-    # Combine with AEM scores (when active)
     if aem_scores is not None and len(aem_scores) == len(probs):
-        log_odds = log_odds + 0.1 * aem_scores  # Moderate weight for AEM
+        logits = logits + 0.15 * aem_scores
     
-    # Find optimal k using gradient-free search
-    best_k = k_min
-    best_score = -np.inf
+    # Sample with Gumbel noise
+    g = gumbel_sample(logits.shape)
+    perturbed_logits = logits + g
     
-    for k in range(max(0, k_min), min(n, k_max) + 1):
-        # Use ST_k to get soft assignments
-        soft_weights = smooth_topk(log_odds, k, temperature)
+    # Find optimal soft assignment with constraint penalties
+    # Target k is center of feasible range
+    k_target = (k_min + k_max) / 2.0
+    
+    # Multiple samples for lower variance
+    n_samples = 3
+    soft_assignments = []
+    
+    for _ in range(n_samples):
+        # Sample Gumbel noise
+        g = gumbel_sample(logits.shape)
+        z_tilde = 1 / (1 + np.exp(-(logits + g) / temperature))
         
-        # Score is expected log probability
-        score = np.sum(soft_weights * np.log(probs + eps))
+        # Compute constraint penalty
+        current_sum = np.sum(z_tilde)
         
-        if score > best_score:
-            best_score = score
-            best_k = k
+        # Soft penalty for being outside [k_min, k_max]
+        if current_sum < k_min:
+            penalty = (k_min - current_sum) ** 2
+            # Gradient: increase all weights proportionally
+            gradient_scale = 1.0 + 0.1 * penalty / (current_sum + eps)
+            z_tilde = np.minimum(z_tilde * gradient_scale, 1.0)
+        elif current_sum > k_max:
+            penalty = (current_sum - k_max) ** 2
+            # Gradient: decrease all weights proportionally
+            gradient_scale = 1.0 - 0.1 * penalty / (current_sum + eps)
+            z_tilde = np.maximum(z_tilde * gradient_scale, 0.0)
+        
+        soft_assignments.append(z_tilde)
     
-    # Return soft assignments for best k
-    return smooth_topk(log_odds, best_k, temperature)
+    # Average samples
+    return np.mean(soft_assignments, axis=0)
+
+
+def soft_k_of_n_assignment(probs, k_min, k_max, temperature=0.5, margin_scores=None, aem_scores=None):
+    """Wrapper for backward compatibility."""
+    return constraint_aware_soft_assignment(probs, k_min, k_max, temperature, margin_scores, aem_scores)
 
 
 def get_order_based_initial_bag_labels(
@@ -373,7 +501,7 @@ class MilCountBasedMultiClassLearner:
         # Initialize y
         n_list = [len(bag) for bag in bags]
         if not initial_y:
-            # Improved initialization: consider constraint satisfaction potential
+            # Enhanced initialization with probabilistic assignment
             y = []
             for i_bag, n_instances_in_bag in enumerate(n_list):
                 # Calculate constraint satisfaction score for each class
@@ -399,44 +527,67 @@ class MilCountBasedMultiClassLearner:
                         distance_from_center = abs(n_instances_in_bag - center)
                         constraint_scores[i_class] = 1.0 - (distance_from_center / range_size)
                 
-                # Add small noise to break ties
-                constraint_scores += np.random.randn(n_classes) * 0.01
-                
-                # Select class with best constraint satisfaction potential
-                best_class = np.argmax(constraint_scores)
-                y.append(np.repeat(best_class, n_instances_in_bag))
+                # For binary classification, use mixed initialization for diversity
+                if n_classes == 2:
+                    # Calculate how many instances should be positive
+                    k_target = int((lower_threshold[i_bag, 1] + upper_threshold[i_bag, 1]) / 2)
+                    k_target = max(int(lower_threshold[i_bag, 1]), 
+                                 min(int(upper_threshold[i_bag, 1]), k_target))
+                    
+                    # Random assignment respecting constraints
+                    instance_labels = np.zeros(n_instances_in_bag, dtype=int)
+                    if k_target > 0:
+                        positive_indices = np.random.choice(n_instances_in_bag, k_target, replace=False)
+                        instance_labels[positive_indices] = 1
+                    y.append(instance_labels)
+                else:
+                    # Multi-class: use constraint scores with temperature-based sampling
+                    # Add small noise to break ties
+                    constraint_scores += np.random.randn(n_classes) * 0.01
+                    
+                    # Use softmax with temperature for probabilistic selection
+                    init_temperature = 0.5
+                    exp_scores = np.exp(constraint_scores / init_temperature)
+                    class_probs = exp_scores / np.sum(exp_scores)
+                    
+                    # Select class probabilistically
+                    best_class = np.random.choice(n_classes, p=class_probs)
+                    y.append(np.repeat(best_class, n_instances_in_bag))
         else:
             y = initial_y
             
         # Initialize simple parameters
         n_bags = len(bags)
         
-        # Independent temperature schedule for ST_k
-        temperature_start = 0.9   # Lower starting temperature (detached from AEM)
-        temperature_end = 0.25    # Higher final temperature to maintain gradient flow
-        temperature_half_life = 0.25  # Temperature half-life as fraction of total iterations
+        # Gumbel-Softmax temperature schedule - simpler is better
+        gumbel_temp_start = 1.0   # Standard starting temperature
+        gumbel_temp_end = 0.1     # Standard ending temperature
+        gumbel_temp_decay = 0.88  # Moderate decay rate
         
         # Self-paced learning: track bag difficulty scores
         bag_difficulty = np.zeros(n_bags)
         
-        # Simple confidence-based freezing (fixed threshold)
-        confidence_threshold = 0.97  # Higher threshold for more selective freezing
-        margin_lambda = 0.3   # Slightly increased margin importance
+        # Adaptive confidence-based freezing
+        confidence_threshold = 0.98  # Very high threshold for selective freezing
+        margin_lambda = 0.35  # Further increased margin importance
+        
+        # Track assignment stability
+        previous_assignments = [y_bag.copy() for y_bag in y]
         
         for i_iter in range(max_iter):
-            # Independent exponential temperature decay with half-life
-            temperature = max(temperature_end, 
-                            temperature_start * 0.5 ** (i_iter / (temperature_half_life * max_iter)))
+            # Simple exponential temperature decay
+            gumbel_temperature = max(gumbel_temp_end, 
+                                   gumbel_temp_start * (gumbel_temp_decay ** i_iter))
             
             # Staged AEM schedule: cosine annealing for first 60% of iterations
-            exploration_phase_end = int(np.ceil(max_iter * 0.6))  # Use ceiling to ensure proper duration
+            exploration_phase_end = int(np.ceil(max_iter * 0.6))
             if i_iter < exploration_phase_end:
-                # Cosine annealing from 0 to max during exploration
-                aem_lambda_max = 0.5  # Increased from 0.3
+                # Cosine annealing during exploration
+                aem_lambda_max = 0.5
                 aem_lambda = aem_lambda_max * 0.5 * (1 - np.cos(np.pi * i_iter / exploration_phase_end))
             else:
-                # Keep small AEM value during exploitation phase
-                aem_lambda = 0.05  # Small constant instead of 0
+                # Small constant during exploitation
+                aem_lambda = 0.05
             
             # Fit
             flatten_bags = np.vstack(bags)
@@ -536,24 +687,35 @@ class MilCountBasedMultiClassLearner:
                         if aem_lambda > 0:
                             aem_scores = compute_attention_entropy_maximization(probs[active_indices], aem_lambda)
                         
-                        # Always use soft assignment with ST_k for differentiability
+                        # Use Gumbel-Softmax for differentiable discrete optimization
                         soft_weights = soft_k_of_n_assignment(
                             active_probs, k_min_active, k_max_active, 
-                            temperature=temperature,  # Use the independent temperature schedule
+                            temperature=gumbel_temperature,
                             margin_scores=margin_scores, aem_scores=aem_scores
                         )
                         
-                        # Straight-through estimator: hard assignment for forward, soft for backward
-                        # Get top-k indices based on soft weights
-                        k_target = int(np.round(np.sum(soft_weights)))
-                        k_target = max(k_min_active, min(k_max_active, k_target))
+                        # Straight-through estimator with Gumbel-Softmax
+                        # Hard assignment based on threshold
+                        optimal_assignment_active = (soft_weights > 0.5).astype(int)
                         
-                        if k_target > 0:
-                            top_k_indices = np.argsort(soft_weights)[-k_target:]
-                            optimal_assignment_active = np.zeros_like(soft_weights, dtype=int)
-                            optimal_assignment_active[top_k_indices] = 1
-                        else:
-                            optimal_assignment_active = np.zeros(len(active_probs), dtype=int)
+                        # Ensure constraints are satisfied
+                        current_k = np.sum(optimal_assignment_active)
+                        if current_k < k_min_active:
+                            # Add more positive assignments
+                            remaining_indices = np.where(optimal_assignment_active == 0)[0]
+                            if len(remaining_indices) > 0:
+                                scores = soft_weights[remaining_indices]
+                                n_to_add = min(k_min_active - current_k, len(remaining_indices))
+                                top_indices = remaining_indices[np.argsort(scores)[-n_to_add:]]
+                                optimal_assignment_active[top_indices] = 1
+                        elif current_k > k_max_active:
+                            # Remove some positive assignments
+                            positive_indices = np.where(optimal_assignment_active == 1)[0]
+                            if len(positive_indices) > 0:
+                                scores = soft_weights[positive_indices]
+                                n_to_remove = current_k - k_max_active
+                                bottom_indices = positive_indices[np.argsort(scores)[:n_to_remove]]
+                                optimal_assignment_active[bottom_indices] = 0
                         
                         # Map back to full assignment
                         optimal_assignment = new_y.copy()
@@ -690,7 +852,7 @@ class MilCountBasedMultiClassLearner:
                                         scores[c] -= 2.0  # Strong penalty for over-represented classes
                                 
                                 # Apply temperature
-                                exp_scores = np.exp(scores / temperature)
+                                exp_scores = np.exp(scores / gumbel_temperature)
                                 probabilities = exp_scores / np.sum(exp_scores)
                                 
                                 # Choose new class
@@ -736,7 +898,7 @@ class MilCountBasedMultiClassLearner:
                 bag_difficulty[i_bag] = constraint_violation + count_loss
 
             if debug:
-                print(f"iter: {i_iter}, temperature: {temperature:.3f}, aem_lambda: {aem_lambda:.3f}")
+                print(f"iter: {i_iter}, gumbel_temp: {gumbel_temperature:.3f}, aem_lambda: {aem_lambda:.3f}")
                 predicted_count = np.nan_to_num(
                     pd.DataFrame([pd.Series(b).value_counts().to_dict() for b in y])[list(range(n_classes))].values,
                 )
