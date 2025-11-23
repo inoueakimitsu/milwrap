@@ -138,13 +138,13 @@ class TestCountBase:
                         lower_threshold[i_bag, i_class] = divisions[i_division]
                         upper_threshold[i_bag, i_class] = divisions[i_division + 1]
 
-        n_fatures = 7
+        n_features = 7
         x_min = 0
         x_max = 100
         cov_diag = 0.1 * 40**2
 
-        means_of_classes = [np.random.uniform(low=x_min, high=x_max, size=n_fatures) for _ in range(n_classes)]
-        covs_of_classes = [np.eye(n_fatures) * cov_diag for _ in range(n_classes)]
+        means_of_classes = [np.random.uniform(low=x_min, high=x_max, size=n_features) for _ in range(n_classes)]
+        covs_of_classes = [np.eye(n_features) * cov_diag for _ in range(n_classes)]
         bags = [
             np.vstack(
                 [
@@ -227,13 +227,13 @@ class TestCountBase:
                         lower_threshold[i_bag, i_class] = divisions[i_division]
                         upper_threshold[i_bag, i_class] = divisions[i_division + 1]
 
-        n_fatures = 7
+        n_features = 7
         x_min = 0
         x_max = 100
         cov_diag = 0.1 * 40**2
 
-        means_of_classes = [np.random.uniform(low=x_min, high=x_max, size=n_fatures) for _ in range(n_classes)]
-        covs_of_classes = [np.eye(n_fatures) * cov_diag for _ in range(n_classes)]
+        means_of_classes = [np.random.uniform(low=x_min, high=x_max, size=n_features) for _ in range(n_classes)]
+        covs_of_classes = [np.eye(n_features) * cov_diag for _ in range(n_classes)]
         bags = [
             np.vstack(
                 [
